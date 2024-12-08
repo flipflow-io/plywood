@@ -215,6 +215,22 @@ export class SplitExpression extends ChainableExpression implements Aggregate {
     });
   }
 
+  public getSelectSQLNoAliases(dialect: SQLDialect): string[] {
+    return this.mapSplits((name, expression) => {
+      if (
+        expression instanceof SqlRefExpression &&
+        ['IP', 'SET/IP'].includes(expression.type) &&
+        !expression.isSqlFunction('IP_SEARCH', 'IP_MATCH')
+      ) {
+        return `${dialect.ipStringifyExpression(
+          expression.getSQL(dialect),
+        )} AS ${dialect.escapeName(name)}`;
+      } else {
+        return `${expression.getSQL(dialect)}`;
+      }
+    });
+  }
+
   public getGroupBySQL(dialect: SQLDialect): string[] {
     return this.mapSplits((name, expression) => expression.getSQL(dialect));
   }

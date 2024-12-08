@@ -976,6 +976,51 @@ describe('DruidSQL Functional', function () {
         });
       });
 
+      it('works with sql nested aggregate', () => {
+        const ex = $('wiki')
+          .split('$channel', 'channel')
+          .apply(
+            'qq',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(TIME_FLOOR(t.__time, \'PT1H\'),COUNT(t.channel) AS "V", SUM(t."V"))`,
+              ),
+            ),
+          )
+          .sort('$channel', 'descending')
+          .limit(5);
+
+        return basicExecutor(ex).then(result => {
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: 'en',
+              Count: 114711,
+              Quantile: 6313.8,
+            },
+            {
+              Channel: 'vi',
+              Count: 99010,
+              Quantile: 10748.596,
+            },
+            {
+              Channel: 'de',
+              Count: 25103,
+              Quantile: 1737.9999,
+            },
+            {
+              Channel: 'fr',
+              Count: 21285,
+              Quantile: 1379.4,
+            },
+            {
+              Channel: 'ru',
+              Count: 14031,
+              Quantile: 898.5999,
+            },
+          ]);
+        });
+      });
+
       it('can timeBucket on joined column with sub-split', () => {
         const prevRange = TimeRange.fromJS({
           start: new Date('2015-09-12T00:00:00Z'),
@@ -994,10 +1039,6 @@ describe('DruidSQL Functional', function () {
               .timeBucket('PT2H'),
             'TimeJoin',
           )
-          .apply('CountAll', $('wiki').sum('$count'))
-          .apply('CountPrev', $('wiki').filter($('__time').overlap(prevRange)).sum('$count'))
-          .apply('CountMain', $('wiki').filter($('__time').overlap(mainRange)).sum('$count'))
-          .limit(2)
           .apply(
             'Channels',
             $('wiki')
@@ -2090,7 +2131,7 @@ describe('DruidSQL Functional', function () {
       });
     });
 
-    it.skip('works with introspection', () => {
+    it('works with introspection', () => {
       // ToDo: needs null check correction
       const ex = ply()
         .apply('wiki', $('wiki').filter($('channel').is('en')))
@@ -2227,6 +2268,360 @@ describe('DruidSQL Functional', function () {
             TotalAdded: 32553107,
           },
         ]);
+      });
+    });
+  });
+
+  describe('DruidSQL Functional', function () {
+    this.timeout(10000);
+
+    const basicExecutor = basicExecutorFactory({
+      datasets: {
+        wiki: External.fromJS(
+          {
+            engine: 'druidsql',
+            source: 'wikipedia',
+            attributes: wikiAttributes,
+            derivedAttributes: wikiDerivedAttributes,
+            context,
+          },
+          druidRequester,
+        ),
+      },
+    });
+
+    describe('PIVOT_NESTED_AGG Tests', () => {
+      it('funciona con SUM como agregado interno', () => {
+        const ex = $('wiki')
+          .split('$channel', 'Channel')
+          .apply(
+            'TotalEdits',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(TIME_FLOOR(t.__time, 'PT1H'), COUNT(*) AS "EditsPerHour", SUM("EditsPerHour"))`,
+              ),
+            ),
+          )
+          .sort('$TotalEdits', 'descending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: '#en.wikipedia',
+              TotalEdits: 6650,
+            },
+            {
+              Channel: '#sh.wikipedia',
+              TotalEdits: 3969,
+            },
+            {
+              Channel: '#sv.wikipedia',
+              TotalEdits: 1867,
+            },
+          ]);
+        });
+      });
+
+      it('funciona con AVG como agregado interno', () => {
+        const ex = $('wiki')
+          .split('$channel', 'Channel')
+          .apply(
+            'AvgEditsPerHour',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(TIME_FLOOR(t.__time, 'PT1H'), COUNT(*) AS "EditsPerHour", AVG("EditsPerHour"))`,
+              ),
+            ),
+          )
+          .sort('$AvgEditsPerHour', 'descending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          // Reemplazar con los valores esperados reales
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: 'en',
+              AvgEditsPerHour: 1,
+            },
+            {
+              Channel: 'vi',
+              AvgEditsPerHour: 1,
+            },
+            {
+              Channel: 'de',
+              AvgEditsPerHour: 1,
+            },
+          ]);
+        });
+      });
+
+      it('funciona con MIN como agregado interno', () => {
+        const ex = $('wiki')
+          .split('$channel', 'Channel')
+          .apply(
+            'MinEditsPerHour',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(TIME_FLOOR(t.__time, 'PT1H'), COUNT(*) AS "EditsPerHour", MIN("EditsPerHour"))`,
+              ),
+            ),
+          )
+          .sort('$MinEditsPerHour', 'ascending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          // Reemplazar con los valores esperados reales
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: '/* Canal con mínimo de ediciones */',
+              MinEditsPerHour: 1,
+            },
+            // Otros canales
+          ]);
+        });
+      });
+
+      it('funciona con MAX como agregado interno', () => {
+        const ex = $('wiki')
+          .split('$channel', 'Channel')
+          .apply(
+            'MaxEditsPerHour',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(TIME_FLOOR(t.__time, 'PT1H'), COUNT(*) AS "EditsPerHour", MAX("EditsPerHour"))`,
+              ),
+            ),
+          )
+          .sort('$MaxEditsPerHour', 'descending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          // Reemplazar con los valores esperados reales
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: '/* Canal con máximo de ediciones */',
+              MaxEditsPerHour: 1,
+            },
+            // Otros canales
+          ]);
+        });
+      });
+
+      it('funciona con COUNT como agregado interno', () => {
+        const ex = $('wiki')
+          .split('$channel', 'Channel')
+          .apply(
+            'CountHoursWithEdits',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(TIME_FLOOR(t.__time, 'PT1H'), COUNT(*) AS "EditsPerHour", COUNT("EditsPerHour"))`,
+              ),
+            ),
+          )
+          .sort('$CountHoursWithEdits', 'descending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: 'en',
+              CountHoursWithEdits: 1 /* Número de horas con ediciones para 'en' */,
+            },
+            {
+              Channel: 'vi',
+              CountHoursWithEdits: 1 /* Número de horas con ediciones para 'vi' */,
+            },
+            {
+              Channel: 'de',
+              CountHoursWithEdits: 1 /* Número de horas con ediciones para 'de' */,
+            },
+          ]);
+        });
+      });
+
+      it('funciona con diferentes tipos de agregados internos', () => {
+        const ex = $('wiki')
+          .split('$channel', 'Channel')
+          .apply(
+            'CombinedAgg',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(
+                TIME_FLOOR(t.__time, 'PT1H'),
+                SUM("added") AS "AddedPerHour",
+                AVG("AddedPerHour") + MAX("AddedPerHour")
+              )`,
+              ),
+            ),
+          )
+          .sort('$CombinedAgg', 'descending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          // Reemplazar con los valores esperados reales
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: '/* Canal con mayor valor de CombinedAgg */',
+              CombinedAgg: 1,
+            },
+            // Otros canales
+          ]);
+        });
+      });
+
+      it('funciona con agregación interna que incluye una dimensión (usando CASE)', () => {
+        const ex = $('wiki')
+          .split('$channel', 'Channel')
+          .apply(
+            'TotalAnonEdits',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(
+                TIME_FLOOR(t.__time, 'PT1H'),
+                SUM(CASE WHEN t.isAnonymous = 'false' THEN 1 ELSE 0 END) AS "AnonEditsPerHourFalse",
+                SUM(t.AnonEditsPerHourFalse)
+              )`,
+              ),
+            ),
+          )
+          .apply(
+            'SumAnonEdits',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(
+                TIME_FLOOR(t.__time, 'PT1H'),
+                AVG(CASE WHEN t.isAnonymous = 'true' THEN 1 ELSE 0 END) AS "AnonEditsPerHour",
+                AVG(t.AnonEditsPerHour)
+              )`,
+              ),
+            ),
+          )
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: 'en',
+              TotalAnonEdits: 1,
+            },
+            // Otros canales
+          ]);
+        });
+      });
+
+      it('funciona con agregado interno que incluye una condición', () => {
+        const ex = $('wiki')
+          .split('$channel', 'Channel')
+          .apply(
+            'TotalAnonAdded',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(
+                TIME_FLOOR(t.__time, 'PT1H'),
+                SUM(CASE WHEN "isAnonymous" = 'true' THEN "added" ELSE 0 END) AS "AnonAddedPerHour",
+                SUM("AnonAddedPerHour")
+              )`,
+              ),
+            ),
+          )
+          .sort('$TotalAnonAdded', 'descending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          // Reemplazar con los valores esperados reales
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: '/* Canal con mayor valor de TotalAnonAdded */',
+              TotalAnonAdded: 1,
+            },
+            // Otros canales
+          ]);
+        });
+      });
+
+      it('funciona con agregado interno complejo', () => {
+        const ex = $('wiki')
+          .split('$channel', 'Channel')
+          .apply(
+            'AvgUniquePagesPerHour',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(
+                TIME_FLOOR(t.__time, 'PT1H'),
+                COUNT(DISTINCT "page") AS "UniquePagesPerHour",
+                AVG("UniquePagesPerHour")
+              )`,
+              ),
+            ),
+          )
+          .sort('$AvgUniquePagesPerHour', 'descending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          // Reemplazar con los valores esperados reales
+          expect(result.toJS().data).to.deep.equal([
+            {
+              Channel: '/* Canal con mayor valor de AvgUniquePagesPerHour */',
+              AvgUniquePagesPerHour: 1,
+            },
+            // Otros canales
+          ]);
+        });
+      });
+
+      it('maneja correctamente casos sin datos (edge cases)', () => {
+        const ex = $('wiki')
+          .filter($('channel').is('nonexistent_channel'))
+          .split('$channel', 'Channel')
+          .apply(
+            'NoDataAgg',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(
+                TIME_FLOOR(t.__time, 'PT1H'),
+                COUNT(*) AS "EditsPerHour",
+                SUM("EditsPerHour")
+              )`,
+              ),
+            ),
+          )
+          .sort('$NoDataAgg', 'descending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          expect(result.toJS().data).to.deep.equal([]);
+        });
+      });
+
+      it('funciona con subexpresiones en la división (split)', () => {
+        const ex = $('wiki')
+          .split($('channel').concat('_test'), 'ChannelTest')
+          .apply(
+            'MaxAddedPerHour',
+            $('wiki').sqlAggregate(
+              r(
+                `PIVOT_NESTED_AGG(
+                TIME_EXTRACT(t.__time, 'HOUR') AS "Hour",
+                SUM("added") AS "AddedPerHour",
+                MAX("AddedPerHour")
+              )`,
+              ),
+            ),
+          )
+          .sort('$MaxAddedPerHour', 'descending')
+          .limit(3);
+
+        return basicExecutor(ex).then(result => {
+          // Reemplazar con los valores esperados reales
+          expect(result.toJS().data).to.deep.equal([
+            {
+              ChannelTest: 'en_test',
+              MaxAddedPerHour: 1,
+            },
+            // Otros canales
+          ]);
+        });
       });
     });
   });

@@ -117,6 +117,101 @@ export class SqlAggregateExpression extends ChainableExpression {
     }
     return `(${sql})`;
   }
+
+  public extractPivotNestedAggComponents(): {
+    subSplitExpression: string;
+    innerAggregateExpr: string;
+    innerAggregateValueAlias: string;
+    outerAggregateExpr: string;
+  } | null {
+    const functionName = 'PIVOT_NESTED_AGG';
+
+    // Ensure the SQL starts with the function name
+    const trimmedSql = this.sql.trim();
+    if (!trimmedSql.toUpperCase().startsWith(functionName + '(')) return null;
+
+    // Extract the arguments inside the parentheses
+    const argsString = trimmedSql.substring(functionName.length + 1, trimmedSql.length - 1); // Remove function name and parentheses
+
+    // Function to split arguments considering nested parentheses
+    function splitArgs(str: string): string[] {
+      const args = [];
+      let currentArg = '';
+      let parenLevel = 0;
+      let inSingleQuote = false;
+      let inDoubleQuote = false;
+      let escapeNextChar = false;
+
+      for (let i = 0; i < str.length; i++) {
+        const char = str[i];
+
+        if (escapeNextChar) {
+          currentArg += char;
+          escapeNextChar = false;
+          continue;
+        }
+
+        if (char === '\\') {
+          escapeNextChar = true;
+          currentArg += char;
+          continue;
+        }
+
+        if (char === "'" && !inDoubleQuote) {
+          inSingleQuote = !inSingleQuote;
+          currentArg += char;
+          continue;
+        }
+
+        if (char === '"' && !inSingleQuote) {
+          inDoubleQuote = !inDoubleQuote;
+          currentArg += char;
+          continue;
+        }
+
+        if (!inSingleQuote && !inDoubleQuote) {
+          if (char === '(') {
+            parenLevel++;
+          } else if (char === ')') {
+            parenLevel--;
+          } else if (char === ',' && parenLevel === 0) {
+            args.push(currentArg.trim());
+            currentArg = '';
+            continue;
+          }
+        }
+
+        currentArg += char;
+      }
+
+      if (currentArg.length > 0) {
+        args.push(currentArg.trim());
+      }
+
+      return args;
+    }
+
+    const args = splitArgs(argsString);
+
+    if (args.length !== 3) return null;
+
+    const subSplitExpression = args[0];
+
+    // Parse innerAggregateExpr and innerAggregateValueAlias
+    const innerAggregateMatch = /(.+?)\s+AS\s+"?([^"]+)"?$/i.exec(args[1]);
+    if (!innerAggregateMatch) return null;
+
+    const innerAggregateExpr = innerAggregateMatch[1].trim();
+    const innerAggregateValueAlias = innerAggregateMatch[2].trim();
+    const outerAggregateExpr = args[2];
+
+    return {
+      subSplitExpression,
+      innerAggregateExpr,
+      innerAggregateValueAlias,
+      outerAggregateExpr,
+    };
+  }
 }
 
 Expression.applyMixins(SqlAggregateExpression, [Aggregate]);
