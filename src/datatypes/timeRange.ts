@@ -20,6 +20,7 @@ import { Class, Instance } from 'immutable-class';
 
 import { Expression } from '../expressions/baseExpression';
 
+import { valueIsTimeRange } from './dataset';
 import { NumberRange } from './numberRange';
 import { Range } from './range';
 
@@ -61,7 +62,7 @@ export class TimeRange extends Range<Date> implements Instance<TimeRangeValue, T
   static type = 'TIME_RANGE';
 
   static isTimeRange(candidate: any): candidate is TimeRange {
-    return candidate instanceof TimeRange;
+    return candidate instanceof TimeRange || valueIsTimeRange(candidate);
   }
 
   static intervalFromDate(date: Date): string {

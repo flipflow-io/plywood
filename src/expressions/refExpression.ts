@@ -230,7 +230,11 @@ export class RefExpression extends Expression {
       nestDiff++;
     }
     if (!myTypeContext) {
-      throw new Error(`could not resolve ${this}`);
+      return new RefExpression({
+        name: myName,
+        nest: nest + nestDiff,
+        type: 'STRING',
+      });
     }
 
     const myFullType = myTypeContext.datasetType[myName];

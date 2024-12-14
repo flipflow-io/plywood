@@ -196,7 +196,7 @@ export class SplitExpression extends ChainableExpression implements Aggregate {
   }
 
   public getSQL(_dialect: SQLDialect): string {
-    throw new Error('can not convert split expression to SQL directly');
+    return this.operand.getSQL(_dialect);
   }
 
   public getSelectSQL(dialect: SQLDialect): string[] {
@@ -211,6 +211,22 @@ export class SplitExpression extends ChainableExpression implements Aggregate {
         )} AS ${dialect.escapeName(name)}`;
       } else {
         return `${expression.getSQL(dialect)} AS ${dialect.escapeName(name)}`;
+      }
+    });
+  }
+
+  public getSelectSQLOnlyAliases(dialect: SQLDialect): string[] {
+    return this.mapSplits((name, expression) => {
+      if (
+        expression instanceof SqlRefExpression &&
+        ['IP', 'SET/IP'].includes(expression.type) &&
+        !expression.isSqlFunction('IP_SEARCH', 'IP_MATCH')
+      ) {
+        return `${dialect.ipStringifyExpression(
+          expression.getSQL(dialect),
+        )} AS ${dialect.escapeName(name)}`;
+      } else {
+        return `${dialect.escapeName(name)}`;
       }
     });
   }

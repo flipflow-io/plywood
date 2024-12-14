@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
-import { Datum, PlywoodValue } from '../datatypes';
+import { Readable } from 'readable-stream';
+
+import { Datum } from '../datatypes';
 import { ComputeOptions, Expression } from '../expressions/baseExpression';
 
-export type Executor = (ex: Expression, opt?: ComputeOptions) => Promise<PlywoodValue>;
+export type Executor = (ex: Expression, opt?: ComputeOptions) => any;
 
 export interface BasicExecutorParameters {
   datasets: Datum;
@@ -27,6 +29,29 @@ export interface BasicExecutorParameters {
 export function basicExecutorFactory(parameters: BasicExecutorParameters): Executor {
   const datasets = parameters.datasets;
   return (ex: Expression, opt: ComputeOptions = {}) => {
-    return ex.compute(datasets, opt);
+    if (opt.stream) {
+      if (typeof ex.computeStream === 'function') {
+        // If ex has a computeStream method, use it
+        return ex.computeStream(datasets, opt);
+      } else {
+        // Otherwise, create a Readable stream and push the result manually
+        const stream = new Readable({
+          objectMode: true,
+          read() {}, // This will be called when the consumer wants more data
+        });
+        ex.compute(datasets, opt)
+          .then(result => {
+            stream.push(result);
+            stream.push(null); // Signal the end of the stream
+          })
+          .catch(err => {
+            stream.emit('error', err);
+          });
+        return stream;
+      }
+    } else {
+      // Otherwise, use regular compute
+      return ex.compute(datasets, opt);
+    }
   };
 }

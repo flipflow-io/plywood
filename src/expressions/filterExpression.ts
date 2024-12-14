@@ -46,6 +46,10 @@ export class FilterExpression extends ChainableUnaryExpression {
     return operandValue ? (operandValue as Dataset).filter(this.expression) : null;
   }
 
+  getSQL(dialect: SQLDialect): string {
+    return super.getSQL(dialect);
+  }
+
   protected _getSQLChainableUnaryHelper(
     dialect: SQLDialect,
     operandSQL: string,

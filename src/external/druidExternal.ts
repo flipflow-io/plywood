@@ -779,8 +779,20 @@ export class DruidExternal extends External {
       outputName: this.makeOutputName(label),
     };
     if (extractionFn) {
-      dimension.type = 'extraction';
-      dimension.extractionFn = extractionFn;
+      if (
+        (expression instanceof TimeBucketExpression || expression instanceof TimePartExpression) &&
+        attributeInfo.name !== DruidExternal.TIME_ATTRIBUTE
+      ) {
+        // For time-related expressions not directly referencing __time,
+        // keep the dimension type as 'default' and don't use extraction
+        dimension.type = 'default';
+        dimension.extractionFn = extractionFn;
+        // Don't set the extractionFn
+      } else {
+        // For other cases, use extraction as before
+        dimension.type = 'extraction';
+        dimension.extractionFn = extractionFn;
+      }
     }
     if (expression.type === 'NUMBER') {
       dimension.outputType =
@@ -1068,10 +1080,15 @@ export class DruidExternal extends External {
 
     // Split up applies
     let globalResplitSplit: SplitExpression = null;
+
+    let globalCounter = 0;
+    let globalDefCounter = 0;
+
     const outerAttributes: Attributes = [];
     const innerApplies: ApplyExpression[] = [];
     const outerApplies = effectiveApplies.map((apply, i) => {
-      let c = 0;
+      const c = 0;
+      let localCounter = 0;
       return apply.changeExpression(
         apply.expression.substitute(ex => {
           if (ex.isAggregate()) {
@@ -1086,7 +1103,7 @@ export class DruidExternal extends External {
 
               const resplitApply = resplit.resplitApply;
               const oldName = resplitApply.name;
-              const newName = oldName + '_' + i;
+              const newName = oldName + '_' + i + '_' + localCounter++;
 
               innerApplies.push(
                 resplitApply
@@ -1105,7 +1122,7 @@ export class DruidExternal extends External {
               // If there is a filter defined on the inner agg then we need to filter the outer aggregate to only the buckets that have a non-zero count with said filter.
               const filterExpression = getFilterSubExpression(resplit.resplitApply.expression);
               if (filterExpression) {
-                const definedFilterName = newName + '_def';
+                const definedFilterName = newName + '_def_' + globalDefCounter++;
                 innerApplies.push($('_').apply(definedFilterName, filterExpression.count()));
                 outerAttributes.push(
                   AttributeInfo.fromJS({ name: definedFilterName, type: 'NUMBER' }),
@@ -1117,7 +1134,7 @@ export class DruidExternal extends External {
 
               return resplitAggWithUpdatedNames;
             } else {
-              const tempName = `a${i}_${c++}`;
+              const tempName = 'a'.concat(String(globalCounter++));
               innerApplies.push(Expression._.apply(tempName, ex));
               outerAttributes.push(
                 AttributeInfo.fromJS({
@@ -1159,7 +1176,7 @@ export class DruidExternal extends External {
         });
       }
 
-      const intermediateName = `s${splitCount++}`;
+      const intermediateName = 's'.concat(String(globalCounter++));
       const divvy = divvyUpNestedSplitExpression(ex, intermediateName);
       outerAttributes.push(
         AttributeInfo.fromJS({ name: intermediateName, type: divvy.inner.type }),
