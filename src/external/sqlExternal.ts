@@ -27,7 +27,6 @@ import {
   ChainableExpression,
   ChainableUnaryExpression,
   CountExpression,
-  DivideExpression,
   Expression,
   FilterExpression,
   NumberBucketExpression,
@@ -36,7 +35,6 @@ import {
   SplitExpression,
   Splits,
   SqlAggregateExpression,
-  SumExpression,
   TimeBucketExpression,
 } from '../expressions';
 
@@ -224,46 +222,9 @@ export abstract class SQLExternal extends External {
           decomposedApplies.forEach(apply => {
             const name = apply.name;
             const expression = apply.expression;
-
-            // If the expression is a sum or count resulting from average decomposition
-            if (expression instanceof SumExpression || expression instanceof CountExpression) {
-              const sql = apply.getSQL(dialect);
-              selectExpressions.push(sql);
-              inflaters.push(External.getSimpleInflater('NUMBER', name));
-            } else if (expression instanceof DivideExpression) {
-              // Handle the average calculation in postTransform
-              const sumExpr = expression.operand;
-              const countExpr = expression.expression;
-
-              // Generate unique names for sum and count
-              const sumName = `${name}_sum`;
-              const countName = `${name}_count`;
-
-              // Create applies for sum and count
-              const sumApply = Expression._.apply(sumName, sumExpr);
-              const countApply = Expression._.apply(countName, countExpr);
-
-              // Generate SQL for sum and count
-              const sumSQL = sumApply.getSQL(dialect);
-              const countSQL = countApply.getSQL(dialect);
-
-              selectExpressions.push(sumSQL);
-              selectExpressions.push(countSQL);
-
-              // Inflate the average in postTransform
-              inflaters.push(d => {
-                const sum = d[sumName] as number;
-                const count = d[countName] as number;
-                d[name] = count ? sum / count : null;
-                delete d[sumName];
-                delete d[countName];
-              });
-            } else {
-              // Other expressions
-              const sql = apply.getSQL(dialect);
-              selectExpressions.push(sql);
-              inflaters.push(External.getSimpleInflater(expression.type, name));
-            }
+            const sql = apply.getSQL(dialect);
+            selectExpressions.push(sql);
+            inflaters.push(External.getSimpleInflater(expression.type, name));
           });
           zeroTotalApplies = decomposedApplies;
         }
@@ -281,45 +242,9 @@ export abstract class SQLExternal extends External {
           decomposedApplies.forEach(apply => {
             const name = apply.name;
             const expression = apply.expression;
-
-            if (expression instanceof SumExpression || expression instanceof CountExpression) {
-              const sql = apply.getSQL(dialect);
-              selectExpressions.push(sql);
-              inflaters.push(External.getSimpleInflater('NUMBER', name));
-            } else if (expression instanceof DivideExpression) {
-              // Handle the average calculation in postTransform
-              const sumExpr = expression.operand;
-              const countExpr = expression.expression;
-
-              // Generate unique names for sum and count
-              const sumName = `${name}_sum`;
-              const countName = `${name}_count`;
-
-              // Create applies for sum and count
-              const sumApply = Expression._.apply(sumName, sumExpr);
-              const countApply = Expression._.apply(countName, countExpr);
-
-              // Generate SQL for sum and count
-              const sumSQL = sumApply.getSQL(dialect);
-              const countSQL = countApply.getSQL(dialect);
-
-              selectExpressions.push(sumSQL);
-              selectExpressions.push(countSQL);
-
-              // Inflate the average in postTransform
-              inflaters.push(d => {
-                const sum = d[sumName] as number;
-                const count = d[countName] as number;
-                d[name] = count ? sum / count : null;
-                delete d[sumName];
-                delete d[countName];
-              });
-            } else {
-              // Other expressions
-              const sql = apply.getSQL(dialect);
-              selectExpressions.push(sql);
-              inflaters.push(External.getSimpleInflater(expression.type, name));
-            }
+            const sql = apply.getSQL(dialect);
+            selectExpressions.push(sql);
+            inflaters.push(External.getSimpleInflater(expression.type, name));
           });
 
           // Add GROUP BY clause
