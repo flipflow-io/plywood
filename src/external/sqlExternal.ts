@@ -15,11 +15,13 @@
  * limitations under the License.
  */
 
+import { Duration, Timezone } from 'chronoshift';
 import * as hasOwnProp from 'has-own-prop';
 import { PlywoodRequester } from 'plywood-base-api';
 import { Transform } from 'readable-stream';
 
 import { AttributeInfo, Attributes } from '../datatypes/attributeInfo';
+import { TimeRange } from '../datatypes/timeRange';
 import { SQLDialect } from '../dialect/baseDialect';
 import {
   $,
@@ -36,6 +38,7 @@ import {
   Splits,
   SqlAggregateExpression,
   TimeBucketExpression,
+  TimeFloorExpression,
 } from '../expressions';
 
 import {
@@ -122,11 +125,32 @@ export abstract class SQLExternal extends External {
     });
   }
 
+  static timeRangeInflaterFactoryFromSQL(
+    label: string,
+    duration: Duration,
+    timezone: Timezone,
+  ): Inflater {
+    return (d: any) => {
+      const v = d[label];
+      if ('' + v === 'null' || typeof v === 'undefined') {
+        d[label] = null;
+        return;
+      }
+      const start = new Date(v);
+      d[label] = new TimeRange({
+        start,
+        end: duration.shift(start, timezone),
+      });
+    };
+  }
+
   public getQueryAndPostTransform(): QueryAndPostTransform<string> {
     let groupByExpressions;
     const { mode, applies, sort, limit, derivedAttributes, dialect, withQuery } = this;
     const queryParts: string[] = [];
     const cteDefinitions: string[] = [];
+    const timeBucketExpressions: { label: string; duration: Duration; timezone: Timezone }[] = [];
+
     let postTransform: Transform = null;
     let inflaters: Inflater[] = [];
     let keys: string[] = null;
@@ -234,6 +258,21 @@ export abstract class SQLExternal extends External {
       case 'split': {
         const split = this.getQuerySplit();
         keys = split.mapSplits(name => name);
+        split.mapSplits((label, splitExpression) => {
+          if (
+            splitExpression instanceof TimeBucketExpression ||
+            splitExpression instanceof TimeFloorExpression
+          ) {
+            const duration = splitExpression.duration;
+            const timezone = splitExpression.getTimezone();
+            timeBucketExpressions.push({ label, duration, timezone });
+          }
+        });
+
+        timeBucketExpressions.forEach(({ label, duration, timezone }) => {
+          inflaters.push(SQLExternal.timeRangeInflaterFactoryFromSQL(label, duration, timezone));
+        });
+
         if (!nestedGroupByResult) {
           // Build select expressions
           selectExpressions.push(...split.getSelectSQL(dialect));
