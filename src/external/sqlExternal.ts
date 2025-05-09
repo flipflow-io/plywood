@@ -51,14 +51,6 @@ import {
 } from './baseExternal';
 import { ParsedResplitAgg } from './druidExternal';
 
-function getSplitInflaters(split: SplitExpression): Inflater[] {
-  return split.mapSplits((label, splitExpression) => {
-    const simpleInflater = External.getIntelligentInflater(splitExpression, label);
-    if (simpleInflater) return simpleInflater;
-    return undefined;
-  });
-}
-
 export abstract class SQLExternal extends External {
   static type = 'DATASET';
 
@@ -146,11 +138,11 @@ export abstract class SQLExternal extends External {
 
   public getQueryAndPostTransform(): QueryAndPostTransform<string> {
     let groupByExpressions;
-    const { mode, applies, sort, limit, derivedAttributes, dialect, withQuery } = this;
+    const { mode, sort, limit, derivedAttributes, dialect, withQuery } = this;
+    let { applies } = this;
     const queryParts: string[] = [];
     const cteDefinitions: string[] = [];
     const timeBucketExpressions: { label: string; duration: Duration; timezone: Timezone }[] = [];
-
     let postTransform: Transform = null;
     let inflaters: Inflater[] = [];
     let keys: string[] = null;
@@ -183,18 +175,17 @@ export abstract class SQLExternal extends External {
     // Proceed with the usual logic based on the mode
     const selectedAttributes = this.getSelectedAttributes();
 
-    // **Decompose averages in applies before processing them**
+    // Decompose averages in applies before processing them
+    applies = !applies ? [Expression._.apply('__VALUE__', this.valueExpression)] : applies;
+
     const decomposedApplies = applies.map(apply => {
       let expression = apply.expression;
-
       // Inline derived attributes if necessary
       if (derivedAttributes) {
         expression = this.inlineDerivedAttributess(expression);
       }
-
       // Decompose average expressions into sum and count
       expression = expression.decomposeAverage();
-
       // Return a new apply with the decomposed expression
       return apply.changeExpression(expression);
     });
@@ -205,7 +196,7 @@ export abstract class SQLExternal extends External {
           // Build select expressions
           const attributeExpressions = selectedAttributes.map(a => {
             const name = a.name;
-            if (derivedAttributes[name]) {
+            if (derivedAttributes && derivedAttributes[name]) {
               return Expression._.apply(name, derivedAttributes[name]).getSQL(dialect);
             } else {
               return dialect.escapeName(name);
@@ -230,31 +221,39 @@ export abstract class SQLExternal extends External {
         }
         break;
       }
-
       case 'value': {
         if (!nestedGroupByResult) {
-          selectExpressions.push(this.toValueApply().getSQL(dialect));
+          if (applies.length > 0) {
+            selectExpressions.push(this.toValueApply().getSQL(dialect));
+          } else {
+            // If no applies, select a constant value (e.g., 1) to ensure valid SQL
+            selectExpressions.push('1');
+          }
           postTransform = External.valuePostTransformFactory();
         }
         break;
       }
-
       case 'total': {
         keys = [];
         if (!nestedGroupByResult) {
-          // Use decomposed applies
-          decomposedApplies.forEach(apply => {
-            const name = apply.name;
-            const expression = apply.expression;
-            const sql = apply.getSQL(dialect);
-            selectExpressions.push(sql);
-            inflaters.push(External.getSimpleInflater(expression.type, name));
-          });
-          zeroTotalApplies = decomposedApplies;
+          if (decomposedApplies.length > 0) {
+            // Use decomposed applies
+            decomposedApplies.forEach(apply => {
+              const name = apply.name;
+              const expression = apply.expression;
+              const sql = apply.getSQL(dialect);
+              selectExpressions.push(sql);
+              inflaters.push(External.getSimpleInflater(expression.type, name));
+            });
+            zeroTotalApplies = decomposedApplies;
+          } else {
+            // If no applies, select a constant value (e.g., COUNT(*))
+            selectExpressions.push('COUNT(*) AS "Count"');
+            inflaters.push(External.getSimpleInflater('NUMBER', 'Count'));
+          }
         }
         break;
       }
-
       case 'split': {
         const split = this.getQuerySplit();
         keys = split.mapSplits(name => name);
@@ -268,35 +267,28 @@ export abstract class SQLExternal extends External {
             timeBucketExpressions.push({ label, duration, timezone });
           }
         });
-
         timeBucketExpressions.forEach(({ label, duration, timezone }) => {
           inflaters.push(SQLExternal.timeRangeInflaterFactoryFromSQL(label, duration, timezone));
         });
-
         if (!nestedGroupByResult) {
           // Build select expressions
           selectExpressions.push(...split.getSelectSQL(dialect));
-
-          // Process decomposed applies
-          decomposedApplies.forEach(apply => {
-            const name = apply.name;
-            const expression = apply.expression;
-            const sql = apply.getSQL(dialect);
-            selectExpressions.push(sql);
-            inflaters.push(External.getSimpleInflater(expression.type, name));
-          });
-
+          if (decomposedApplies.length > 0) {
+            // Process decomposed applies
+            decomposedApplies.forEach(apply => {
+              const name = apply.name;
+              const expression = apply.expression;
+              const sql = apply.getSQL(dialect);
+              selectExpressions.push(sql);
+              inflaters.push(External.getSimpleInflater(expression.type, name));
+            });
+          } else {
+            // If no applies, select a constant value
+            selectExpressions.push('COUNT(*) AS "Count"');
+            inflaters.push(External.getSimpleInflater('NUMBER', 'Count'));
+          }
           // Add GROUP BY clause
           groupByExpressions = split.getShortGroupBySQL();
-
-          if (!this.havingFilter.equals(Expression.TRUE)) {
-            queryParts.push('HAVING ' + this.havingFilter.getSQL(dialect));
-          }
-        } else {
-          // If we have nestedGroupByResult, 'groupByExpressions' is already set
-          if (!this.havingFilter.equals(Expression.TRUE)) {
-            queryParts.push('HAVING ' + this.havingFilter.getSQL(dialect));
-          }
         }
         break;
       }
@@ -308,6 +300,10 @@ export abstract class SQLExternal extends External {
     if (cteDefinitions.length > 0) {
       queryParts.push(`WITH\n${cteDefinitions.join(',\n')}`);
     }
+    if (selectExpressions.length === 0) {
+      // Ensure there is at least one select expression
+      selectExpressions.push('1');
+    }
     queryParts.push('SELECT ' + selectExpressions.join(', '));
     queryParts.push(fromClause); // 'FROM' clause
     if (whereClause && !nestedGroupByResult) {
@@ -316,7 +312,10 @@ export abstract class SQLExternal extends External {
     if (groupByExpressions && groupByExpressions.length > 0) {
       queryParts.push('GROUP BY ' + groupByExpressions.join(', '));
     }
-    // 'HAVING' clause is already handled in the switch-case
+    // Add HAVING clause after GROUP BY
+    if (this.havingFilter && !this.havingFilter.equals(Expression.TRUE)) {
+      queryParts.push('HAVING ' + this.havingFilter.getSQL(dialect));
+    }
     if (sort) {
       queryParts.push(sort.getSQL(dialect));
     }
@@ -638,8 +637,10 @@ export abstract class SQLExternal extends External {
 
       // Use your custom Set class as before
       // Initialize innerSelectExpressions and innerGroupByExpressions as empty Sets
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-expect-error
       let innerSelectExpressions = new Set({ setType: 'STRING', elements: [] });
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-expect-error
       let innerGroupByExpressions = new Set({ setType: 'STRING', elements: [] });
 
@@ -668,8 +669,10 @@ export abstract class SQLExternal extends External {
         ? 'WHERE ' + filter.getSQL(dialect)
         : '';
 
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-expect-error
       const items = innerSelectExpressions.elements;
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-expect-error
       const groupItems = innerGroupByExpressions.elements;
 

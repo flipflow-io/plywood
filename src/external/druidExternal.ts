@@ -1087,7 +1087,6 @@ export class DruidExternal extends External {
     const outerAttributes: Attributes = [];
     const innerApplies: ApplyExpression[] = [];
     const outerApplies = effectiveApplies.map((apply, i) => {
-      const c = 0;
       let localCounter = 0;
       return apply.changeExpression(
         apply.expression.substitute(ex => {
@@ -1208,6 +1207,8 @@ export class DruidExternal extends External {
     innerValue.split = split ? split.changeSplits(innerSplits) : Expression._.split(innerSplits);
     innerValue.limit = null;
     innerValue.sort = null;
+    innerValue.havingFilter = Expression.TRUE;
+
     const innerExternal = new DruidExternal(innerValue);
     const innerQuery = innerExternal.getQueryAndPostTransform().query;
     delete innerQuery.context;

@@ -1128,6 +1128,7 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
 
   public findDatumByAttribute(attribute: string, value: any): Datum | undefined {
     return SimpleArray.find(this.data, function (d) {
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-expect-error
       const a = valueIsTimeRange(d[attribute]) ? TimeRange.fromJS(d[attribute]) : d[attribute];
       const b = valueIsTimeRange(value) ? TimeRange.fromJS(value) : value;
