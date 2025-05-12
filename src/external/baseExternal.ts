@@ -718,7 +718,9 @@ export abstract class External {
         }
 
         for (const inflater of inflaters) {
-          inflater(d);
+          if (typeof inflater === 'function') {
+            inflater(d);
+          }
         }
 
         External.inflateArrays(d, attributes);
