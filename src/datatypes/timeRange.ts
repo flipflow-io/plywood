@@ -57,11 +57,15 @@ function dateToIntervalPart(date: Date): string {
   return date.toISOString().replace('.000Z', 'Z').replace(':00Z', 'Z').replace(':00Z', 'Z'); // Do not do a final .replace('T00Z', 'Z');
 }
 
+export function valueIsTimeRange(group: any): boolean {
+  return group && typeof group === 'object' && 'start' in group && 'end' in group;
+}
+
 export class TimeRange extends Range<Date> implements Instance<TimeRangeValue, TimeRangeJS> {
   static type = 'TIME_RANGE';
 
   static isTimeRange(candidate: any): candidate is TimeRange {
-    return candidate instanceof TimeRange;
+    return candidate instanceof TimeRange || valueIsTimeRange(candidate);
   }
 
   static intervalFromDate(date: Date): string {

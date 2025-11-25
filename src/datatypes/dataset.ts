@@ -36,7 +36,7 @@ import { Ip } from './ip';
 import { NumberRange } from './numberRange';
 import { Set } from './set';
 import { StringRange } from './stringRange';
-import { TimeRange } from './timeRange';
+import { TimeRange, valueIsTimeRange } from './timeRange';
 
 export type ComputeFn = (d: Datum) => any;
 
@@ -233,6 +233,9 @@ function isString(str: string) {
 
 function getAttributeInfo(name: string, attributeValue: any): AttributeInfo {
   if (attributeValue == null) return null;
+  if (hasOwnProp(attributeValue, 'engine')) {
+    return null;
+  }
   if (isDate(attributeValue)) {
     return new AttributeInfo({ name, type: 'TIME' });
   } else if (isBoolean(attributeValue)) {
@@ -247,7 +250,7 @@ function getAttributeInfo(name: string, attributeValue: any): AttributeInfo {
     return new AttributeInfo({ name, type: 'NUMBER_RANGE' });
   } else if (attributeValue instanceof StringRange) {
     return new AttributeInfo({ name, type: 'STRING_RANGE' });
-  } else if (attributeValue instanceof TimeRange) {
+  } else if (attributeValue instanceof TimeRange || valueIsTimeRange(attributeValue)) {
     return new AttributeInfo({ name, type: 'TIME_RANGE' });
   } else if (attributeValue instanceof Set) {
     return new AttributeInfo({ name, type: attributeValue.getType() });
@@ -1117,7 +1120,13 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
   }
 
   public findDatumByAttribute(attribute: string, value: any): Datum | undefined {
-    return SimpleArray.find(this.data, d => generalEqual(d[attribute], value));
+    return SimpleArray.find(this.data, d => {
+      const a = valueIsTimeRange(d[attribute])
+        ? TimeRange.fromJS(d[attribute] as any)
+        : d[attribute];
+      const b = valueIsTimeRange(value) ? TimeRange.fromJS(value as any) : value;
+      return generalEqual(a, b);
+    });
   }
 
   public getColumns(options: FlattenOptions = {}) {

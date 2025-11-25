@@ -111,6 +111,9 @@ export function valueFromJS(v: any, typeOverride: string | null = null): any {
     const typeofV = typeof v;
     if (typeofV === 'object') {
       switch (typeOverride || v.type) {
+        case 'NULL':
+          return null;
+
         case 'NUMBER': {
           const n = Number(v.value);
           if (isNaN(n)) throw new Error(`bad number value '${v.value}'`);
