@@ -119,6 +119,7 @@ export interface ComputeOptions extends Environment {
   maxRows?: number;
   maxComputeCycles?: number;
   concurrentQueryLimit?: number;
+  stream?: boolean;
 }
 
 export type AlterationFillerPromise = (external: External, terminal: boolean) => Promise<any>;

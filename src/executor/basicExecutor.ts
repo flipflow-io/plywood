@@ -15,10 +15,15 @@
  * limitations under the License.
  */
 
+import { Readable } from 'readable-stream';
+
 import { Datum, PlywoodValue } from '../datatypes';
 import { ComputeOptions, Expression } from '../expressions/baseExpression';
 
-export type Executor = (ex: Expression, opt?: ComputeOptions) => Promise<PlywoodValue>;
+export type Executor = (
+  ex: Expression,
+  opt?: ComputeOptions,
+) => Promise<PlywoodValue> | Readable | ReadableStream;
 
 export interface BasicExecutorParameters {
   datasets: Datum;
@@ -27,6 +32,26 @@ export interface BasicExecutorParameters {
 export function basicExecutorFactory(parameters: BasicExecutorParameters): Executor {
   const datasets = parameters.datasets;
   return (ex: Expression, opt: ComputeOptions = {}) => {
-    return ex.compute(datasets, opt);
+    if (opt.stream) {
+      if (typeof ex.computeStream === 'function') {
+        return ex.computeStream(datasets, opt);
+      } else {
+        const stream = new Readable({
+          objectMode: true,
+          read: function () {},
+        });
+        ex.compute(datasets, opt)
+          .then(result => {
+            stream.push(result);
+            stream.push(null);
+          })
+          .catch(err => {
+            stream.emit('error', err);
+          });
+        return stream;
+      }
+    } else {
+      return ex.compute(datasets, opt);
+    }
   };
 }

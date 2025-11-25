@@ -1191,6 +1191,7 @@ export class DruidExternal extends External {
     innerValue.split = split ? split.changeSplits(innerSplits) : Expression._.split(innerSplits);
     innerValue.limit = null;
     innerValue.sort = null;
+    innerValue.havingFilter = Expression.TRUE;
     const innerExternal = new DruidExternal(innerValue);
     const innerQuery = innerExternal.getQueryAndPostTransform().query;
     delete innerQuery.context;
