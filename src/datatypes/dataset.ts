@@ -780,6 +780,30 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
     return count;
   }
 
+  public mode(ex: Expression): any {
+    if (typeof ex === 'function') {
+      return this.modeFn(ex as any);
+    }
+    return this.modeFn(ex.getFn());
+  }
+
+  public modeFn(exFn: ComputeFn): any {
+    const counts = new Map<any, number>();
+    let maxCount = 0;
+    let modeValue: any = null;
+    for (const datum of this.data) {
+      const v = exFn(datum);
+      if (v == null) continue;
+      const count = (counts.get(v) || 0) + 1;
+      counts.set(v, count);
+      if (count > maxCount) {
+        maxCount = count;
+        modeValue = v;
+      }
+    }
+    return modeValue;
+  }
+
   public quantile(ex: Expression, quantile: number): number {
     if (typeof ex === 'function') {
       // ToDo: add better deprecation

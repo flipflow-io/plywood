@@ -86,6 +86,7 @@ import { LookupExpression } from './lookupExpression';
 import { MatchExpression } from './matchExpression';
 import { MaxExpression } from './maxExpression';
 import { MinExpression } from './minExpression';
+import { ModeExpression } from './modeExpression';
 import { MultiplyExpression } from './multiplyExpression';
 import { MvContainsExpression } from './mvContainsExpression';
 import { MvFilterOnlyExpression } from './mvFilterOnlyExpression';
@@ -1551,6 +1552,11 @@ export abstract class Expression implements Instance<ExpressionValue, Expression
       value: getNumber(value),
       tuning: tuning ? getString(tuning) : null,
     });
+  }
+
+  public mode(ex: any) {
+    if (!(ex instanceof Expression)) ex = Expression.fromJSLoose(ex);
+    return new ModeExpression({ operand: this, expression: ex });
   }
 
   public collect(ex: any) {

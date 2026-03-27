@@ -182,6 +182,7 @@ describe('Expression', () => {
           tuning: 'resolution=400',
         },
         { op: 'collect', expression: { op: 'ref', name: 'myVar' } },
+        { op: 'mode', expression: { op: 'ref', name: 'myVar' } },
         { op: 'cast', outputType: 'TIME' },
         { op: 'cast', outputType: 'NUMBER' },
 

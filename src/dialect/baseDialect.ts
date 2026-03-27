@@ -225,6 +225,10 @@ export abstract class SQLDialect {
     throw new Error('dialect does not implement quantile');
   }
 
+  public modeExpression(_expressionSQL: string, _operandSQL: string): string {
+    throw new Error('dialect does not implement mode');
+  }
+
   public logExpression(base: string, operand: string): string {
     if (base === String(Math.E)) return `LN(${operand})`;
     return `LOG(${base},${operand})`;

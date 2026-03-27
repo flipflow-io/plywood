@@ -2277,6 +2277,248 @@ describe('DruidSQL Functional', function () {
     });
   });
 
+  // ============================================================
+  // MODE Expression Functional Tests
+  // Tests the decomposition approach: split queries produce
+  // separate normal + mode queries joined in memory.
+  // ============================================================
+  describe('MODE expression', function () {
+    this.timeout(10000);
+
+    const basicExecutor = basicExecutorFactory({
+      datasets: {
+        wiki: External.fromJS(
+          {
+            engine: 'druidsql',
+            source: 'wikipedia',
+            attributes: wikiAttributes,
+            derivedAttributes: wikiDerivedAttributes,
+            context,
+          },
+          druidRequester,
+        ),
+      },
+    });
+
+    it('split + mode + count (most frequent page per channel)', () => {
+      const ex = $('wiki')
+        .split($('channel'), 'Channel')
+        .apply('Count', $('wiki').sum('$count'))
+        .apply('ModePage', $('wiki').mode('$page'))
+        .sort('$Count', 'descending')
+        .limit(5);
+
+      return basicExecutor(ex).then(result => {
+        expect(result.toJS().data).to.deep.equal([
+          {
+            Channel: 'en',
+            Count: 114711,
+            ModePage: 'User:Cyde/List of candidates for speedy deletion/Subpage',
+          },
+          {
+            Channel: 'vi',
+            Count: 99010,
+            ModePage: 'Giang Hoa (diễn viên)',
+          },
+          {
+            Channel: 'de',
+            Count: 25103,
+            ModePage: 'Wikipedia:Vandalismusmeldung',
+          },
+          {
+            Channel: 'fr',
+            Count: 21285,
+            ModePage: 'Wikipédia:Le Bistro/12 septembre 2015',
+          },
+          {
+            Channel: 'ru',
+            Count: 14031,
+            ModePage: 'Гомосексуальный образ жизни',
+          },
+        ]);
+      });
+    });
+
+    it('total mode + count (most frequent channel overall)', () => {
+      const ex = ply()
+        .apply('Count', $('wiki').sum('$count'))
+        .apply('ModeChannel', $('wiki').mode('$channel'));
+
+      return basicExecutor(ex).then(result => {
+        expect(result.toJS().data).to.deep.equal([
+          {
+            Count: 392443,
+            ModeChannel: 'en',
+          },
+        ]);
+      });
+    });
+
+    it('value mode (single most frequent page)', () => {
+      const ex = ply().apply('MostFrequentPage', $('wiki').mode('$page'));
+
+      return basicExecutor(ex).then(result => {
+        expect(result.toJS().data).to.deep.equal([
+          {
+            MostFrequentPage: 'Jeremy Corbyn',
+          },
+        ]);
+      });
+    });
+
+    it('multiple modes in same split', () => {
+      const ex = $('wiki')
+        .split($('channel'), 'Channel')
+        .apply('Count', $('wiki').sum('$count'))
+        .apply('ModePage', $('wiki').mode('$page'))
+        .apply('ModeUser', $('wiki').mode('$user'))
+        .sort('$Count', 'descending')
+        .limit(3);
+
+      return basicExecutor(ex).then(result => {
+        expect(result.toJS().data).to.deep.equal([
+          {
+            Channel: 'en',
+            Count: 114711,
+            ModePage: 'User:Cyde/List of candidates for speedy deletion/Subpage',
+            ModeUser: 'The Quixotic Potato',
+          },
+          {
+            Channel: 'vi',
+            Count: 99010,
+            ModePage: 'Giang Hoa (diễn viên)',
+            ModeUser: 'TuanminhBot',
+          },
+          {
+            Channel: 'de',
+            Count: 25103,
+            ModePage: 'Wikipedia:Vandalismusmeldung',
+            ModeUser: 'Krdbot',
+          },
+        ]);
+      });
+    });
+
+    it('mode + sum + count', () => {
+      const ex = $('wiki')
+        .split($('channel'), 'Channel')
+        .apply('Count', $('wiki').sum('$count'))
+        .apply('TotalAdded', $('wiki').sum('$added'))
+        .apply('ModePage', $('wiki').mode('$page'))
+        .sort('$Count', 'descending')
+        .limit(3);
+
+      return basicExecutor(ex).then(result => {
+        expect(result.toJS().data).to.deep.equal([
+          {
+            Channel: 'en',
+            Count: 114711,
+            TotalAdded: 32553107,
+            ModePage: 'User:Cyde/List of candidates for speedy deletion/Subpage',
+          },
+          {
+            Channel: 'vi',
+            Count: 99010,
+            TotalAdded: 3225313,
+            ModePage: 'Giang Hoa (diễn viên)',
+          },
+          {
+            Channel: 'de',
+            Count: 25103,
+            TotalAdded: 5743850,
+            ModePage: 'Wikipedia:Vandalismusmeldung',
+          },
+        ]);
+      });
+    });
+
+    it('mode as only aggregate in split', () => {
+      const ex = $('wiki')
+        .split($('channel'), 'Channel')
+        .apply('ModePage', $('wiki').mode('$page'))
+        .sort('$Channel', 'ascending')
+        .limit(3);
+
+      return basicExecutor(ex).then(result => {
+        expect(result.toJS().data).to.deep.equal([
+          {
+            Channel: 'ar',
+            ModePage: 'قبيلة حارم المشحكة والمعربة',
+          },
+          {
+            Channel: 'be',
+            ModePage: 'Парк імя Міхаіла Паўлава',
+          },
+          {
+            Channel: 'bg',
+            ModePage: 'Уикипедия:Разговори',
+          },
+        ]);
+      });
+    });
+
+    it('mode with time split', () => {
+      const ex = $('wiki')
+        .split($('__time').timeBucket('PT12H', 'Etc/UTC'), 'TimeHalf')
+        .apply('Count', $('wiki').sum('$count'))
+        .apply('ModeChannel', $('wiki').mode('$channel'))
+        .sort('$TimeHalf', 'ascending');
+
+      return basicExecutor(ex).then(result => {
+        expect(result.toJS().data).to.deep.equal([
+          {
+            TimeHalf: {
+              start: new Date('2015-09-12T00:00:00.000Z'),
+              end: new Date('2015-09-12T12:00:00.000Z'),
+            },
+            Count: 165125,
+            ModeChannel: 'vi',
+          },
+          {
+            TimeHalf: {
+              start: new Date('2015-09-12T12:00:00.000Z'),
+              end: new Date('2015-09-13T00:00:00.000Z'),
+            },
+            Count: 227318,
+            ModeChannel: 'en',
+          },
+        ]);
+      });
+    });
+
+    it('mode with filter on the mode aggregate', () => {
+      const ex = $('wiki')
+        .split($('channel'), 'Channel')
+        .apply('Count', $('wiki').sum('$count'))
+        .apply(
+          'ModeNamespace',
+          $('wiki').filter($('namespace').isnt('Main')).mode('$namespace'),
+        )
+        .sort('$Count', 'descending')
+        .limit(3);
+
+      return basicExecutor(ex).then(result => {
+        expect(result.toJS().data).to.deep.equal([
+          {
+            Channel: 'en',
+            Count: 114711,
+            ModeNamespace: 'User talk',
+          },
+          {
+            Channel: 'vi',
+            Count: 99010,
+            ModeNamespace: 'Wikipedia',
+          },
+          {
+            Channel: 'de',
+            Count: 25103,
+            ModeNamespace: 'Wikipedia',
+          },
+        ]);
+      });
+    });
+  });
+
   describe('DruidSQL Functional', function () {
     this.timeout(10000);
 

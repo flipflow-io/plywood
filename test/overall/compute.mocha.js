@@ -1286,6 +1286,54 @@ describe('compute native', () => {
     });
   });
 
+  it('works with mode on strings', () => {
+    const modeData = [
+      { color: 'red', size: 10 },
+      { color: 'blue', size: 20 },
+      { color: 'red', size: 30 },
+      { color: 'blue', size: 20 },
+      { color: 'red', size: 20 },
+      { color: 'green', size: 10 },
+    ];
+
+    const ex = ply()
+      .apply('d', Dataset.fromJS(modeData).hide())
+      .apply('modeColor', '$d.mode($color)')
+      .apply('modeSize', '$d.mode($size)');
+
+    return ex.compute().then(v => {
+      expect(v.toJS().data).to.deep.equal([
+        {
+          modeColor: 'red',
+          modeSize: 20,
+        },
+      ]);
+    });
+  });
+
+  it('works with mode with nulls', () => {
+    const modeDataNulls = [
+      { color: null },
+      { color: null },
+      { color: 'blue' },
+      { color: 'blue' },
+      { color: 'blue' },
+      { color: null },
+    ];
+
+    const ex = ply()
+      .apply('d', Dataset.fromJS(modeDataNulls).hide())
+      .apply('modeColor', '$d.mode($color)');
+
+    return ex.compute().then(v => {
+      expect(v.toJS().data).to.deep.equal([
+        {
+          modeColor: 'blue',
+        },
+      ]);
+    });
+  });
+
   it('works with a basic select', () => {
     const ds = Dataset.fromJS(data);
 
