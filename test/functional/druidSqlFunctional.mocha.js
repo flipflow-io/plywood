@@ -2490,10 +2490,7 @@ describe('DruidSQL Functional', function () {
       const ex = $('wiki')
         .split($('channel'), 'Channel')
         .apply('Count', $('wiki').sum('$count'))
-        .apply(
-          'ModeNamespace',
-          $('wiki').filter($('namespace').isnt('Main')).mode('$namespace'),
-        )
+        .apply('ModeNamespace', $('wiki').filter($('namespace').isnt('Main')).mode('$namespace'))
         .sort('$Count', 'descending')
         .limit(3);
 
