@@ -18,7 +18,7 @@
 import { PlywoodRequester } from 'plywood-base-api';
 import { Transform } from 'readable-stream';
 
-import { Attributes } from '../datatypes/attributeInfo';
+import { AttributeInfo, Attributes } from '../datatypes/attributeInfo';
 import { SQLDialect } from '../dialect/baseDialect';
 import {
   $,
@@ -45,7 +45,6 @@ import {
   QueryAndPostTransform,
 } from './baseExternal';
 import { buildResplitAggregationSQL } from './utils/resplitAggregationSQLBuilder';
-import { AttributeInfo } from '../datatypes/attributeInfo';
 
 function getSplitInflaters(split: SplitExpression): Inflater[] {
   return split.mapSplits((label, splitExpression) => {
@@ -178,6 +177,7 @@ export abstract class SQLExternal extends External {
           .filter(Boolean);
 
         queryParts.push(
+          'SELECT',
           selectedAttributes
             .map(a => {
               const name = a.name;
@@ -199,7 +199,12 @@ export abstract class SQLExternal extends External {
         break;
 
       case 'value':
-        queryParts.push(this.toValueApply().getSQL(dialect), fromClause, dialect.emptyGroupBy());
+        queryParts.push(
+          'SELECT',
+          this.toValueApply().getSQL(dialect),
+          fromClause,
+          dialect.emptyGroupBy(),
+        );
         postTransform = External.valuePostTransformFactory();
         break;
 
@@ -214,6 +219,7 @@ export abstract class SQLExternal extends External {
 
         keys = [];
         queryParts.push(
+          'SELECT',
           applies.map(apply => apply.getSQL(dialect)).join(',\n'),
           fromClause,
           dialect.emptyGroupBy(),
@@ -242,7 +248,7 @@ export abstract class SQLExternal extends External {
           }[];
         } = {};
 
-        const otherApplies: ApplyExpression[] = [];
+        const _otherApplies: ApplyExpression[] = [];
 
         applies.forEach(apply => {
           if (apply.expression instanceof SqlAggregateExpression) {
@@ -280,9 +286,9 @@ export abstract class SQLExternal extends External {
           const pnaApplies = pivotNestedAggApplies[subSplitExpression];
 
           // Construir las expresiones de selección y agrupación internas
-          // @ts-expect-error
+          // @ts-expect-error - plywood Set constructor uses non-standard signature
           let innerSelectExpressions = new Set({ setType: 'STRING', elements: [] });
-          // @ts-expect-error
+          // @ts-expect-error - plywood Set constructor uses non-standard signature
           let innerGroupByExpressions = new Set({ setType: 'STRING', elements: [] });
 
           // Añadir la expresión de subdivisión interna
@@ -308,9 +314,9 @@ export abstract class SQLExternal extends External {
             ? 'WHERE ' + filter.getSQL(dialect)
             : '';
 
-          // @ts-expect-error
+          // @ts-expect-error - accessing plywood Set internal elements
           const items = innerSelectExpressions.elements;
-          // @ts-expect-error
+          // @ts-expect-error - accessing plywood Set internal elements
           const groupItems = innerGroupByExpressions.elements;
           const innerAggregateSQL = `
           SELECT
@@ -348,7 +354,7 @@ export abstract class SQLExternal extends External {
           'SELECT',
           selectExpressions.join(',\n'),
           fromClause,
-          groupByExpressions.length > 0 ? 'GROUP BY ' + groupByExpressions.join(', ') : '',
+          groupByExpressions.length > 0 ? 'GROUP BY ' + groupByExpressions.join(',') : '',
         );
 
         // Manejar HAVING, ORDER BY y LIMIT
@@ -366,49 +372,6 @@ export abstract class SQLExternal extends External {
       }
       default:
         throw new Error(`can not get query for mode: ${mode}`);
-    }
-
-    // If nestedGroupByResult exists, it already built the query parts
-    // Otherwise, build them now
-    if (!nestedGroupByResult) {
-      // Build WITH clause if there are CTEs
-      if (cteDefinitions.length > 0) {
-        queryParts.unshift(`WITH\n  ${cteDefinitions.join(',\n  ')}`);
-      }
-
-      // Build SELECT clause if not already built
-      if (selectExpressions.length === 0) {
-        selectExpressions.push('1');
-      }
-
-      queryParts.push('SELECT ' + selectExpressions.join(', '));
-      queryParts.push(fromClause);
-      if (groupByExpressions && groupByExpressions.length > 0) {
-        queryParts.push('GROUP BY ' + groupByExpressions.join(', '));
-      }
-
-      // Add HAVING, ORDER BY, LIMIT
-      if (!this.havingFilter.equals(Expression.TRUE)) {
-        queryParts.push('HAVING ' + this.havingFilter.getSQL(dialect));
-      }
-      if (sort) {
-        queryParts.push(sort.getSQL(dialect));
-      }
-      if (limit) {
-        queryParts.push(limit.getSQL(dialect));
-      }
-    } else {
-      // nestedGroupByResult already has SELECT, FROM, GROUP BY
-      // Just add HAVING, ORDER BY, LIMIT if needed
-      if (!this.havingFilter.equals(Expression.TRUE)) {
-        queryParts.push('HAVING ' + this.havingFilter.getSQL(dialect));
-      }
-      if (sort) {
-        queryParts.push(sort.getSQL(dialect));
-      }
-      if (limit) {
-        queryParts.push(limit.getSQL(dialect));
-      }
     }
 
     return {
@@ -494,6 +457,7 @@ export abstract class SQLExternal extends External {
     };
 
     const { applies, split, dialect } = this;
+    if (!applies && !this.valueExpression) return null;
     const effectiveApplies = applies
       ? applies
       : [Expression._.apply('__VALUE__', this.valueExpression)];
@@ -654,9 +618,10 @@ export abstract class SQLExternal extends External {
     if (!cteColumnNames || cteColumnNames.length === 0) {
       return sqlExpression;
     }
-    const isCompleteAggregateExpression = /^(SUM|COUNT|AVG|MIN|MAX|STDDEV|VARIANCE|GROUP_CONCAT|LISTAGG|ARRAY_AGG|STRING_AGG|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|EVERY|REGR_|PERCENTILE_|MEDIAN|ANY_VALUE)\s*\(/i.test(
-      sqlExpression,
-    );
+    const isCompleteAggregateExpression =
+      /^(SUM|COUNT|AVG|MIN|MAX|STDDEV|VARIANCE|GROUP_CONCAT|LISTAGG|ARRAY_AGG|STRING_AGG|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|EVERY|REGR_|PERCENTILE_|MEDIAN|ANY_VALUE)\s*\(/i.test(
+        sqlExpression,
+      );
     if (isCompleteAggregateExpression) {
       return sqlExpression;
     }
@@ -666,7 +631,10 @@ export abstract class SQLExternal extends External {
       const quotedColumnPattern = new RegExp(`"${columnName.replace(/"/g, '""')}"`, 'g');
       if (quotedColumnPattern.test(processedExpression)) {
         const aggregatePattern = new RegExp(
-          `\\b(SUM|COUNT|AVG|MIN|MAX|STDDEV|VARIANCE|GROUP_CONCAT|LISTAGG|ARRAY_AGG|STRING_AGG|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|EVERY|REGR_|PERCENTILE_|MEDIAN|ANY_VALUE)\\s*\\([^)]*"${columnName.replace(/"/g, '""')}"[^)]*\\)`,
+          `\\b(SUM|COUNT|AVG|MIN|MAX|STDDEV|VARIANCE|GROUP_CONCAT|LISTAGG|ARRAY_AGG|STRING_AGG|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|EVERY|REGR_|PERCENTILE_|MEDIAN|ANY_VALUE)\\s*\\([^)]*"${columnName.replace(
+            /"/g,
+            '""',
+          )}"[^)]*\\)`,
           'i',
         );
         if (!aggregatePattern.test(processedExpression)) {

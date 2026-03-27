@@ -233,9 +233,6 @@ function isString(str: string) {
 
 function getAttributeInfo(name: string, attributeValue: any): AttributeInfo {
   if (attributeValue == null) return null;
-  if (hasOwnProp(attributeValue, 'engine')) {
-    return null;
-  }
   if (isDate(attributeValue)) {
     return new AttributeInfo({ name, type: 'TIME' });
   } else if (isBoolean(attributeValue)) {
@@ -1124,7 +1121,7 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
       const a = valueIsTimeRange(d[attribute])
         ? TimeRange.fromJS(d[attribute] as any)
         : d[attribute];
-      const b = valueIsTimeRange(value) ? TimeRange.fromJS(value as any) : value;
+      const b = valueIsTimeRange(value) ? TimeRange.fromJS(value) : value;
       return generalEqual(a, b);
     });
   }

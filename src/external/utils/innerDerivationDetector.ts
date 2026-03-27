@@ -38,4 +38,3 @@ export function detectInnerDerivation(innerApplies: ApplyExpression[]): boolean 
   }
   return false;
 }
-

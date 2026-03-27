@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-import { Expression } from '../../expressions';
 import { SQLDialect } from '../../dialect/baseDialect';
+import { Expression } from '../../expressions';
 
 export interface QualifiedExpressions {
   selectExpressions: string[];
@@ -49,7 +49,7 @@ export function qualifyColumns(
   const groupByExpressions: string[] = [];
 
   for (const name in outerSplits) {
-    if (!outerSplits.hasOwnProperty(name)) continue;
+    if (!Object.prototype.hasOwnProperty.call(outerSplits, name)) continue;
 
     const expression = outerSplits[name];
     let sql = expression.getSQL(dialect);
@@ -77,4 +77,3 @@ export function qualifyColumns(
     groupByExpressions,
   };
 }
-

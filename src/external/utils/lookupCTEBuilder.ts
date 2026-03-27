@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-import { Expression } from '../../expressions';
 import { SQLDialect } from '../../dialect/baseDialect';
+import { Expression } from '../../expressions';
 
 export interface LookupCTEResult {
   cteDefinition: string | null;
@@ -67,7 +67,7 @@ export function buildLookupCTE(
 
   // Include measure internal splits for JOIN
   for (const intermediateName in measureInternalSplits) {
-    if (!measureInternalSplits.hasOwnProperty(intermediateName)) continue;
+    if (!Object.prototype.hasOwnProperty.call(measureInternalSplits, intermediateName)) continue;
     const expression = measureInternalSplits[intermediateName];
     const sql = expression.getSQL(dialect);
     lookupSelectExpressions.push(`${sql} AS ${dialect.escapeName(intermediateName)}`);
@@ -77,7 +77,7 @@ export function buildLookupCTE(
 
   // Include additional splits
   for (const intermediateName in additionalSplits) {
-    if (!additionalSplits.hasOwnProperty(intermediateName)) continue;
+    if (!Object.prototype.hasOwnProperty.call(additionalSplits, intermediateName)) continue;
     const expression = additionalSplits[intermediateName];
     const sql = expression.getSQL(dialect);
     lookupSelectExpressions.push(`${sql} AS ${dialect.escapeName(intermediateName)}`);
@@ -113,17 +113,15 @@ export function buildLookupCTE(
 
   // Add all columns from inner query
   for (const intermediateName in measureInternalSplits) {
-    if (!measureInternalSplits.hasOwnProperty(intermediateName)) continue;
+    if (!Object.prototype.hasOwnProperty.call(measureInternalSplits, intermediateName)) continue;
     outerLookupSelectExpressions.push(
       `${lookupInnerAlias}.${dialect.escapeName(intermediateName)}`,
     );
-    outerPartitionByExpressions.push(
-      `${lookupInnerAlias}.${dialect.escapeName(intermediateName)}`,
-    );
+    outerPartitionByExpressions.push(`${lookupInnerAlias}.${dialect.escapeName(intermediateName)}`);
   }
 
   for (const intermediateName in additionalSplits) {
-    if (!additionalSplits.hasOwnProperty(intermediateName)) continue;
+    if (!Object.prototype.hasOwnProperty.call(additionalSplits, intermediateName)) continue;
     outerLookupSelectExpressions.push(
       `${lookupInnerAlias}.${dialect.escapeName(intermediateName)}`,
     );
@@ -137,7 +135,9 @@ export function buildLookupCTE(
   const outerLookupQueryParts = [
     'SELECT',
     outerLookupSelectExpressions.join(',\n'),
-    `, ROW_NUMBER() OVER (PARTITION BY ${outerPartitionByExpressions.join(', ')} ORDER BY ${lookupInnerAlias}."__time_max" DESC) AS rn`,
+    `, ROW_NUMBER() OVER (PARTITION BY ${outerPartitionByExpressions.join(
+      ', ',
+    )} ORDER BY ${lookupInnerAlias}."__time_max" DESC) AS rn`,
     'FROM (',
     innerLookupQuery,
     `) AS ${lookupInnerAlias}`,
@@ -149,9 +149,11 @@ export function buildLookupCTE(
   // Build join conditions based on measure internal splits
   const joinConditions: string[] = [];
   for (const intermediateName in measureInternalSplits) {
-    if (!measureInternalSplits.hasOwnProperty(intermediateName)) continue;
+    if (!Object.prototype.hasOwnProperty.call(measureInternalSplits, intermediateName)) continue;
     joinConditions.push(
-      `t.${dialect.escapeName(intermediateName)} = ${lookupCTEName}.${dialect.escapeName(intermediateName)}`,
+      `t.${dialect.escapeName(intermediateName)} = ${lookupCTEName}.${dialect.escapeName(
+        intermediateName,
+      )}`,
     );
   }
 
@@ -162,4 +164,3 @@ export function buildLookupCTE(
     additionalOuterSplits,
   };
 }
-
