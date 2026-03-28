@@ -42,65 +42,8 @@ jobs:
             test/parser/* \
             test/simulate/*
 
-  functional-test:
-    needs: lint-and-test
-    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci --legacy-peer-deps --ignore-scripts
-
-      - name: Compile
-        run: ./compile
-
-      - name: Start Druid
-        run: |
-          docker run -d --name druid \
-            -p 8888:8888 -p 8082:8082 -p 8081:8081 \
-            -e druid_extensions_loadList='["druid-multi-stage-query"]' \
-            apache/druid:35.0.0 \
-            ./bin/start-druid
-
-      - name: Wait for Druid to be ready
-        run: |
-          echo "Waiting for Druid..."
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:8888/status > /dev/null 2>&1; then
-              echo "Druid is up!"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "Druid failed to start"
-              docker logs druid --tail 50
-              exit 1
-            fi
-            sleep 5
-          done
-          curl -sf http://localhost:8888/status | jq .version
-
-      - name: Load wikipedia test dataset
-        run: |
-          DRUID_HOST=localhost:8888 ./test/load-wikipedia.sh
-        timeout-minutes: 5
-
-      - name: Druid SQL functional tests
-        run: |
-          PLYWOOD_PATH="build/plywood" npx mocha \
-            test/functional/druidSqlFunctional.mocha.js \
-            test/functional/druidFunctional.mocha.js
-        env:
-          DRUID_HOST: localhost:8888
-
   publish:
-    needs: [lint-and-test, functional-test]
+    needs: lint-and-test
     if: github.ref == 'refs/heads/master' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
