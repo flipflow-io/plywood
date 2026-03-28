@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-exports.druidVersion = '2023.05.0-iap';
-exports.druidHost = `localhost:8082`;
+exports.druidVersion = process.env.DRUID_VERSION || '2023.05.0-iap';
+exports.druidHost = process.env.DRUID_HOST || `localhost:8082`;
 exports.druidContext = {
   timeout: 10000,
   useCache: false,

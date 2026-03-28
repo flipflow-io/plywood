@@ -13,3 +13,6 @@
 /private/
 /build/
 /docs/examples/play.js
+
+# === Auth (generated from .npmrc.example) ===
+.npmrc

@@ -129,3 +129,131 @@ git push origin my-feature-branch
 - **Communicate with the Team**: Keep team members informed about significant changes or issues.
 
 ---
+
+# Testing
+
+Requires **Node 20** (pinned via Volta in `package.json`).
+
+```bash
+npm install --legacy-peer-deps
+```
+
+## Compile
+
+Every test command runs `./compile` first, which does: ESLint → Prettier check → PEG.js → TypeScript → rollup bundle. You can run it standalone:
+
+```bash
+./compile
+```
+
+If lint/format fails:
+
+```bash
+npm run eslint-fix
+npm run prettify
+```
+
+## Unit + Simulate Tests (no external deps)
+
+```bash
+npm test
+```
+
+This runs `./travis-test`: compile + mocha on `test/{datatypes,expression,external,helper,overall,parser,simulate}/*` against 3 builds (build, package, package.min) + lite builds.
+
+To run a single test file fast (skips compile, uses existing build):
+
+```bash
+npx mocha test/simulate/simulateDruidSqlMode.mocha.js
+```
+
+## Functional Tests (require live databases)
+
+```bash
+npm run full-test
+```
+
+This runs `./run-tests`: compile + mocha on `test/*/*` (includes `test/functional/*`).
+
+### Prerequisites
+
+Functional tests connect to real databases. Config is in `test/info.js`:
+
+| Database   | Host            | Required by                                |
+|------------|-----------------|--------------------------------------------|
+| Druid      | `localhost:8182` | `druidSqlFunctional`, `druidFunctional`    |
+| MySQL      | `localhost:3306` | `mySqlFunctional`                          |
+| PostgreSQL | `localhost:5432` | `postgresFunctional`                       |
+
+On `flipflow-dev`, Druid is available via SSH tunnel:
+
+```bash
+# Check if tunnel is already running
+ss -tlnp | grep 8182
+
+# If not, start it
+systemctl --user start tunnel@druid-router
+```
+
+### Load the Wikipedia test dataset into Druid
+
+The functional tests expect a `wikipedia` datasource with 39244 rows (Wikipedia edits from 2015-09-12):
+
+```bash
+./test/load-wikipedia.sh
+```
+
+This script loads the data via Druid MSQ, polls until ingestion completes, and verifies the row count. See the script for the full ingestion SQL.
+
+Verify manually if needed:
+
+```bash
+curl -s 'http://localhost:8182/druid/v2/sql' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "SELECT COUNT(*) AS cnt FROM \"wikipedia\""}' | jq
+# Should return 39244
+```
+
+### Run only Druid SQL functional tests
+
+```bash
+npx mocha test/functional/druidSqlFunctional.mocha.js
+```
+
+### Run only simulate tests (no DB needed)
+
+```bash
+npx mocha test/simulate/*
+```
+
+### Run a single test by name
+
+```bash
+npx mocha test/functional/druidSqlFunctional.mocha.js --grep "MODE"
+```
+
+## Test structure
+
+```
+test/
+├── datatypes/       # Dataset, Set, TimeRange, etc.
+├── expression/      # Expression parsing, serialization, free references
+├── external/        # External query planning
+├── helper/          # Utility tests
+├── overall/         # Compute engine (in-memory evaluation)
+├── parser/          # PEG.js expression parser
+├── simulate/        # SQL generation tests (no real DB)
+│   ├── simulateDruidSql.mocha.js
+│   ├── simulateDruidSqlMode.mocha.js
+│   ├── simulateDruid.mocha.js (native Druid JSON queries)
+│   └── simulateMySQL.mocha.js
+├── functional/      # Real database execution tests
+│   ├── druidSqlFunctional.mocha.js  (Druid SQL — main)
+│   ├── druidFunctional.mocha.js     (Druid native)
+│   ├── mySqlFunctional.mocha.js
+│   ├── postgresFunctional.mocha.js
+│   └── ...
+├── info.js          # Database connection config
+├── utils.js         # Test helpers (sane template tag)
+└── plywood.js       # PLYWOOD_PATH loader (build/plywood by default)
+```
