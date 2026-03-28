@@ -16,12 +16,13 @@
  */
 
 import { AttributeInfo } from '../../datatypes/attributeInfo';
-import { Expression, ApplyExpression, SplitExpression } from '../../expressions';
 import { SQLDialect } from '../../dialect/baseDialect';
-import { detectInnerDerivation } from './innerDerivationDetector';
-import { classifySplits, SplitClassificationResult, DivvyResult } from './splitClassifier';
-import { buildLookupCTE, LookupCTEResult } from './lookupCTEBuilder';
+import { ApplyExpression, Expression, SplitExpression } from '../../expressions';
+
 import { qualifyColumns } from './columnQualifier';
+import { detectInnerDerivation } from './innerDerivationDetector';
+import { buildLookupCTE, LookupCTEResult } from './lookupCTEBuilder';
+import { classifySplits, DivvyResult } from './splitClassifier';
 
 export interface ResplitAggregationSQLResult {
   cteDefinitions: string[];
@@ -87,7 +88,8 @@ export function buildResplitAggregationSQL(
   const innerGroupByExpressions: string[] = [];
 
   for (const intermediateName in classification.innerSplits) {
-    if (!classification.innerSplits.hasOwnProperty(intermediateName)) continue;
+    if (!Object.prototype.hasOwnProperty.call(classification.innerSplits, intermediateName))
+      continue;
     const expression = classification.innerSplits[intermediateName];
     const sql = expression.getSQL(dialect);
     innerSelectExpressions.push(`${sql} AS ${dialect.escapeName(intermediateName)}`);
@@ -101,9 +103,7 @@ export function buildResplitAggregationSQL(
 
   // Handle case when there are no GROUP BY expressions (no splits)
   const groupByClause =
-    innerGroupByExpressions.length > 0
-      ? `GROUP BY ${innerGroupByExpressions.join(', ')}`
-      : '';
+    innerGroupByExpressions.length > 0 ? `GROUP BY ${innerGroupByExpressions.join(', ')}` : '';
 
   const innerQueryParts = [
     'SELECT ' + innerSelectExpressions.join(',\n'),
@@ -139,7 +139,9 @@ export function buildResplitAggregationSQL(
   const cteDefinitions: string[] = [cteDefinition];
 
   if (lookupCTE && lookupCTE.joinConditions.length > 0) {
-    finalFromClause += `\nLEFT JOIN ${lookupCTE.cteName} ON ${lookupCTE.joinConditions.join(' AND ')} AND ${lookupCTE.cteName}.rn = 1`;
+    finalFromClause += `\nLEFT JOIN ${lookupCTE.cteName} ON ${lookupCTE.joinConditions.join(
+      ' AND ',
+    )} AND ${lookupCTE.cteName}.rn = 1`;
     cteDefinitions.push(lookupCTE.cteDefinition);
   }
 
@@ -162,14 +164,13 @@ export function buildResplitAggregationSQL(
   if (lookupCTE && additionalSplitsKeys.length > 0) {
     // Map intermediate names to outer names
     for (const intermediateName in classification.additionalSplits) {
-      if (!classification.additionalSplits.hasOwnProperty(intermediateName)) continue;
+      if (!Object.prototype.hasOwnProperty.call(classification.additionalSplits, intermediateName))
+        continue;
 
       // Find outer name for this intermediate name
       let outerName: string | null = null;
       for (const oname in classification.outerSplitNameToIntermediateName) {
-        if (
-          classification.outerSplitNameToIntermediateName[oname] === intermediateName
-        ) {
+        if (classification.outerSplitNameToIntermediateName[oname] === intermediateName) {
           outerName = oname;
           break;
         }
@@ -177,11 +178,11 @@ export function buildResplitAggregationSQL(
 
       if (outerName) {
         selectExpressions.push(
-          `${lookupCTE.cteName}.${dialect.escapeName(intermediateName)} AS ${dialect.escapeName(outerName)}`,
+          `${lookupCTE.cteName}.${dialect.escapeName(intermediateName)} AS ${dialect.escapeName(
+            outerName,
+          )}`,
         );
-        groupByExpressions.push(
-          `${lookupCTE.cteName}.${dialect.escapeName(intermediateName)}`,
-        );
+        groupByExpressions.push(`${lookupCTE.cteName}.${dialect.escapeName(intermediateName)}`);
       }
     }
   }
@@ -189,7 +190,7 @@ export function buildResplitAggregationSQL(
   // Step 8: Add outer applies
   const cteColumnNames: string[] = [];
   for (const intermediateName in classification.innerSplits) {
-    if (classification.innerSplits.hasOwnProperty(intermediateName)) {
+    if (Object.prototype.hasOwnProperty.call(classification.innerSplits, intermediateName)) {
       cteColumnNames.push(intermediateName);
     }
   }
@@ -200,18 +201,10 @@ export function buildResplitAggregationSQL(
   outerApplies.forEach(apply => {
     const sqlWithoutAlias = apply.getSQL(dialect).replace(/\s+AS\s+.*$/i, '');
     if (groupByExpressions.length > 0) {
-      const processedSql = wrapCTEReferencesWithAnyValue(
-        sqlWithoutAlias,
-        cteColumnNames,
-        dialect,
-      );
+      const processedSql = wrapCTEReferencesWithAnyValue(sqlWithoutAlias, cteColumnNames, dialect);
       selectExpressions.push(`${processedSql} AS ${dialect.escapeName(apply.name)}`);
     } else {
-      const processedSql = wrapCTEReferencesWithAnyValue(
-        sqlWithoutAlias,
-        cteColumnNames,
-        dialect,
-      );
+      const processedSql = wrapCTEReferencesWithAnyValue(sqlWithoutAlias, cteColumnNames, dialect);
       selectExpressions.push(`${processedSql} AS ${dialect.escapeName(apply.name)}`);
     }
   });
@@ -224,4 +217,3 @@ export function buildResplitAggregationSQL(
     outerAttributes,
   };
 }
-

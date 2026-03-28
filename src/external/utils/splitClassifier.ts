@@ -79,9 +79,7 @@ export function classifySplits(
     const intermediateName = `s${splitCount++}`;
     const divvy = divvyUpNestedSplitExpression(ex, intermediateName);
 
-    outerAttributes.push(
-      AttributeInfo.fromJS({ name: intermediateName, type: divvy.inner.type }),
-    );
+    outerAttributes.push(AttributeInfo.fromJS({ name: intermediateName, type: divvy.inner.type }));
 
     innerSplits[intermediateName] = divvy.inner;
 
@@ -130,7 +128,7 @@ export function classifySplits(
     uiSplit.mapSplits((sname, sex) => {
       // Find the intermediate name for this split
       for (const checkIntermediateName in innerSplits) {
-        if (!innerSplits.hasOwnProperty(checkIntermediateName)) continue;
+        if (!Object.prototype.hasOwnProperty.call(innerSplits, checkIntermediateName)) continue;
 
         const checkDivvy = divvyUpNestedSplitExpression(sex, checkIntermediateName);
         if (checkDivvy.inner.equals(innerSplits[checkIntermediateName])) {
@@ -143,7 +141,7 @@ export function classifySplits(
 
   // Separate splits: measure internal vs additional
   for (const intermediateName in innerSplits) {
-    if (!innerSplits.hasOwnProperty(intermediateName)) continue;
+    if (!Object.prototype.hasOwnProperty.call(innerSplits, intermediateName)) continue;
 
     if (hasInnerDerivation && !measureInternalSplits[intermediateName]) {
       // This is an additional split - it should NOT go to inner CTE GROUP BY
@@ -169,4 +167,3 @@ export function classifySplits(
     outerAttributes,
   };
 }
-

@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  GAR_NPM_URL: https://europe-west4-npm.pkg.dev/flipflow-426307/flipflow-npm/
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Compile (eslint + prettier + tsc + bundle)
+        run: ./compile
+
+      - name: Unit and simulate tests
+        run: |
+          PLYWOOD_PATH="build/plywood" npx mocha \
+            test/datatypes/* \
+            test/expression/* \
+            test/external/* \
+            test/helper/* \
+            test/overall/* \
+            test/parser/* \
+            test/simulate/*
+
+  functional-test:
+    needs: lint-and-test
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    services:
+      druid:
+        image: apache/druid:35.0.0
+        ports:
+          - 8082:8082
+          - 8888:8888
+          - 8081:8081
+        env:
+          DRUID_SINGLE_NODE_CONF: micro-quickstart
+          druid_extensions_loadList: '["druid-multi-stage-query"]'
+        options: >-
+          --health-cmd "curl -sf http://localhost:8888/status || exit 1"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 90s
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Compile
+        run: ./compile
+
+      - name: Wait for Druid to be ready
+        run: |
+          echo "Waiting for Druid router..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8888/status > /dev/null 2>&1; then
+              echo "Druid is up!"
+              break
+            fi
+            sleep 5
+          done
+          curl -sf http://localhost:8888/status | jq .version
+
+      - name: Load wikipedia test dataset
+        run: |
+          DRUID_HOST=localhost:8888 ./test/load-wikipedia.sh
+        timeout-minutes: 5
+
+      - name: Druid SQL functional tests
+        run: |
+          PLYWOOD_PATH="build/plywood" npx mocha \
+            test/functional/druidSqlFunctional.mocha.js \
+            test/functional/druidFunctional.mocha.js
+        env:
+          DRUID_HOST: localhost:8888
+
+  publish:
+    needs: [lint-and-test, functional-test]
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure npm for Artifact Registry
+        run: |
+          cp .npmrc.example .npmrc
+          npx google-artifactregistry-auth --repo-config=./.npmrc --credential-config=./.npmrc
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Compile
+        run: ./compile
+
+      - name: Check if version already published
+        id: version_check
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          echo "name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "$PKG_NAME@$PKG_VERSION" version 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$PKG_NAME@$PKG_VERSION already published — skipping"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to Artifact Registry
+        if: steps.version_check.outputs.exists == 'false'
+        run: npm publish
