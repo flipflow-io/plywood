@@ -16,9 +16,10 @@
  */
 
 import { PlywoodRequester } from 'plywood-base-api';
-import { Transform } from 'readable-stream';
+import { ReadableStream, Transform } from 'readable-stream';
 
-import { AttributeInfo, Attributes } from '../datatypes/attributeInfo';
+import { AttributeInfo, Attributes, Dataset, Datum, PlywoodValue } from '../datatypes';
+import { Set } from '../datatypes/set';
 import { SQLDialect } from '../dialect/baseDialect';
 import {
   $,
@@ -28,6 +29,8 @@ import {
   CountExpression,
   Expression,
   FilterExpression,
+  LimitExpression,
+  ModeExpression,
   NumberBucketExpression,
   RefExpression,
   SortExpression,
@@ -35,6 +38,7 @@ import {
   SqlAggregateExpression,
   TimeBucketExpression,
 } from '../expressions';
+import { PlyType } from '../types';
 
 import {
   External,
@@ -43,6 +47,7 @@ import {
   Inflater,
   IntrospectionDepth,
   QueryAndPostTransform,
+  TotalContainer,
 } from './baseExternal';
 import { buildResplitAggregationSQL } from './utils/resplitAggregationSQLBuilder';
 
@@ -107,6 +112,226 @@ export abstract class SQLExternal extends External {
     }
 
     return `FROM ${dialect.escapeName(source as string)} AS t`;
+  }
+
+  // -----------------
+  // Mode Decomposition: splits mode applies from normal aggregates
+  // in split mode, generating separate queries joined in memory.
+  // -----------------
+
+  protected buildModeDecomposition(): {
+    normalExternal: External;
+    modeQueries: { name: string; sql: string; type: PlyType }[];
+    postJoinSort: SortExpression | null;
+    postJoinLimit: LimitExpression | null;
+  } | null {
+    if (this.mode !== 'split') return null;
+
+    const modeApplyInfos: { apply: ApplyExpression; modeExpression: ModeExpression }[] = [];
+    const normalApplies: ApplyExpression[] = [];
+    const modeApplyNames: Record<string, true> = {};
+
+    for (const apply of this.applies) {
+      const modeEx = SQLExternal.extractModeExpression(apply.expression);
+      if (modeEx) {
+        modeApplyInfos.push({ apply, modeExpression: modeEx });
+        modeApplyNames[apply.name] = true;
+      } else {
+        normalApplies.push(apply);
+      }
+    }
+
+    if (modeApplyInfos.length === 0) return null;
+
+    // If sort references a mode apply, strip it from normalExternal
+    // and apply it post-join in memory
+    let postJoinSort: SortExpression | null = null;
+    let postJoinLimit: LimitExpression | null = null;
+    const sortRefName =
+      this.sort && this.sort.expression.isOp('ref')
+        ? (this.sort.expression as RefExpression).name
+        : null;
+    const sortRefsMode = sortRefName && modeApplyNames[sortRefName];
+
+    // Build normal external without mode applies
+    const normalValue = this.valueOf();
+    normalValue.applies = normalApplies;
+    if (sortRefsMode) {
+      postJoinSort = this.sort;
+      postJoinLimit = this.limit;
+      delete normalValue.sort;
+      delete normalValue.limit;
+    }
+    const normalExternal = External.fromValue(normalValue);
+
+    // Build mode query SQL for each mode apply
+    const { dialect } = this;
+    const split = this.getQuerySplit();
+    const filter = this.getQueryFilter();
+    const from = this.getFrom();
+
+    const splitDimSQLs = split.getSelectSQLNoAliases(dialect);
+    const splitDimAliasedSQLs = split.getSelectSQL(dialect);
+    const splitKeyNames = split.mapSplits(name => name);
+    // Escaped key names for referencing aliased columns in outer query
+    const splitKeyEscaped = splitKeyNames.map(name => dialect.escapeName(name));
+
+    const modeQueries = modeApplyInfos.map(({ apply, modeExpression }) => {
+      const modeFieldSQL = modeExpression.expression.getSQL(dialect);
+      const modeFilter = SQLExternal.extractModeFilter(apply.expression, dialect);
+
+      // Build WHERE parts for the inner subquery
+      const whereParts: string[] = [];
+      if (!filter.equals(Expression.TRUE)) {
+        whereParts.push(filter.getSQL(dialect));
+      }
+      whereParts.push(`${modeFieldSQL} IS NOT NULL`);
+      if (modeFilter) {
+        whereParts.push(modeFilter);
+      }
+
+      // Inner subquery: alias split dims with key names, GROUP BY raw expressions
+      const innerSelect = [
+        ...splitDimAliasedSQLs,
+        `${modeFieldSQL} AS "__val"`,
+        `ROW_NUMBER() OVER (PARTITION BY ${splitDimSQLs.join(
+          ',',
+        )} ORDER BY COUNT(*) DESC) AS "__rn"`,
+      ].join(',\n');
+
+      const innerGroupBy = [...splitDimSQLs, modeFieldSQL].join(',');
+      const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+      // Outer query: reference aliased key names from inner subquery
+      const outerSelect = [...splitKeyEscaped, `"__val" AS ${dialect.escapeName(apply.name)}`].join(
+        ',\n',
+      );
+
+      const sql = [
+        'SELECT',
+        outerSelect,
+        `FROM (SELECT ${innerSelect} ${from} ${whereClause} GROUP BY ${innerGroupBy})`,
+        'WHERE "__rn" = 1',
+      ].join('\n');
+
+      return {
+        name: apply.name,
+        sql,
+        type: modeExpression.type,
+      };
+    });
+
+    return { normalExternal, modeQueries, postJoinSort, postJoinLimit };
+  }
+
+  public simulateValue(
+    lastNode: boolean,
+    simulatedQueries: any[],
+    externalForNext: External = null,
+  ): PlywoodValue | TotalContainer {
+    if (!externalForNext) externalForNext = this;
+
+    if (this.mode === 'split') {
+      const modeDecomp = this.buildModeDecomposition();
+      if (modeDecomp) {
+        const { normalExternal, modeQueries } = modeDecomp;
+
+        // Push normal query (without mode applies)
+        simulatedQueries.push(normalExternal.getQueryAndPostTransform().query);
+
+        // Push each mode query
+        for (const mq of modeQueries) {
+          simulatedQueries.push(this.sqlToQuery(mq.sql));
+        }
+
+        // Build sample result with all columns (split keys + all applies)
+        const datum: Datum = {};
+        this.split.mapSplits((name, expression) => {
+          datum[name] = this.getSampleValueForType(Set.unwrapSetType(expression.type));
+        });
+        for (const apply of this.applies) {
+          datum[apply.name] = this.getSampleValueForType(apply.expression.type);
+        }
+
+        const keys = this.split.mapSplits(name => name);
+        if (!lastNode) {
+          externalForNext.addNextExternalToDatum(datum);
+        }
+        return new Dataset({ keys, data: [datum] });
+      }
+    }
+    return super.simulateValue(lastNode, simulatedQueries, externalForNext);
+  }
+
+  private getSampleValueForType(type: string): any {
+    switch (type) {
+      case 'NUMBER':
+        return 4;
+      case 'STRING':
+        return 'some_value';
+      case 'BOOLEAN':
+        return true;
+      default:
+        return null;
+    }
+  }
+
+  protected queryBasicValueStream(rawQueries: any[] | null): ReadableStream {
+    if (this.mode === 'split') {
+      const modeDecomp = this.buildModeDecomposition();
+      if (modeDecomp) {
+        const { normalExternal, modeQueries } = modeDecomp;
+        const { engine, requester } = this;
+
+        // Execute normal external (standard aggregates)
+        // Cast needed: External.fromValue returns External but runtime type preserves subclass
+        const normalPromise = External.buildValueFromStream(
+          (normalExternal as any).queryBasicValueStream(rawQueries),
+        );
+
+        // Execute each mode query via the requester
+        const splitKeys = this.split.mapSplits(name => name);
+        const splitAttrs = this.split.mapSplits(
+          (name, expression) =>
+            new AttributeInfo({ name, type: Set.unwrapSetType(expression.type) }),
+        );
+
+        const modePromises = modeQueries.map(mq => {
+          const query = this.sqlToQuery(mq.sql);
+          const modeAttr = new AttributeInfo({ name: mq.name, type: mq.type });
+          const attrs = [...splitAttrs, modeAttr];
+          const postTransform = External.postTransformFactory([], attrs, splitKeys, null);
+
+          const stream = External.performQueryAndPostTransform(
+            { query, postTransform },
+            requester,
+            engine,
+            rawQueries,
+          );
+          return External.buildValueFromStream(stream);
+        });
+
+        const { postJoinSort, postJoinLimit } = modeDecomp;
+
+        // Join all results in memory, then apply sort/limit if needed
+        return External.valuePromiseToStream(
+          Promise.all([normalPromise, ...modePromises]).then(([normalPV, ...modePVs]) => {
+            let joined = normalPV as Dataset;
+            for (const modePV of modePVs) {
+              joined = joined.leftJoin(modePV as Dataset);
+            }
+            if (postJoinSort) {
+              joined = joined.sort(postJoinSort.expression, postJoinSort.direction);
+              if (postJoinLimit) {
+                joined = joined.limit(postJoinLimit.value);
+              }
+            }
+            return joined;
+          }),
+        );
+      }
+    }
+    return super.queryBasicValueStream(rawQueries);
   }
 
   public getQueryAndPostTransform(): QueryAndPostTransform<string> {
@@ -198,15 +423,36 @@ export abstract class SQLExternal extends External {
         }
         break;
 
-      case 'value':
-        queryParts.push(
-          'SELECT',
-          this.toValueApply().getSQL(dialect),
-          fromClause,
-          dialect.emptyGroupBy(),
-        );
+      case 'value': {
+        const valueApply = this.toValueApply();
+        const valueModeEx = SQLExternal.extractModeExpression(valueApply.expression);
+        if (valueModeEx) {
+          const modeFieldSQL = valueModeEx.expression.getSQL(dialect);
+          const modeFilter = SQLExternal.extractModeFilter(valueApply.expression, dialect);
+          const subWhereParts: string[] = [];
+          if (!filter.equals(Expression.TRUE)) {
+            subWhereParts.push(filter.getSQL(dialect));
+          }
+          subWhereParts.push(`${modeFieldSQL} IS NOT NULL`);
+          if (modeFilter) {
+            subWhereParts.push(modeFilter);
+          }
+          queryParts.push(
+            'SELECT',
+            `(SELECT ${modeFieldSQL} ${this.getFrom()} WHERE ${subWhereParts.join(
+              ' AND ',
+            )} GROUP BY ${modeFieldSQL} ORDER BY COUNT(*) DESC LIMIT 1) AS ${dialect.escapeName(
+              valueApply.name,
+            )}`,
+            fromClause,
+            dialect.emptyGroupBy(),
+          );
+        } else {
+          queryParts.push('SELECT', valueApply.getSQL(dialect), fromClause, dialect.emptyGroupBy());
+        }
         postTransform = External.valuePostTransformFactory();
         break;
+      }
 
       case 'total':
         zeroTotalApplies = applies;
@@ -220,7 +466,30 @@ export abstract class SQLExternal extends External {
         keys = [];
         queryParts.push(
           'SELECT',
-          applies.map(apply => apply.getSQL(dialect)).join(',\n'),
+          applies
+            .map(apply => {
+              const modeEx = SQLExternal.extractModeExpression(apply.expression);
+              if (modeEx) {
+                // Generate scalar subquery for total mode
+                const modeFieldSQL = modeEx.expression.getSQL(dialect);
+                const modeFilter = SQLExternal.extractModeFilter(apply.expression, dialect);
+                const subWhereParts: string[] = [];
+                if (!filter.equals(Expression.TRUE)) {
+                  subWhereParts.push(filter.getSQL(dialect));
+                }
+                subWhereParts.push(`${modeFieldSQL} IS NOT NULL`);
+                if (modeFilter) {
+                  subWhereParts.push(modeFilter);
+                }
+                return `(SELECT ${modeFieldSQL} ${this.getFrom()} WHERE ${subWhereParts.join(
+                  ' AND ',
+                )} GROUP BY ${modeFieldSQL} ORDER BY COUNT(*) DESC LIMIT 1) AS ${dialect.escapeName(
+                  apply.name,
+                )}`;
+              }
+              return apply.getSQL(dialect);
+            })
+            .join(',\n'),
           fromClause,
           dialect.emptyGroupBy(),
         );
@@ -250,7 +519,17 @@ export abstract class SQLExternal extends External {
 
         const _otherApplies: ApplyExpression[] = [];
 
+        // Collect mode applies for CTE generation
+        const modeApplies: { apply: ApplyExpression; modeExpression: ModeExpression }[] = [];
+
         applies.forEach(apply => {
+          // Detect ModeExpression (possibly wrapped in FilterExpression)
+          const modeEx = SQLExternal.extractModeExpression(apply.expression);
+          if (modeEx) {
+            modeApplies.push({ apply, modeExpression: modeEx });
+            return;
+          }
+
           if (apply.expression instanceof SqlAggregateExpression) {
             const sqlAggregateExpression = apply.expression;
             const pivotNestedAggComponents =
@@ -286,9 +565,7 @@ export abstract class SQLExternal extends External {
           const pnaApplies = pivotNestedAggApplies[subSplitExpression];
 
           // Construir las expresiones de selección y agrupación internas
-          // @ts-expect-error - plywood Set constructor uses non-standard signature
           let innerSelectExpressions = new Set({ setType: 'STRING', elements: [] });
-          // @ts-expect-error - plywood Set constructor uses non-standard signature
           let innerGroupByExpressions = new Set({ setType: 'STRING', elements: [] });
 
           // Añadir la expresión de subdivisión interna
@@ -314,9 +591,7 @@ export abstract class SQLExternal extends External {
             ? 'WHERE ' + filter.getSQL(dialect)
             : '';
 
-          // @ts-expect-error - accessing plywood Set internal elements
           const items = innerSelectExpressions.elements;
-          // @ts-expect-error - accessing plywood Set internal elements
           const groupItems = innerGroupByExpressions.elements;
           const innerAggregateSQL = `
           SELECT
@@ -342,6 +617,85 @@ export abstract class SQLExternal extends External {
               )}`,
             );
           });
+        }
+
+        // Generate CTEs for MODE expressions
+        const modeJoinClauses: string[] = [];
+        modeApplies.forEach(({ apply, modeExpression }, idx) => {
+          const cteName = `__mode_${idx}`;
+          const cteAlias = `__m${idx}`;
+
+          // Get the field being mode'd
+          const modeFieldSQL = modeExpression.expression.getSQL(dialect);
+
+          // Get split dimension expressions for PARTITION BY and JOIN
+          const splitDimSQLs = split.getSelectSQLNoAliases(dialect);
+          const _splitDimAliasedSQLs = split.getSelectSQL(dialect);
+
+          // Extract filter from the mode's operand chain (if mode is filtered)
+          const modeFilter = SQLExternal.extractModeFilter(apply.expression, dialect);
+
+          // Build the CTE: GROUP BY split dims + mode field, then ROW_NUMBER
+          const cteSelectParts = [
+            ...splitDimSQLs,
+            `${modeFieldSQL} AS __val`,
+            `ROW_NUMBER() OVER (PARTITION BY ${splitDimSQLs.join(
+              ',',
+            )} ORDER BY COUNT(*) DESC) AS __rn`,
+          ];
+
+          const cteWhereparts: string[] = [];
+          if (!filter.equals(Expression.TRUE)) {
+            cteWhereparts.push(filter.getSQL(dialect));
+          }
+          cteWhereparts.push(`${modeFieldSQL} IS NOT NULL`);
+          if (modeFilter) {
+            cteWhereparts.push(modeFilter);
+          }
+
+          const cteGroupByParts = [...splitDimSQLs, modeFieldSQL];
+
+          const cteSQL = [
+            'SELECT',
+            cteSelectParts.join(','),
+            this.getFrom(),
+            `WHERE ${cteWhereparts.join(' AND ')}`,
+            `GROUP BY ${cteGroupByParts.join(',')}`,
+          ].join('\n');
+
+          cteDefinitions.push(`${cteName} AS (${cteSQL})`);
+
+          // Build JOIN clause
+          const joinConditions = split
+            .mapSplits((_name, expression) => {
+              const dimSQL = expression.getSQL(dialect);
+              return `(t.${dimSQL} IS NOT DISTINCT FROM ${cteAlias}.${dimSQL})`;
+            })
+            .concat([`${cteAlias}.__rn = 1`]);
+
+          modeJoinClauses.push(
+            `LEFT JOIN ${cteName} ${cteAlias} ON (${joinConditions.join(' AND ')})`,
+          );
+
+          // Add mode column to SELECT
+          selectExpressions.push(`${cteAlias}.__val AS ${dialect.escapeName(apply.name)}`);
+
+          // Add mode column to GROUP BY to satisfy SQL semantics
+          groupByExpressions.push(`${cteAlias}.__val`);
+        });
+
+        // Insert JOIN clauses between FROM and WHERE
+        if (modeJoinClauses.length > 0) {
+          // fromClause may contain "FROM table AS t\nWHERE ..."
+          // We need to insert JOINs between FROM and WHERE
+          const whereIdx = fromClause.indexOf('\nWHERE ');
+          if (whereIdx !== -1) {
+            const fromPart = fromClause.substring(0, whereIdx);
+            const wherePart = fromClause.substring(whereIdx);
+            fromClause = fromPart + '\n' + modeJoinClauses.join('\n') + wherePart;
+          } else {
+            fromClause += '\n' + modeJoinClauses.join('\n');
+          }
         }
 
         // Construir la cláusula WITH si hay CTEs
@@ -383,6 +737,38 @@ export abstract class SQLExternal extends External {
   }
 
   protected abstract getIntrospectAttributes(depth: IntrospectionDepth): Promise<Attributes>;
+
+  // -----------------
+  // Mode Expression Support
+
+  /**
+   * Extracts a ModeExpression from an apply's expression chain.
+   * Mode may be direct: $data.mode($field)
+   * Or filtered: $data.filter(...).mode($field)
+   */
+  static extractModeExpression(ex: Expression): ModeExpression | null {
+    if (ex instanceof ModeExpression) return ex;
+    // Check if it's a mode wrapped in a filter chain
+    if (ex instanceof ChainableUnaryExpression && ex.operand instanceof ModeExpression) {
+      return ex.operand;
+    }
+    return null;
+  }
+
+  /**
+   * Extracts the filter SQL from a filtered mode expression.
+   * E.g., $data.filter($color != "null").mode($color) → the filter condition SQL
+   */
+  static extractModeFilter(ex: Expression, _dialect: SQLDialect): string | null {
+    if (ex instanceof ModeExpression) {
+      // Check if the operand of the mode is a FilterExpression
+      if (ex.operand instanceof FilterExpression) {
+        const filterEx = ex.operand;
+        return filterEx.expression.getSQL(_dialect);
+      }
+    }
+    return null;
+  }
 
   // -----------------
   // Resplit Aggregation Support

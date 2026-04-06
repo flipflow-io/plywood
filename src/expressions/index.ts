@@ -53,6 +53,7 @@ export * from './lookupExpression';
 export * from './matchExpression';
 export * from './maxExpression';
 export * from './minExpression';
+export * from './modeExpression';
 export * from './multiplyExpression';
 export * from './mvContainsExpression';
 export * from './mvOverlapExpression';

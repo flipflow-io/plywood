@@ -286,4 +286,10 @@ export class DruidDialect extends SQLDialect {
   public ipStringifyExpression(operand: string): string {
     return `IP_STRINGIFY(${operand})`;
   }
+
+  public modeExpression(expressionSQL: string, _operandSQL: string): string {
+    // For inline usage (should not be reached in normal query generation,
+    // as mode is handled at the sqlExternal level via CTE/subquery)
+    return `MODE_INLINE(${expressionSQL})`;
+  }
 }

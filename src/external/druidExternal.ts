@@ -53,6 +53,7 @@ import {
   SortExpression,
   SplitExpression,
   Splits,
+  SqlRefExpression,
   TimeBucketExpression,
   TimeFloorExpression,
   TimePartExpression,
@@ -685,19 +686,6 @@ export class DruidExternal extends External {
   }
 
   public expressionToDimensionInflater(expression: Expression, label: string): DimensionInflater {
-    const freeReferences = expression.getFreeReferences();
-    if (freeReferences.length === 0) {
-      return {
-        dimension: {
-          type: 'extraction',
-          dimension: DruidExternal.TIME_ATTRIBUTE,
-          outputName: this.makeOutputName(label),
-          extractionFn: new DruidExtractionFnBuilder(this).expressionToExtractionFn(expression),
-        },
-        inflater: null,
-      };
-    }
-
     const makeExpression: () => DimensionInflater = () => {
       const druidExpression = new DruidExpressionBuilder(this).expressionToDruidExpression(
         expression,
@@ -734,6 +722,26 @@ export class DruidExternal extends External {
       };
     };
 
+    const freeReferences = expression.getFreeReferences();
+    const containsSqlRef =
+      expression instanceof SqlRefExpression ||
+      expression.some(ex => (ex instanceof SqlRefExpression ? true : null));
+
+    if (freeReferences.length === 0) {
+      if (containsSqlRef) {
+        return makeExpression();
+      }
+      return {
+        dimension: {
+          type: 'extraction',
+          dimension: DruidExternal.TIME_ATTRIBUTE,
+          outputName: this.makeOutputName(label),
+          extractionFn: new DruidExtractionFnBuilder(this).expressionToExtractionFn(expression),
+        },
+        inflater: null,
+      };
+    }
+
     function isComplexFallback(expression: Expression) {
       // Check to see if the expression is something like $(...).blah(...).blah(...).fallback($(...))
       if (expression instanceof FallbackExpression) {
@@ -745,6 +753,7 @@ export class DruidExternal extends External {
     }
 
     if (
+      containsSqlRef ||
       freeReferences.length > 1 ||
       expression.some(ex => ex.isOp('then') || null) ||
       isComplexFallback(expression)

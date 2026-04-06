@@ -49,6 +49,7 @@ import {
   OverlapExpression,
   PowerExpression,
   RefExpression,
+  SqlRefExpression,
   SubstrExpression,
   SubtractExpression,
   ThenExpression,
@@ -172,6 +173,8 @@ export class DruidExpressionBuilder {
 
         return exStr;
       }
+    } else if (expression instanceof SqlRefExpression) {
+      return `(${expression.sql})`;
     } else if (expression instanceof ChainableExpression) {
       const myOperand = expression.operand;
       const ex1 = this.expressionToDruidExpression(myOperand);

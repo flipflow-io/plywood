@@ -137,6 +137,11 @@ describe('stringification', () => {
     expect(ex.toString(2)).to.equal('$x.substr(1,5)');
   });
 
+  it('works with mode', () => {
+    const ex = $('x').mode('$color');
+    expect(ex.toString(2)).to.equal('$x.mode($color)');
+  });
+
   it('works with quantile with resolution', () => {
     const ex = $('x').quantile('$hist', 0.98, 'resolution=2000');
     expect(ex.toString(2)).to.equal(`$x.quantile($hist,0.98,"resolution=2000")`);
