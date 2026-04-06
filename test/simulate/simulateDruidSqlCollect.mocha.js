@@ -28,7 +28,7 @@ const context = {
 };
 
 const timeFilter =
-  "(TIMESTAMP '2015-09-12 00:00:00'<=\"time\" AND \"time\"<TIMESTAMP '2015-09-13 00:00:00')";
+  '(TIMESTAMP \'2015-09-12 00:00:00\'<="time" AND "time"<TIMESTAMP \'2015-09-13 00:00:00\')';
 
 describe('simulate DruidSql COLLECT', () => {
   it('works with collect in total (no split)', () => {
@@ -36,7 +36,7 @@ describe('simulate DruidSql COLLECT', () => {
 
     const queryPlan = ex.simulateQueryPlan(context);
     expect(queryPlan[0]).to.have.length(1);
-    expect(queryPlan[0][0].query).to.contain("ARRAY_TO_STRING(ARRAY_AGG(DISTINCT");
+    expect(queryPlan[0][0].query).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT');
     expect(queryPlan[0][0].query).to.contain('"channel"');
   });
 
@@ -54,7 +54,7 @@ describe('simulate DruidSql COLLECT', () => {
     const query = queryPlan[0][0].query;
     expect(query).to.contain('"page" AS "Page"');
     expect(query).to.contain('COUNT(*)');
-    expect(query).to.contain("ARRAY_TO_STRING(ARRAY_AGG(DISTINCT");
+    expect(query).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT');
     expect(query).to.contain('"user"');
     expect(query).to.contain('ORDER BY "Count" DESC');
     expect(query).to.contain('LIMIT 5');
@@ -68,7 +68,7 @@ describe('simulate DruidSql COLLECT', () => {
 
     const queryPlan = ex.simulateQueryPlan(context);
     const query = queryPlan[0][0].query;
-    expect(query).to.contain("ARRAY_TO_STRING(ARRAY_AGG(DISTINCT");
+    expect(query).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT');
     expect(query).to.contain('"channel"');
     expect(query).to.contain('GROUP BY 1');
   });
@@ -84,7 +84,7 @@ describe('simulate DruidSql COLLECT', () => {
     const query = queryPlan[0][0].query;
 
     // Both collects should be in the same query (inline, no decomposition)
-    expect(query).to.contain("ARRAY_TO_STRING(ARRAY_AGG(DISTINCT \"user\")");
-    expect(query).to.contain("ARRAY_TO_STRING(ARRAY_AGG(DISTINCT \"channel\")");
+    expect(query).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT "user")');
+    expect(query).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT "channel")');
   });
 });
