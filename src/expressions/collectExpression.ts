@@ -56,9 +56,7 @@ export class CollectExpression extends ChainableUnaryExpression implements Aggre
     operandSQL: string,
     expressionSQL: string,
   ): string {
-    return dialect.collectExpression(
-      dialect.aggregateFilterIfNeeded(operandSQL, expressionSQL),
-    );
+    return dialect.collectExpression(dialect.aggregateFilterIfNeeded(operandSQL, expressionSQL));
   }
 }
 
