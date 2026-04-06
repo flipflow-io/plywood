@@ -1105,6 +1105,41 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
     });
   }
 
+  /**
+   * Join where other has a subset of this dataset's keys.
+   * Each row in other is broadcast to all rows in this that match on other's keys.
+   * Like a SQL LEFT JOIN on a subset of columns.
+   */
+  public broadcastJoin(other: Dataset): Dataset {
+    if (!other || !other.data.length) return this;
+    const { data, keys, attributes } = this;
+    if (!data.length) return this;
+
+    const otherKeys = other.keys;
+    const otherLookup = other.getKeyLookup();
+
+    const newData = data.map(datum => {
+      const lookupKey = otherKeys
+        .map(k => {
+          let v: any = datum[k];
+          if (v && v.start) v = v.start;
+          if (v && v.toISOString) v = v.toISOString();
+          return v;
+        })
+        .join('|');
+
+      const otherDatum = otherLookup[lookupKey];
+      if (!otherDatum) return datum;
+      return joinDatums(datum, otherDatum);
+    });
+
+    return new Dataset({
+      keys,
+      attributes: AttributeInfo.override(attributes, other.attributes),
+      data: newData,
+    });
+  }
+
   public fullJoin(other: Dataset): Dataset {
     if (!other || !other.data.length) return this;
     const { data, keys, attributes } = this;

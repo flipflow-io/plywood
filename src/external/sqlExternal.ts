@@ -398,7 +398,12 @@ export abstract class SQLExternal extends External {
           Promise.all([normalPromise, ...modePromises]).then(([normalPV, ...modePVs]) => {
             let joined = normalPV as Dataset;
             for (const modePV of modePVs) {
-              joined = joined.leftJoin(modePV as Dataset);
+              const other = modePV as Dataset;
+              if (other.keys && joined.keys && other.keys.length < joined.keys.length) {
+                joined = joined.broadcastJoin(other);
+              } else {
+                joined = joined.leftJoin(other);
+              }
             }
             if (postJoinSort) {
               joined = joined.sort(postJoinSort.expression, postJoinSort.direction);
