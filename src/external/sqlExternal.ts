@@ -130,7 +130,7 @@ export abstract class SQLExternal extends External {
 
   protected buildModeDecomposition(): {
     normalExternal: External;
-    modeQueries: { name: string; sql: string; type: PlyType }[];
+    modeQueries: { name: string; sql: string; type: PlyType; keys?: string[] }[];
     postJoinSort: SortExpression | null;
     postJoinLimit: LimitExpression | null;
   } | null {
@@ -296,6 +296,7 @@ export abstract class SQLExternal extends External {
         name: apply.name,
         sql,
         type: 'STRING' as PlyType,
+        keys: collectKeyNames,
       };
     });
 
@@ -379,8 +380,21 @@ export abstract class SQLExternal extends External {
         const modePromises = modeQueries.map(mq => {
           const query = this.sqlToQuery(mq.sql);
           const modeAttr = new AttributeInfo({ name: mq.name, type: mq.type });
-          const attrs = [...splitAttrs, modeAttr];
-          const postTransform = External.postTransformFactory([], attrs, splitKeys, null);
+
+          // Use per-query keys if available (collect with groupByKeys)
+          const mqKeys = mq.keys || splitKeys;
+          const mqAttrs = mq.keys
+            ? [
+                ...mq.keys.map(
+                  k =>
+                    splitAttrs.find(a => a.name === k) ||
+                    new AttributeInfo({ name: k, type: 'STRING' }),
+                ),
+                modeAttr,
+              ]
+            : [...splitAttrs, modeAttr];
+
+          const postTransform = External.postTransformFactory([], mqAttrs, mqKeys, null);
 
           const stream = External.performQueryAndPostTransform(
             { query, postTransform },
