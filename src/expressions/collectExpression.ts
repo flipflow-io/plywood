@@ -28,8 +28,14 @@ import { Aggregate } from './mixins/aggregate';
 export class CollectExpression extends ChainableUnaryExpression implements Aggregate {
   static op = 'Collect';
   static fromJS(parameters: ExpressionJS): CollectExpression {
-    return new CollectExpression(ChainableUnaryExpression.jsToValue(parameters));
+    const value = ChainableUnaryExpression.jsToValue(parameters);
+    if ((parameters as any).groupByKeys) {
+      (value as any).groupByKeys = (parameters as any).groupByKeys;
+    }
+    return new CollectExpression(value);
   }
+
+  public groupByKeys: string[] | null;
 
   constructor(parameters: ExpressionValue) {
     super(parameters, dummyObject);
@@ -45,6 +51,23 @@ export class CollectExpression extends ChainableUnaryExpression implements Aggre
       'STRING_RANGE',
     );
     this.type = Set.wrapSetType(this.expression.type);
+    this.groupByKeys = (parameters as any).groupByKeys || null;
+  }
+
+  public valueOf(): ExpressionValue {
+    const value = super.valueOf();
+    if (this.groupByKeys) {
+      (value as any).groupByKeys = this.groupByKeys;
+    }
+    return value;
+  }
+
+  public toJS(): ExpressionJS {
+    const js = super.toJS();
+    if (this.groupByKeys) {
+      (js as any).groupByKeys = this.groupByKeys;
+    }
+    return js;
   }
 
   protected _calcChainableUnaryHelper(operandValue: any, _expressionValue: any): PlywoodValue {

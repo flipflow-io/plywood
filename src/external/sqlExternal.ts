@@ -239,8 +239,10 @@ export abstract class SQLExternal extends External {
     });
 
     // Build collect queries — simpler than mode (no ROW_NUMBER, just ARRAY_AGG)
+    // When groupByKeys is set, only use those keys for GROUP BY (not all split dims)
     const collectQueries = collectApplyInfos.map(({ apply, collectExpression }) => {
       const collectFieldSQL = collectExpression.expression.getSQL(dialect);
+      const { groupByKeys } = collectExpression;
 
       const whereParts: string[] = [];
       if (!filter.equals(Expression.TRUE)) {
@@ -249,8 +251,36 @@ export abstract class SQLExternal extends External {
       whereParts.push(`${collectFieldSQL} IS NOT NULL`);
       const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
 
+      // If groupByKeys specified, use only those split dims
+      let collectSplitDimSQLs: string[];
+      let collectSplitAliasedSQLs: string[];
+      let collectKeyNames: string[];
+
+      if (groupByKeys && groupByKeys.length > 0) {
+        const groupBySet: Record<string, true> = {};
+        for (const k of groupByKeys) groupBySet[k] = true;
+
+        collectSplitDimSQLs = [];
+        collectSplitAliasedSQLs = [];
+        collectKeyNames = [];
+
+        split.mapSplits((name, expression) => {
+          if (groupBySet[name]) {
+            collectSplitDimSQLs.push(expression.getSQL(dialect));
+            collectSplitAliasedSQLs.push(
+              `${expression.getSQL(dialect)} AS ${dialect.escapeName(name)}`,
+            );
+            collectKeyNames.push(name);
+          }
+        });
+      } else {
+        collectSplitDimSQLs = splitDimSQLs;
+        collectSplitAliasedSQLs = splitDimAliasedSQLs;
+        collectKeyNames = splitKeyNames;
+      }
+
       const selectParts = [
-        ...splitDimAliasedSQLs,
+        ...collectSplitAliasedSQLs,
         `${dialect.collectExpression(collectFieldSQL)} AS ${dialect.escapeName(apply.name)}`,
       ];
 
@@ -259,7 +289,7 @@ export abstract class SQLExternal extends External {
         selectParts.join(',\n'),
         from,
         whereClause,
-        `GROUP BY ${splitDimSQLs.join(',')}`,
+        `GROUP BY ${collectSplitDimSQLs.join(',')}`,
       ].join('\n');
 
       return {
