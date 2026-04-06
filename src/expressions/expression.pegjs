@@ -225,10 +225,10 @@ NumberOrNull = Number / NullToken;
 
 
 String "String"
-  = "'" chars:NotSQuote "'" _ { return chars; }
-  / "'" chars:NotSQuote { error("Unmatched single quote"); }
-  / '"' chars:NotDQuote '"' _ { return chars; }
-  / '"' chars:NotDQuote { error("Unmatched double quote"); }
+  = "'" chars:SingleQuotedCharacter* "'" _ { return chars.join(''); }
+  / "'" chars:SingleQuotedCharacter* { error("Unmatched single quote"); }
+  / '"' chars:DoubleQuotedCharacter* '"' _ { return chars.join(''); }
+  / '"' chars:DoubleQuotedCharacter* { error("Unmatched double quote"); }
 
 
 /* Tokens */
@@ -305,11 +305,13 @@ NamePart
 TypeName "TypeName"
   = $([A-Z_/]+)
 
-NotSQuote "NotSQuote"
-  = $([^']*)
+SingleQuotedCharacter
+  = "\\'" { return "'"; }
+  / !"'" char:. { return char; }
 
-NotDQuote "NotDQuote"
-  = $([^"]*)
+DoubleQuotedCharacter
+  = '\\"' { return '"'; }
+  / !'"' char:. { return char; }
 
 _ "Whitespace"
   = $([ \t\r\n]*)
