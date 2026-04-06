@@ -29,6 +29,7 @@ import {
   CountExpression,
   Expression,
   FilterExpression,
+  LimitExpression,
   ModeExpression,
   NumberBucketExpression,
   RefExpression,
@@ -121,16 +122,20 @@ export abstract class SQLExternal extends External {
   protected buildModeDecomposition(): {
     normalExternal: External;
     modeQueries: { name: string; sql: string; type: PlyType }[];
+    postJoinSort: SortExpression | null;
+    postJoinLimit: LimitExpression | null;
   } | null {
     if (this.mode !== 'split') return null;
 
     const modeApplyInfos: { apply: ApplyExpression; modeExpression: ModeExpression }[] = [];
     const normalApplies: ApplyExpression[] = [];
+    const modeApplyNames: Record<string, true> = {};
 
     for (const apply of this.applies) {
       const modeEx = SQLExternal.extractModeExpression(apply.expression);
       if (modeEx) {
         modeApplyInfos.push({ apply, modeExpression: modeEx });
+        modeApplyNames[apply.name] = true;
       } else {
         normalApplies.push(apply);
       }
@@ -138,9 +143,25 @@ export abstract class SQLExternal extends External {
 
     if (modeApplyInfos.length === 0) return null;
 
+    // If sort references a mode apply, strip it from normalExternal
+    // and apply it post-join in memory
+    let postJoinSort: SortExpression | null = null;
+    let postJoinLimit: LimitExpression | null = null;
+    const sortRefName =
+      this.sort && this.sort.expression.isOp('ref')
+        ? (this.sort.expression as RefExpression).name
+        : null;
+    const sortRefsMode = sortRefName && modeApplyNames[sortRefName];
+
     // Build normal external without mode applies
     const normalValue = this.valueOf();
     normalValue.applies = normalApplies;
+    if (sortRefsMode) {
+      postJoinSort = this.sort;
+      postJoinLimit = this.limit;
+      delete normalValue.sort;
+      delete normalValue.limit;
+    }
     const normalExternal = External.fromValue(normalValue);
 
     // Build mode query SQL for each mode apply
@@ -200,7 +221,7 @@ export abstract class SQLExternal extends External {
       };
     });
 
-    return { normalExternal, modeQueries };
+    return { normalExternal, modeQueries, postJoinSort, postJoinLimit };
   }
 
   public simulateValue(
@@ -290,12 +311,20 @@ export abstract class SQLExternal extends External {
           return External.buildValueFromStream(stream);
         });
 
-        // Join all results in memory
+        const { postJoinSort, postJoinLimit } = modeDecomp;
+
+        // Join all results in memory, then apply sort/limit if needed
         return External.valuePromiseToStream(
           Promise.all([normalPromise, ...modePromises]).then(([normalPV, ...modePVs]) => {
             let joined = normalPV as Dataset;
             for (const modePV of modePVs) {
               joined = joined.leftJoin(modePV as Dataset);
+            }
+            if (postJoinSort) {
+              joined = joined.sort(postJoinSort.expression, postJoinSort.direction);
+              if (postJoinLimit) {
+                joined = joined.limit(postJoinLimit.value);
+              }
             }
             return joined;
           }),
