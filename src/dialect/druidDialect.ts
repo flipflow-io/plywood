@@ -292,4 +292,8 @@ export class DruidDialect extends SQLDialect {
     // as mode is handled at the sqlExternal level via CTE/subquery)
     return `MODE_INLINE(${expressionSQL})`;
   }
+
+  public collectExpression(expressionSQL: string): string {
+    return `ARRAY_TO_STRING(ARRAY_AGG(DISTINCT ${expressionSQL}), ', ')`;
+  }
 }

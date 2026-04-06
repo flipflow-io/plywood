@@ -15,6 +15,7 @@
  */
 
 import { Dataset, PlywoodValue, Set } from '../datatypes';
+import { SQLDialect } from '../dialect/baseDialect';
 
 import {
   ChainableUnaryExpression,
@@ -48,6 +49,16 @@ export class CollectExpression extends ChainableUnaryExpression implements Aggre
 
   protected _calcChainableUnaryHelper(operandValue: any, _expressionValue: any): PlywoodValue {
     return operandValue ? (operandValue as Dataset).collect(this.expression) : null;
+  }
+
+  protected _getSQLChainableUnaryHelper(
+    dialect: SQLDialect,
+    operandSQL: string,
+    expressionSQL: string,
+  ): string {
+    return dialect.collectExpression(
+      dialect.aggregateFilterIfNeeded(operandSQL, expressionSQL),
+    );
   }
 }
 

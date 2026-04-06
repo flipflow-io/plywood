@@ -229,6 +229,10 @@ export abstract class SQLDialect {
     throw new Error('dialect does not implement mode');
   }
 
+  public collectExpression(_expressionSQL: string): string {
+    throw new Error('dialect does not implement collect');
+  }
+
   public logExpression(base: string, operand: string): string {
     if (base === String(Math.E)) return `LN(${operand})`;
     return `LOG(${base},${operand})`;
