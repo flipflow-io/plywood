@@ -28,6 +28,7 @@ import {
   ChainableUnaryExpression,
   CountExpression,
   Expression,
+  CollectExpression,
   FilterExpression,
   LimitExpression,
   ModeExpression,
@@ -119,6 +120,14 @@ export abstract class SQLExternal extends External {
   // in split mode, generating separate queries joined in memory.
   // -----------------
 
+  static extractCollectExpression(ex: Expression): CollectExpression | null {
+    if (ex instanceof CollectExpression) return ex;
+    if (ex instanceof ChainableUnaryExpression && ex.operand instanceof CollectExpression) {
+      return ex.operand;
+    }
+    return null;
+  }
+
   protected buildModeDecomposition(): {
     normalExternal: External;
     modeQueries: { name: string; sql: string; type: PlyType }[];
@@ -128,20 +137,28 @@ export abstract class SQLExternal extends External {
     if (this.mode !== 'split') return null;
 
     const modeApplyInfos: { apply: ApplyExpression; modeExpression: ModeExpression }[] = [];
+    const collectApplyInfos: { apply: ApplyExpression; collectExpression: CollectExpression }[] =
+      [];
     const normalApplies: ApplyExpression[] = [];
-    const modeApplyNames: Record<string, true> = {};
+    const specialApplyNames: Record<string, true> = {};
 
     for (const apply of this.applies) {
       const modeEx = SQLExternal.extractModeExpression(apply.expression);
       if (modeEx) {
         modeApplyInfos.push({ apply, modeExpression: modeEx });
-        modeApplyNames[apply.name] = true;
+        specialApplyNames[apply.name] = true;
       } else {
-        normalApplies.push(apply);
+        const collectEx = SQLExternal.extractCollectExpression(apply.expression);
+        if (collectEx) {
+          collectApplyInfos.push({ apply, collectExpression: collectEx });
+          specialApplyNames[apply.name] = true;
+        } else {
+          normalApplies.push(apply);
+        }
       }
     }
 
-    if (modeApplyInfos.length === 0) return null;
+    if (modeApplyInfos.length === 0 && collectApplyInfos.length === 0) return null;
 
     // If sort references a mode apply, strip it from normalExternal
     // and apply it post-join in memory
@@ -151,7 +168,7 @@ export abstract class SQLExternal extends External {
       this.sort && this.sort.expression.isOp('ref')
         ? (this.sort.expression as RefExpression).name
         : null;
-    const sortRefsMode = sortRefName && modeApplyNames[sortRefName];
+    const sortRefsMode = sortRefName && specialApplyNames[sortRefName];
 
     // Build normal external without mode applies
     const normalValue = this.valueOf();
@@ -221,7 +238,40 @@ export abstract class SQLExternal extends External {
       };
     });
 
-    return { normalExternal, modeQueries, postJoinSort, postJoinLimit };
+    // Build collect queries — simpler than mode (no ROW_NUMBER, just ARRAY_AGG)
+    const collectQueries = collectApplyInfos.map(({ apply, collectExpression }) => {
+      const collectFieldSQL = collectExpression.expression.getSQL(dialect);
+
+      const whereParts: string[] = [];
+      if (!filter.equals(Expression.TRUE)) {
+        whereParts.push(filter.getSQL(dialect));
+      }
+      whereParts.push(`${collectFieldSQL} IS NOT NULL`);
+      const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+      const selectParts = [
+        ...splitDimAliasedSQLs,
+        `${dialect.collectExpression(collectFieldSQL)} AS ${dialect.escapeName(apply.name)}`,
+      ];
+
+      const sql = [
+        'SELECT',
+        selectParts.join(',\n'),
+        from,
+        whereClause,
+        `GROUP BY ${splitDimSQLs.join(',')}`,
+      ].join('\n');
+
+      return {
+        name: apply.name,
+        sql,
+        type: 'STRING' as PlyType,
+      };
+    });
+
+    const allDecompQueries = [...modeQueries, ...collectQueries];
+
+    return { normalExternal, modeQueries: allDecompQueries, postJoinSort, postJoinLimit };
   }
 
   public simulateValue(

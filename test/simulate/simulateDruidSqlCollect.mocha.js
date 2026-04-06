@@ -40,7 +40,7 @@ describe('simulate DruidSql COLLECT', () => {
     expect(queryPlan[0][0].query).to.contain('"channel"');
   });
 
-  it('works with collect in split alongside count', () => {
+  it('decomposes collect in split alongside count', () => {
     const ex = $('wiki')
       .split('$page', 'Page')
       .apply('Count', '$wiki.count()')
@@ -49,31 +49,34 @@ describe('simulate DruidSql COLLECT', () => {
       .limit(5);
 
     const queryPlan = ex.simulateQueryPlan(context);
-    expect(queryPlan[0]).to.have.length(1);
+    // Decomposed: normal query + collect query
+    expect(queryPlan[0]).to.have.length(2);
 
-    const query = queryPlan[0][0].query;
-    expect(query).to.contain('"page" AS "Page"');
-    expect(query).to.contain('COUNT(*)');
-    expect(query).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT');
-    expect(query).to.contain('"user"');
-    expect(query).to.contain('ORDER BY "Count" DESC');
-    expect(query).to.contain('LIMIT 5');
+    const normalQuery = queryPlan[0][0].query;
+    expect(normalQuery).to.contain('"page" AS "Page"');
+    expect(normalQuery).to.contain('COUNT(*)');
+    expect(normalQuery).to.not.contain('ARRAY_AGG');
+
+    const collectQuery = queryPlan[0][1].query;
+    expect(collectQuery).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT');
+    expect(collectQuery).to.contain('"user"');
   });
 
-  it('works with collect of same field as split dimension', () => {
+  it('decomposes collect of same field as split dimension', () => {
     const ex = $('wiki')
       .split('$page', 'Page')
       .apply('AllChannels', '$wiki.collect($channel)')
       .limit(3);
 
     const queryPlan = ex.simulateQueryPlan(context);
-    const query = queryPlan[0][0].query;
-    expect(query).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT');
-    expect(query).to.contain('"channel"');
-    expect(query).to.contain('GROUP BY 1');
+    expect(queryPlan[0]).to.have.length(2);
+
+    const collectQuery = queryPlan[0][1].query;
+    expect(collectQuery).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT');
+    expect(collectQuery).to.contain('"channel"');
   });
 
-  it('works with multiple collects in same split', () => {
+  it('decomposes multiple collects into separate queries', () => {
     const ex = $('wiki')
       .split('$page', 'Page')
       .apply('AllUsers', '$wiki.collect($user)')
@@ -81,10 +84,67 @@ describe('simulate DruidSql COLLECT', () => {
       .limit(5);
 
     const queryPlan = ex.simulateQueryPlan(context);
-    const query = queryPlan[0][0].query;
+    // 3 queries: normal (no applies) + collect user + collect channel
+    expect(queryPlan[0]).to.have.length(3);
 
-    // Both collects should be in the same query (inline, no decomposition)
-    expect(query).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT "user")');
-    expect(query).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT "channel")');
+    const collectQuery1 = queryPlan[0][1].query;
+    const collectQuery2 = queryPlan[0][2].query;
+    expect(collectQuery1).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT "user")');
+    expect(collectQuery2).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT "channel")');
+  });
+
+  it('decomposes collect in split mode (split + collect)', () => {
+    const ex = $('wiki')
+      .split('$page', 'Page')
+      .apply('Count', '$wiki.count()')
+      .apply('AllChannels', '$wiki.collect($channel)')
+      .sort('$Count', 'descending')
+      .limit(5);
+
+    const queryPlan = ex.simulateQueryPlan(context);
+    // Should decompose into 2 queries: normal + collect
+    expect(queryPlan[0]).to.have.length(2);
+
+    const normalQuery = queryPlan[0][0].query;
+    const collectQuery = queryPlan[0][1].query;
+
+    // Normal query should NOT have ARRAY_AGG
+    expect(normalQuery).to.not.contain('ARRAY_AGG');
+    expect(normalQuery).to.contain('COUNT(*)');
+    expect(normalQuery).to.contain('ORDER BY');
+
+    // Collect query should have ARRAY_AGG and GROUP BY split key only
+    expect(collectQuery).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT');
+    expect(collectQuery).to.contain('"channel"');
+    expect(collectQuery).to.contain('GROUP BY');
+    expect(collectQuery).to.contain('"page"');
+  });
+
+  it('decomposes collect alongside mode in split', () => {
+    const ex = $('wiki')
+      .split('$page', 'Page')
+      .apply('Count', '$wiki.count()')
+      .apply('MostFreqUser', '$wiki.mode($user)')
+      .apply('AllChannels', '$wiki.collect($channel)')
+      .sort('$Count', 'descending')
+      .limit(5);
+
+    const queryPlan = ex.simulateQueryPlan(context);
+    // 3 queries: normal + mode + collect
+    expect(queryPlan[0]).to.have.length(3);
+
+    const normalQuery = queryPlan[0][0].query;
+    const modeQuery = queryPlan[0][1].query;
+    const collectQuery = queryPlan[0][2].query;
+
+    expect(normalQuery).to.contain('COUNT(*)');
+    expect(normalQuery).to.not.contain('ARRAY_AGG');
+    expect(normalQuery).to.not.contain('ROW_NUMBER');
+
+    expect(modeQuery).to.contain('ROW_NUMBER');
+    expect(modeQuery).to.contain('"user"');
+
+    expect(collectQuery).to.contain('ARRAY_TO_STRING(ARRAY_AGG(DISTINCT');
+    expect(collectQuery).to.contain('"channel"');
   });
 });
