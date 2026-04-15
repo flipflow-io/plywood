@@ -434,7 +434,18 @@ export abstract class SQLExternal extends External {
   }
 
   public getQueryAndPostTransform(): QueryAndPostTransform<string> {
-    const { mode, applies, sort, limit, derivedAttributes, dialect, withQuery } = this;
+    const { mode, sort, limit, derivedAttributes, dialect, withQuery } = this;
+
+    // Inline derivedAttributes in apply expressions (aggregates and their inner filters)
+    // so references like $isOwnProducta resolve to $isOwnProduct before SQL generation.
+    // Without this, the generated SQL references the alias as if it were a real column.
+    const hasDerivedAttributes = Object.keys(derivedAttributes).length > 0;
+    const applies: ApplyExpression[] =
+      hasDerivedAttributes && this.applies
+        ? this.applies.map(apply =>
+            apply.changeExpression(this.inlineDerivedAttributes(apply.expression)),
+          )
+        : this.applies;
 
     const queryParts = [];
     const cteDefinitions: string[] = [];
@@ -523,7 +534,12 @@ export abstract class SQLExternal extends External {
         break;
 
       case 'value': {
-        const valueApply = this.toValueApply();
+        let valueApply = this.toValueApply();
+        if (hasDerivedAttributes) {
+          valueApply = valueApply.changeExpression(
+            this.inlineDerivedAttributes(valueApply.expression),
+          );
+        }
         const valueModeEx = SQLExternal.extractModeExpression(valueApply.expression);
         if (valueModeEx) {
           const modeFieldSQL = valueModeEx.expression.getSQL(dialect);
