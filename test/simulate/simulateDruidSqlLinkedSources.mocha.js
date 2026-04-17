@@ -73,9 +73,7 @@ describe('simulate Druid SQL with linked sources (multi-external join)', () => {
   });
 
   it('applies time filters to both externals', () => {
-    const mainSplit = $('main')
-      .split('$ean', 'EAN')
-      .apply('AvgPrice', '$main.average($price)');
+    const mainSplit = $('main').split('$ean', 'EAN').apply('AvgPrice', '$main.average($price)');
 
     const reviewsSplit = $('reviews')
       .split('$ean', 'EAN')
