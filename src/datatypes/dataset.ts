@@ -1082,6 +1082,14 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
   }
 
   public join(other: Dataset): Dataset {
+    // Auto-dispatch: if other's keys are a strict subset of this's keys,
+    // use broadcastJoin so partial-key results expand across all matching rows.
+    if (other && this.keys && other.keys && other.keys.length < this.keys.length) {
+      const thisKeys = this.keys;
+      if (other.keys.every(k => thisKeys.indexOf(k) !== -1)) {
+        return this.broadcastJoin(other);
+      }
+    }
     return this.leftJoin(other);
   }
 
