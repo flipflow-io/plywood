@@ -1603,6 +1603,74 @@ describe('Dataset', () => {
     });
   });
 
+  describe('#join with partial keys', () => {
+    it('broadcasts values from other when its keys are a strict subset of this keys', () => {
+      const main = Dataset.fromJS({
+        keys: ['competitor', 'productName'],
+        data: [
+          { competitor: 'A', productName: 'X', price: 100 },
+          { competitor: 'A', productName: 'Y', price: 200 },
+          { competitor: 'B', productName: 'X', price: 300 },
+          { competitor: 'B', productName: 'Z', price: 400 },
+        ],
+      });
+
+      const reviews = Dataset.fromJS({
+        keys: ['competitor'],
+        data: [
+          { competitor: 'A', avg_rating: 4.5 },
+          { competitor: 'B', avg_rating: 3.0 },
+        ],
+      });
+
+      const joined = main.join(reviews);
+
+      // Every row of main should have received the avg_rating for its competitor
+      expect(joined.data).to.deep.equal([
+        { competitor: 'A', productName: 'X', price: 100, avg_rating: 4.5 },
+        { competitor: 'A', productName: 'Y', price: 200, avg_rating: 4.5 },
+        { competitor: 'B', productName: 'X', price: 300, avg_rating: 3.0 },
+        { competitor: 'B', productName: 'Z', price: 400, avg_rating: 3.0 },
+      ]);
+    });
+
+    it('falls back to leftJoin when keys match exactly', () => {
+      const a = Dataset.fromJS({
+        keys: ['k'],
+        data: [
+          { k: 'a', x: 1 },
+          { k: 'b', x: 2 },
+        ],
+      });
+      const b = Dataset.fromJS({
+        keys: ['k'],
+        data: [
+          { k: 'a', y: 10 },
+          { k: 'b', y: 20 },
+        ],
+      });
+      const joined = a.join(b);
+      expect(joined.data).to.deep.equal([
+        { k: 'a', x: 1, y: 10 },
+        { k: 'b', x: 2, y: 20 },
+      ]);
+    });
+
+    it('does not broadcast when other has a non-subset key', () => {
+      const a = Dataset.fromJS({
+        keys: ['k'],
+        data: [{ k: 'a', x: 1 }],
+      });
+      const b = Dataset.fromJS({
+        keys: ['other'],
+        data: [{ other: 'z', y: 10 }],
+      });
+      const joined = a.join(b);
+      // No key match — row from 'a' preserved without 'y'
+      expect(joined.data).to.deep.equal([{ k: 'a', x: 1 }]);
+    });
+  });
+
   describe('#fullJoin', () => {
     it('works on simple key values', () => {
       function mkHour(s) {
