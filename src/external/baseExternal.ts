@@ -281,6 +281,7 @@ export interface ExternalValue {
   attributes?: Attributes;
   attributeOverrides?: Attributes;
   derivedAttributes?: Record<string, Expression>;
+  linkedSources?: Record<string, { source: string; joinKeys: string[] }>;
   delegates?: External[];
   concealBuckets?: boolean;
   mode?: QueryMode;
@@ -322,6 +323,7 @@ export interface ExternalJS {
   attributes?: AttributeJSs;
   attributeOverrides?: AttributeJSs;
   derivedAttributes?: Record<string, ExpressionJS>;
+  linkedSources?: Record<string, { source: string; joinKeys: string[] }>;
   filter?: ExpressionJS;
   rawAttributes?: AttributeJSs;
   concealBuckets?: boolean;
@@ -849,6 +851,9 @@ export abstract class External {
     if (parameters.derivedAttributes) {
       value.derivedAttributes = Expression.expressionLookupFromJS(parameters.derivedAttributes);
     }
+    if (parameters.linkedSources) {
+      value.linkedSources = parameters.linkedSources;
+    }
 
     value.filter = parameters.filter ? Expression.fromJS(parameters.filter) : Expression.TRUE;
 
@@ -921,6 +926,7 @@ export abstract class External {
   public attributes: Attributes = null;
   public attributeOverrides: Attributes = null;
   public derivedAttributes: Record<string, Expression>;
+  public linkedSources: Record<string, { source: string; joinKeys: string[] }>;
   public delegates: External[];
   public concealBuckets: boolean;
 
@@ -961,6 +967,7 @@ export abstract class External {
       this.attributeOverrides = parameters.attributeOverrides;
     }
     this.derivedAttributes = parameters.derivedAttributes || {};
+    this.linkedSources = parameters.linkedSources || {};
     if (parameters.delegates) {
       this.delegates = parameters.delegates;
     }
@@ -1037,6 +1044,7 @@ export abstract class External {
     if (this.attributes) value.attributes = this.attributes;
     if (this.attributeOverrides) value.attributeOverrides = this.attributeOverrides;
     if (nonEmptyLookup(this.derivedAttributes)) value.derivedAttributes = this.derivedAttributes;
+    if (nonEmptyLookup(this.linkedSources)) value.linkedSources = this.linkedSources;
     if (this.delegates) value.delegates = this.delegates;
     value.concealBuckets = this.concealBuckets;
 
@@ -1090,6 +1098,7 @@ export abstract class External {
       js.attributeOverrides = AttributeInfo.toJSs(this.attributeOverrides);
     if (nonEmptyLookup(this.derivedAttributes))
       js.derivedAttributes = Expression.expressionLookupToJS(this.derivedAttributes);
+    if (nonEmptyLookup(this.linkedSources)) js.linkedSources = this.linkedSources;
     if (this.concealBuckets) js.concealBuckets = true;
 
     if (this.mode !== 'raw' && this.rawAttributes)
@@ -2010,6 +2019,11 @@ export abstract class External {
       }
     }
 
+    // Register linked sources as DATASET refs so $reviews resolves in type checking
+    for (const name in this.linkedSources) {
+      myDatasetType[name] = { type: 'DATASET', datasetType: {} };
+    }
+
     return {
       type: 'DATASET',
       datasetType: myDatasetType,
@@ -2037,6 +2051,13 @@ export abstract class External {
         type: 'DATASET',
         datasetType: splitDatasetType,
       };
+    }
+
+    // Surface linked sources at the top level so $reviews resolves in applies after split
+    if (myFullType.datasetType) {
+      for (const name in this.linkedSources) {
+        myFullType.datasetType[name] = { type: 'DATASET', datasetType: {} };
+      }
     }
 
     return myFullType;
