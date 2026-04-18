@@ -1108,10 +1108,7 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
       const thisKeys = this.keys;
       const otherKeys = other.keys;
       const sharedKeys = thisKeys.filter(k => otherKeys.indexOf(k) !== -1);
-      if (
-        otherKeys.length < thisKeys.length &&
-        otherKeys.every(k => thisKeys.indexOf(k) !== -1)
-      ) {
+      if (otherKeys.length < thisKeys.length && otherKeys.every(k => thisKeys.indexOf(k) !== -1)) {
         return this.broadcastJoin(other);
       }
       if (

@@ -176,7 +176,10 @@ describe('simulate Druid SQL with linked sources (multi-external join)', () => {
     });
 
     // Both source queries present, each against its own datasource
-    const allQueries = plan.flat().map(q => q.query || '').join('\n');
+    const allQueries = plan
+      .flat()
+      .map(q => q.query || '')
+      .join('\n');
     expect(allQueries).to.include('"main_ds"');
     expect(allQueries).to.include('"main_ds-reviews"');
     // Each external keeps its OWN aggregations
