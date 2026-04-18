@@ -119,4 +119,85 @@ describe('simulate Druid SQL with linked sources (multi-external join)', () => {
     expect(queryPlan[1][0].query).to.include('"competitor"');
     expect(queryPlan[1][0].query).to.include('"ean"');
   });
+
+  // -----------------------------------------------------------
+  // Heterogeneous externals in the same ply() — the core invariant:
+  // each external owns its own schema (attributes + derivedAttributes),
+  // and fusing them into a single total must NOT merge schemas.
+  // -----------------------------------------------------------
+  const makeMainWithDerived = () =>
+    External.fromJS({
+      engine: 'druidsql',
+      source: 'main_ds',
+      timeAttribute: 'time',
+      attributes: [
+        { name: 'time', type: 'TIME' },
+        { name: 'product_id', type: 'STRING' },
+        { name: 'price', type: 'NUMBER', unsplitable: true },
+      ],
+      // derivedAttribute referencing a main column
+      derivedAttributes: { productId: '$product_id' },
+      filter: timeFilter,
+    });
+
+  const makeReviewsWithDerived = () =>
+    External.fromJS({
+      engine: 'druidsql',
+      source: 'main_ds-reviews',
+      timeAttribute: 'time',
+      attributes: [
+        { name: 'time', type: 'TIME' },
+        { name: 'partition_id', type: 'STRING' },
+        { name: 'product_name', type: 'STRING' },
+        { name: 'rating', type: 'NUMBER', unsplitable: true },
+      ],
+      // derivedAttribute referencing a REVIEWS-only column
+      // Before the fix this would crash uniteValueExternalsIntoTotal because it
+      // tried to resolve $product_name against main's rawAttributes.
+      derivedAttributes: {
+        partitionId: '$partition_id',
+        productName: '$product_name',
+      },
+      filter: timeFilter,
+    });
+
+  it('heterogeneous externals in one ply() total do not cross-fuse schemas', () => {
+    const ex = ply()
+      .apply('main', $('main').filter(timeFilter))
+      .apply('reviews', $('reviews').filter(timeFilter))
+      .apply('AvgPrice', '$main.average($price)')
+      .apply('AvgRating', '$reviews.average($rating)');
+
+    // Simulating must not throw "could not resolve $product_name" —
+    // each external resolves its own derivedAttributes against its own schema.
+    const plan = ex.simulateQueryPlan({
+      main: makeMainWithDerived(),
+      reviews: makeReviewsWithDerived(),
+    });
+
+    // Both source queries present, each against its own datasource
+    const allQueries = plan.flat().map(q => q.query || '').join('\n');
+    expect(allQueries).to.include('"main_ds"');
+    expect(allQueries).to.include('"main_ds-reviews"');
+    // Each external keeps its OWN aggregations
+    expect(allQueries).to.include('AVG("price")');
+    expect(allQueries).to.include('AVG("rating")');
+  });
+
+  it('External construction rejects derivedAttributes that do not resolve in its own schema', () => {
+    // No try/catch — this must throw early, loud and clear.
+    expect(() =>
+      External.fromJS({
+        engine: 'druidsql',
+        source: 'reviews_ds',
+        timeAttribute: 'time',
+        attributes: [
+          { name: 'time', type: 'TIME' },
+          { name: 'rating', type: 'NUMBER' },
+        ],
+        // $nonexistent is not in this external's attributes
+        derivedAttributes: { bogus: '$nonexistent' },
+      }),
+    ).to.throw(/could not resolve/);
+  });
 });

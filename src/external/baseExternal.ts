@@ -1306,6 +1306,9 @@ export abstract class External {
     value.mode = 'total';
     value.suppress = false;
     value.rawAttributes = value.attributes;
+    // Only called with homogeneous externals (same base). The caller in
+    // Dataset.ts groups applies by equalBase() before invoking this path, so
+    // a schema-safe merge of derivedAttributes is guaranteed.
     value.derivedAttributes = External.getMergedDerivedAttributesFromExternals(externals);
     value.filter = commonFilter;
     value.attributes = [];

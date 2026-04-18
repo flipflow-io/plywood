@@ -1671,6 +1671,73 @@ describe('Dataset', () => {
     });
   });
 
+  describe('#crossJoinOnSharedKeys', () => {
+    it('expands cartesian rows when each side has exclusive keys', () => {
+      // Main: grouped by (productName, isOwn) — product-level metric
+      const main = Dataset.fromJS({
+        keys: ['productName', 'isOwn'],
+        data: [
+          { productName: 'P1', isOwn: 'yes', price: 100 },
+          { productName: 'P2', isOwn: 'no', price: 200 },
+        ],
+      });
+      // Reviews: grouped by (productName, review_title) — per-review metric
+      const reviews = Dataset.fromJS({
+        keys: ['productName', 'review_title'],
+        data: [
+          { productName: 'P1', review_title: 'excelente', rating: 5 },
+          { productName: 'P1', review_title: 'bueno', rating: 4 },
+          { productName: 'P2', review_title: 'malo', rating: 1 },
+        ],
+      });
+
+      // Shared key = productName. Cartesian on productName, each side contributes
+      // its own exclusive key.
+      const joined = main.crossJoinOnSharedKeys(reviews, ['productName']);
+      expect(joined.keys).to.deep.equal(['productName', 'isOwn', 'review_title']);
+      expect(joined.data).to.deep.equal([
+        { productName: 'P1', isOwn: 'yes', price: 100, review_title: 'excelente', rating: 5 },
+        { productName: 'P1', isOwn: 'yes', price: 100, review_title: 'bueno', rating: 4 },
+        { productName: 'P2', isOwn: 'no', price: 200, review_title: 'malo', rating: 1 },
+      ]);
+    });
+
+    it('preserves this-side rows that have no match in other', () => {
+      const main = Dataset.fromJS({
+        keys: ['productName', 'isOwn'],
+        data: [
+          { productName: 'P1', isOwn: 'yes', price: 100 },
+          { productName: 'P_orphan', isOwn: 'yes', price: 999 },
+        ],
+      });
+      const reviews = Dataset.fromJS({
+        keys: ['productName', 'review_title'],
+        data: [{ productName: 'P1', review_title: 'ok', rating: 3 }],
+      });
+      const joined = main.crossJoinOnSharedKeys(reviews, ['productName']);
+      expect(joined.data).to.deep.equal([
+        { productName: 'P1', isOwn: 'yes', price: 100, review_title: 'ok', rating: 3 },
+        { productName: 'P_orphan', isOwn: 'yes', price: 999 },
+      ]);
+    });
+
+    it('is auto-dispatched by join() when key sets overlap with exclusives on both sides', () => {
+      const main = Dataset.fromJS({
+        keys: ['productName', 'isOwn'],
+        data: [{ productName: 'P1', isOwn: 'yes', price: 100 }],
+      });
+      const reviews = Dataset.fromJS({
+        keys: ['productName', 'review_title'],
+        data: [{ productName: 'P1', review_title: 'ok', rating: 3 }],
+      });
+      // Neither keys ⊂ the other. Auto-dispatch must pick crossJoinOnSharedKeys.
+      const joined = main.join(reviews);
+      expect(joined.data).to.deep.equal([
+        { productName: 'P1', isOwn: 'yes', price: 100, review_title: 'ok', rating: 3 },
+      ]);
+    });
+  });
+
   describe('#fullJoin', () => {
     it('works on simple key values', () => {
       function mkHour(s) {
