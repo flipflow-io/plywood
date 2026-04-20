@@ -42,7 +42,7 @@ const makeMainWithLinkedReviews = () =>
     linkedSources: {
       reviews: {
         source: 'main_ds-reviews',
-        joinKeys: ['competitor'],
+        joinKeys: ['competitor', 'time'],
         attributes: [
           { name: 'time', type: 'TIME' },
           { name: 'competitor', type: 'STRING' },
@@ -87,6 +87,51 @@ describe('External auto-decomposition — cross-source expressions', () => {
     expect(realQueries).to.have.length(1);
     expect(realQueries[0].query).to.include('"main_ds"');
     expect(realQueries[0].query).to.not.include('main_ds-reviews');
+  });
+
+  // Cross-source split: a split key whose expression references a linked-only
+  // attribute is valid — plywood should run it on the linked side, while any
+  // shared split goes on both sides and becomes the join key. The main side
+  // broadcasts its rows across the extra linked rows.
+  it('split by a linked-only dim plus a shared time bucket → main/linked queries partition split keys', () => {
+    // Mirrors what turnilo emits: bare refs to both main-compatible columns
+    // (time → shared joinKey) and linked-only columns (reviewContent →
+    // only in reviews). Plywood must type-check via flat-exposed linked
+    // attrs in main's full-type and route split keys by source at execute.
+    const ex = $('main')
+      .split({
+        review_title: '$reviewContent',
+        time: '$time.timeBucket("P1D")',
+      })
+      .apply('AvgPrice', '$main.average($price)')
+      .apply('AvgRating', '$reviews.average($reviewsRating)');
+
+    // With cross-source split support: this should decompose to
+    //   main_ds       GROUP BY time_bucket           SELECT AVG(price)
+    //   main_ds-reviews GROUP BY time_bucket, reviewContent SELECT AVG(reviewsRating)
+    //   join on time_bucket (broadcast main per title)
+    const plan = ex.simulateQueryPlan({ main: makeMainWithLinkedReviews() });
+
+    const all = plan
+      .flat()
+      .map(q => q.query || '')
+      .join('\n');
+    expect(all).to.include('"main_ds"');
+    expect(all).to.include('"main_ds-reviews"');
+    // Main side groups by time only — must NOT reference reviewContent
+    const mainQuery = plan
+      .flat()
+      .find(
+        q => (q.query || '').includes('"main_ds"') && !(q.query || '').includes('main_ds-reviews'),
+      );
+    expect(mainQuery, 'main query must exist').to.exist;
+    expect(mainQuery.query).to.match(/AVG\("price"\)/);
+    expect(mainQuery.query).to.not.match(/reviewContent/);
+    // Linked side groups by BOTH time and reviewContent
+    const linkedQuery = plan.flat().find(q => (q.query || '').includes('main_ds-reviews'));
+    expect(linkedQuery, 'linked query must exist').to.exist;
+    expect(linkedQuery.query).to.match(/reviewContent/);
+    expect(linkedQuery.query).to.match(/AVG\("reviewsRating"\)/);
   });
 
   // Failure 1 in the UI: sorting by a linked measure. The algebraically

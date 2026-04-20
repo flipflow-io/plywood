@@ -2191,11 +2191,30 @@ export abstract class External {
       }
     }
 
-    // Deliberately NOT registering linkedSources inside this external's own
-    // type: that would make expressionDefined(main) return true for refs
-    // into linked datasources and tempt Plywood's optimizer to absorb them
-    // as if they were native columns. Linked-source resolution happens at
-    // the enclosing scope (peer externals injected via expandLinkedSourcesInDatum).
+    // Flat-expose linked source attributes at main's top level so expressions
+    // like $title (a column that lives only in `reviews`) type-check against
+    // this external. Main attributes win on name collisions (the column is
+    // physically main's); shared columns (joinKeys) are already present from
+    // rawAttributes and we don't overwrite them. getCrossExternalDecomposition
+    // partitions splits/applies by source at execute time and strips linked-
+    // only keys from main's SQL path.
+    for (const name in this.linkedSources) {
+      const ls = this.linkedSources[name];
+      if (ls.attributes) {
+        for (const attr of ls.attributes) {
+          if (!(attr.name in myDatasetType)) {
+            myDatasetType[attr.name] = { type: <PlyTypeSimple>attr.type };
+          }
+        }
+      }
+      if (ls.derivedAttributes) {
+        for (const key in ls.derivedAttributes) {
+          if (!(key in myDatasetType)) {
+            myDatasetType[key] = { type: <PlyTypeSimple>ls.derivedAttributes[key].type };
+          }
+        }
+      }
+    }
 
     return {
       type: 'DATASET',
@@ -2541,15 +2560,50 @@ export abstract class External {
         querySelection: (this as any).querySelection,
         context: (this as any).context,
       });
+      // A linked attribute set for this source — names that exist in the
+      // linked external's schema (attributes + derivedAttributes) but not
+      // necessarily as joinKeys. Used to classify split aliases whose refs
+      // are linked-only (meaningful on that side but not on main).
+      const linkedAttrs: Record<string, true> = {};
+      if (config.attributes) {
+        for (const a of config.attributes as any[]) linkedAttrs[a.name] = true;
+      }
+      if (config.derivedAttributes) {
+        for (const k in config.derivedAttributes) linkedAttrs[k] = true;
+      }
+      // Main's own schema (rawAttributes + derivedAttributes) — used to
+      // classify splits that are main-compatible. rawAttributes is populated
+      // from attributes via the constructor.
+      const mainAttrs: Record<string, true> = {};
+      for (const a of this.rawAttributes || []) mainAttrs[a.name] = true;
+      for (const k in this.derivedAttributes) mainAttrs[k] = true;
+
+      // Partition main's current split aliases by where each is valid:
+      //   shared     = refs ⊆ joinKeys (goes to BOTH sides, becomes the join key)
+      //   mainOnly   = refs ⊆ mainAttrs but not all in joinKeys (stays on main)
+      //   linkedOnly = refs ⊆ linkedAttrs (only this linked source) → goes only to linked
       const sharedAliases: string[] = [];
-      const linkedSplitMap: Record<string, Expression> = {};
+      const mainOnlyAliases: string[] = [];
+      const linkedOnlyAliases: string[] = [];
       for (const alias of this.split.keys) {
         const ex = this.split.splits[alias];
         const refs = ex.getFreeReferences();
-        if (refs.length === 0) continue;
-        if (refs.every(r => joinKeyCols[r])) {
-          sharedAliases.push(alias);
-          linkedSplitMap[alias] = ex;
+        if (refs.length === 0) {
+          mainOnlyAliases.push(alias);
+          continue;
+        }
+        const isShared = refs.every(r => joinKeyCols[r]);
+        const isMainResolvable = refs.every(r => mainAttrs[r]);
+        const isLinkedResolvable = refs.every(r => linkedAttrs[r]);
+        if (isShared) sharedAliases.push(alias);
+        else if (isMainResolvable) mainOnlyAliases.push(alias);
+        else if (isLinkedResolvable) linkedOnlyAliases.push(alias);
+        else {
+          throw new Error(
+            `Split alias "${alias}" references columns that resolve in neither main nor "${lsName}" (refs: [${refs.join(
+              ', ',
+            )}])`,
+          );
         }
       }
       if (sharedAliases.length === 0) {
@@ -2560,11 +2614,17 @@ export abstract class External {
         );
       }
 
+      // Linked side: shared splits + this source's linked-only splits
       let linkedExternal: External = template;
+      const linkedSplitMap: Record<string, Expression> = {};
+      for (const a of sharedAliases) linkedSplitMap[a] = this.split.splits[a];
+      for (const a of linkedOnlyAliases) linkedSplitMap[a] = this.split.splits[a];
       linkedExternal = linkedExternal.addExpression(this.split.changeSplits(linkedSplitMap));
       if (!linkedExternal) {
         throw new Error(
-          `Linked source "${lsName}" rejected the shared split — its schema must accept the shared join-key expressions`,
+          `Linked source "${lsName}" rejected its share of splits [${Object.keys(
+            linkedSplitMap,
+          ).join(', ')}] — the expressions must resolve in its schema`,
         );
       }
 
@@ -2583,15 +2643,29 @@ export abstract class External {
         external: linkedExternal,
         joinKeys: sharedAliases,
       });
+
+      // Stash the main-compatible split set for rebuilding main after the loop.
+      // (We recompute per linked source but the intersection of "main-keepable"
+      // aliases is the same across sources — linked-only for source A is only
+      // valid on A, so it must be dropped from main regardless of B.)
+      (this as any)._lastMainKeepableAliases = [...mainOnlyAliases, ...sharedAliases];
     }
 
-    // Build the main side: drop foreign applies, keep everything else exactly
-    // as it was. The aggregate attributes list must stay in sync with applies.
+    // Build the main side: keep only splits whose refs resolve in main's own
+    // schema, drop foreign applies.
+    const mainKeepableAliases: string[] = (this as any)._lastMainKeepableAliases || [];
     const mainValue = this.valueOf();
     mainValue.applies = mainApplies;
+    const mainSplitMap: Record<string, Expression> = {};
+    for (const a of mainKeepableAliases) mainSplitMap[a] = this.split.splits[a];
+    mainValue.split = this.split.changeSplits(mainSplitMap);
     mainValue.attributes = [
-      ...this.split.mapSplits(
-        (name, expression) => new AttributeInfo({ name, type: Set.unwrapSetType(expression.type) }),
+      ...mainKeepableAliases.map(
+        name =>
+          new AttributeInfo({
+            name,
+            type: Set.unwrapSetType(this.split.splits[name].type),
+          }),
       ),
       ...mainApplies.map(a => new AttributeInfo({ name: a.name, type: a.expression.type })),
     ];
