@@ -974,6 +974,19 @@ export abstract class External {
         if (expanded && hasOwnProp(expanded, lsName)) continue;
 
         const ls = value.linkedSources[lsName];
+        const normalizedAttrs: Attributes | undefined = ls.attributes
+          ? (ls.attributes as any[]).map(a =>
+              a instanceof AttributeInfo ? a : AttributeInfo.fromJS(a),
+            )
+          : undefined;
+        let normalizedDerived: Record<string, Expression> | undefined;
+        if (ls.derivedAttributes) {
+          normalizedDerived = {};
+          for (const k in ls.derivedAttributes) {
+            const v = (ls.derivedAttributes as any)[k];
+            normalizedDerived[k] = v instanceof Expression ? v : Expression.fromJSLoose(v);
+          }
+        }
         const linkedValue: ExternalValue = {
           engine: value.engine,
           version: value.version,
@@ -982,8 +995,8 @@ export abstract class External {
           rollup: value.rollup,
           concealBuckets: value.concealBuckets,
           requester: value.requester,
-          attributes: ls.attributes,
-          derivedAttributes: ls.derivedAttributes,
+          attributes: normalizedAttrs,
+          derivedAttributes: normalizedDerived,
           filter: value.filter,
           timeAttribute: (value as any).timeAttribute,
           customAggregations: (value as any).customAggregations,
@@ -2496,6 +2509,22 @@ export abstract class External {
       // Always synthesize a fresh RAW linked external — the one captured during
       // apply-absorption is in 'value' mode (it already absorbed an aggregate)
       // and can't re-accept a split. Same recipe as expandLinkedSourcesInDatum.
+      // Normalize attributes/derivedAttributes: callers may have passed plain
+      // JS objects (turnilo does), so coerce to AttributeInfo[] / Expression[]
+      // unless they are already.
+      const normalizedAttributes: Attributes | undefined = config.attributes
+        ? (config.attributes as any[]).map(a =>
+            a instanceof AttributeInfo ? a : AttributeInfo.fromJS(a),
+          )
+        : undefined;
+      let normalizedDerived: Record<string, Expression> | undefined;
+      if (config.derivedAttributes) {
+        normalizedDerived = {};
+        for (const k in config.derivedAttributes) {
+          const v = (config.derivedAttributes as any)[k];
+          normalizedDerived[k] = v instanceof Expression ? v : Expression.fromJSLoose(v);
+        }
+      }
       const template = External.fromValue({
         engine: this.engine,
         version: this.version,
@@ -2504,8 +2533,8 @@ export abstract class External {
         rollup: this.rollup,
         concealBuckets: this.concealBuckets,
         requester: this.requester,
-        attributes: config.attributes,
-        derivedAttributes: config.derivedAttributes,
+        attributes: normalizedAttributes,
+        derivedAttributes: normalizedDerived,
         filter: this.filter,
         timeAttribute: (this as any).timeAttribute,
         customAggregations: (this as any).customAggregations,
