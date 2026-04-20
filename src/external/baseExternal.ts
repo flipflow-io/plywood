@@ -2487,17 +2487,6 @@ export abstract class External {
 
     if (Object.keys(linkedAppliesByName).length === 0) return null;
 
-    // joinKeys configures the underlying COLUMN names that exist in both
-    // datasources. The main split's KEYS are caller-chosen aliases — we need
-    // to find which alias wraps which joinKey column so the linked sub-query
-    // can split by the same alias (Dataset.join matches by key name).
-    // An alias `A` maps to column `C` when `this.split.splits[A]` is `$C`
-    // (RefExpression with name=C).
-    const aliasForColumn: Record<string, string> = {};
-    for (const alias of this.split.keys) {
-      const ex = this.split.splits[alias];
-      if (ex instanceof RefExpression) aliasForColumn[ex.name] = alias;
-    }
     const linkedExternals: { name: string; external: External; joinKeys: string[] }[] = [];
 
     // Once we commit to decomposing (there ARE foreign applies), any further
@@ -2506,6 +2495,13 @@ export abstract class External {
     // the foreign ref is a native column. Clear errors > silent wrong data.
     for (const lsName in linkedAppliesByName) {
       const config = this.linkedSources[lsName];
+      // A main split alias is valid on the linked side iff every free
+      // reference in its expression is a declared joinKey column. This
+      // covers plain refs ($competitor), derived expressions (timeBucket
+      // ($__time, "P1D")), and rejects mixed forms like
+      // $competitor.concat($price) where only some refs are shared.
+      const joinKeyCols: Record<string, true> = {};
+      for (const c of config.joinKeys || []) joinKeyCols[c] = true;
       // Always synthesize a fresh RAW linked external — the one captured during
       // apply-absorption is in 'value' mode (it already absorbed an aggregate)
       // and can't re-accept a split. Same recipe as expandLinkedSourcesInDatum.
@@ -2545,24 +2541,22 @@ export abstract class External {
         querySelection: (this as any).querySelection,
         context: (this as any).context,
       });
-      // Shared join keys = config.joinKeys whose underlying column is present
-      // among main's split aliases. Each yields an (alias -> columnRef) pair
-      // for the linked side's split.
       const sharedAliases: string[] = [];
       const linkedSplitMap: Record<string, Expression> = {};
-      for (const col of config.joinKeys || []) {
-        const alias = aliasForColumn[col];
-        if (!alias) continue;
-        sharedAliases.push(alias);
-        linkedSplitMap[alias] = this.split.splits[alias];
+      for (const alias of this.split.keys) {
+        const ex = this.split.splits[alias];
+        const refs = ex.getFreeReferences();
+        if (refs.length === 0) continue;
+        if (refs.every(r => joinKeyCols[r])) {
+          sharedAliases.push(alias);
+          linkedSplitMap[alias] = ex;
+        }
       }
       if (sharedAliases.length === 0) {
         throw new Error(
-          `Cross-source query needs at least one split whose column is a declared joinKey of "${lsName}" [${(
+          `Cross-source query needs at least one split whose free refs are all declared joinKeys of "${lsName}" [${(
             config.joinKeys || []
-          ).join(', ')}] — current split aliases map columns [${Object.keys(aliasForColumn).join(
-            ', ',
-          )}]`,
+          ).join(', ')}] — current split aliases [${this.split.keys.join(', ')}]`,
         );
       }
 
