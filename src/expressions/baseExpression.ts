@@ -1793,7 +1793,11 @@ export abstract class Expression implements Instance<ExpressionValue, Expression
   // Evaluation
 
   private _initialPrepare(context: Datum, environment: Environment): Expression {
-    return this.defineEnvironment(environment).referenceCheck(context).resolve(context).simplify();
+    const expanded = External.expandLinkedSourcesInDatum(context);
+    return this.defineEnvironment(environment)
+      .referenceCheck(expanded)
+      .resolve(expanded)
+      .simplify();
   }
 
   /**

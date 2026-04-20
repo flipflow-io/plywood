@@ -272,6 +272,28 @@ export interface SpecialApplyTransform {
   prevTimeRange: TimeRange;
 }
 
+/**
+ * Build a type-context fragment describing a linked source's schema so
+ * refs like $reviews.reviewsRating resolve during type checking.
+ */
+function linkedSourceDatasetType(ls: {
+  attributes?: Attributes;
+  derivedAttributes?: Record<string, Expression>;
+}): Record<string, FullType> {
+  const datasetType: Record<string, FullType> = {};
+  if (ls.attributes) {
+    for (const attr of ls.attributes) {
+      datasetType[attr.name] = { type: <PlyTypeSimple>attr.type };
+    }
+  }
+  if (ls.derivedAttributes) {
+    for (const key in ls.derivedAttributes) {
+      datasetType[key] = { type: <PlyTypeSimple>ls.derivedAttributes[key].type };
+    }
+  }
+  return datasetType;
+}
+
 export interface ExternalValue {
   engine?: string;
   version?: string;
@@ -281,7 +303,18 @@ export interface ExternalValue {
   attributes?: Attributes;
   attributeOverrides?: Attributes;
   derivedAttributes?: Record<string, Expression>;
-  linkedSources?: Record<string, { source: string; joinKeys: string[] }>;
+  linkedSources?: Record<
+    string,
+    {
+      source: string;
+      joinKeys: string[];
+      // Schema of the linked datasource. When omitted plywood falls back
+      // to inheriting from main's rawAttributes, which is rarely correct for
+      // cross-datasource joins — callers should supply this explicitly.
+      attributes?: Attributes;
+      derivedAttributes?: Record<string, Expression>;
+    }
+  >;
   delegates?: External[];
   concealBuckets?: boolean;
   mode?: QueryMode;
@@ -323,7 +356,15 @@ export interface ExternalJS {
   attributes?: AttributeJSs;
   attributeOverrides?: AttributeJSs;
   derivedAttributes?: Record<string, ExpressionJS>;
-  linkedSources?: Record<string, { source: string; joinKeys: string[] }>;
+  linkedSources?: Record<
+    string,
+    {
+      source: string;
+      joinKeys: string[];
+      attributes?: AttributeJSs;
+      derivedAttributes?: Record<string, ExpressionJS>;
+    }
+  >;
   filter?: ExpressionJS;
   rawAttributes?: AttributeJSs;
   concealBuckets?: boolean;
@@ -852,7 +893,18 @@ export abstract class External {
       value.derivedAttributes = Expression.expressionLookupFromJS(parameters.derivedAttributes);
     }
     if (parameters.linkedSources) {
-      value.linkedSources = parameters.linkedSources;
+      value.linkedSources = {};
+      for (const name in parameters.linkedSources) {
+        const ls = parameters.linkedSources[name];
+        value.linkedSources[name] = {
+          source: ls.source,
+          joinKeys: ls.joinKeys,
+          attributes: ls.attributes ? AttributeInfo.fromJSs(ls.attributes) : undefined,
+          derivedAttributes: ls.derivedAttributes
+            ? Expression.expressionLookupFromJS(ls.derivedAttributes)
+            : undefined,
+        };
+      }
     }
 
     value.filter = parameters.filter ? Expression.fromJS(parameters.filter) : Expression.TRUE;
@@ -918,6 +970,61 @@ export abstract class External {
     return new ClassFn(parameters);
   }
 
+  /**
+   * When a datum contains an External that declares linkedSources, synthesize
+   * a sibling External for each linked source and inject it at the same scope.
+   *
+   * This mirrors the manual `ply().apply('main', main).apply('reviews', reviews)`
+   * pattern callers used to write by hand: the auto-decomposition pipeline
+   * downstream assumes every external referenced in the expression is
+   * directly addressable in the enclosing context.
+   *
+   * Idempotent: if a linked-source name is already bound in the datum (caller
+   * supplied it explicitly), we leave it untouched.
+   */
+  static expandLinkedSourcesInDatum(datum: Datum): Datum {
+    let expanded: Datum | null = null;
+    for (const k in datum) {
+      if (!hasOwnProp(datum, k)) continue;
+      const value = datum[k];
+      if (!(value instanceof External)) continue;
+      if (!value.linkedSources || Object.keys(value.linkedSources).length === 0) continue;
+
+      for (const lsName in value.linkedSources) {
+        if (lsName === k) continue;
+        if (hasOwnProp(datum, lsName)) continue;
+        if (expanded && hasOwnProp(expanded, lsName)) continue;
+
+        const ls = value.linkedSources[lsName];
+        const linkedValue: ExternalValue = {
+          engine: value.engine,
+          version: value.version,
+          source: ls.source,
+          suppress: true,
+          rollup: value.rollup,
+          concealBuckets: value.concealBuckets,
+          requester: value.requester,
+          attributes: ls.attributes,
+          derivedAttributes: ls.derivedAttributes,
+          filter: value.filter,
+          timeAttribute: (value as any).timeAttribute,
+          customAggregations: (value as any).customAggregations,
+          customTransforms: (value as any).customTransforms,
+          allowEternity: (value as any).allowEternity,
+          allowSelectQueries: (value as any).allowSelectQueries,
+          exactResultsOnly: (value as any).exactResultsOnly,
+          querySelection: (value as any).querySelection,
+          context: (value as any).context,
+        };
+        const linkedExt = External.fromValue(linkedValue);
+
+        if (!expanded) expanded = { ...datum };
+        expanded[lsName] = linkedExt;
+      }
+    }
+    return expanded || datum;
+  }
+
   public engine: string;
   public version: string;
   public source: string | string[];
@@ -926,7 +1033,16 @@ export abstract class External {
   public attributes: Attributes = null;
   public attributeOverrides: Attributes = null;
   public derivedAttributes: Record<string, Expression>;
-  public linkedSources: Record<string, { source: string; joinKeys: string[] }>;
+  public linkedSources: Record<
+    string,
+    {
+      source: string;
+      joinKeys: string[];
+      attributes?: Attributes;
+      derivedAttributes?: Record<string, Expression>;
+    }
+  >;
+
   public delegates: External[];
   public concealBuckets: boolean;
 
@@ -2022,10 +2138,11 @@ export abstract class External {
       }
     }
 
-    // Register linked sources as DATASET refs so $reviews resolves in type checking
-    for (const name in this.linkedSources) {
-      myDatasetType[name] = { type: 'DATASET', datasetType: {} };
-    }
+    // Deliberately NOT registering linkedSources inside this external's own
+    // type: that would make expressionDefined(main) return true for refs
+    // into linked datasources and tempt Plywood's optimizer to absorb them
+    // as if they were native columns. Linked-source resolution happens at
+    // the enclosing scope (peer externals injected via expandLinkedSourcesInDatum).
 
     return {
       type: 'DATASET',
@@ -2056,12 +2173,8 @@ export abstract class External {
       };
     }
 
-    // Surface linked sources at the top level so $reviews resolves in applies after split
-    if (myFullType.datasetType) {
-      for (const name in this.linkedSources) {
-        myFullType.datasetType[name] = { type: 'DATASET', datasetType: {} };
-      }
-    }
+    // See the note in getRawFullType: linkedSources are NOT registered here
+    // either. Resolution is via peer externals at the enclosing datum scope.
 
     return myFullType;
   }
