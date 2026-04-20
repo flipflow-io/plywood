@@ -89,6 +89,27 @@ describe('External auto-decomposition — cross-source expressions', () => {
     expect(realQueries[0].query).to.not.include('main_ds-reviews');
   });
 
+  // Filtered aggregate on the linked side: the apply has its own .filter(…)
+  // on top of $reviews — plywood absorbs the filter into the inner external.
+  // When main tries to collapse the apply, filterDiff must recognize the
+  // extra filter as a per-apply refinement (not a ctx-wide filter mismatch).
+  it('linked apply with .filter(rating>0) and main apply without it', () => {
+    const ex = $('main')
+      .split('$competitor', 'Competitor')
+      .apply('AvgPrice', '$main.average($price)')
+      .apply('AvgRating', '$reviews.filter($reviewsRating > 0).average($reviewsRating)');
+
+    const plan = ex.simulateQueryPlan({ main: makeMainWithLinkedReviews() });
+    const all = plan
+      .flat()
+      .map(q => q.query || '')
+      .join('\n');
+    expect(all).to.include('"main_ds-reviews"');
+    // Filtered aggregate: Druid SQL maps .filter(...).average(...) to a
+    // conditional CASE. Either form is correct for the engine.
+    expect(all).to.match(/AVG\(CASE WHEN.*"reviewsRating"|AVG\("reviewsRating"\)/);
+  });
+
   // Cross-source split: a split key whose expression references a linked-only
   // attribute is valid — plywood should run it on the linked side, while any
   // shared split goes on both sides and becomes the join key. The main side

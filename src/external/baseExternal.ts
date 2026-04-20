@@ -1994,12 +1994,14 @@ export abstract class External {
       return External.valuePromiseToStream(
         Promise.all([mainPromise, ...linkedPromises]).then(([main, ...linked]) => {
           let joined = main as Dataset;
-          // .join() auto-dispatches to crossJoinOnSharedKeys / broadcastJoin /
-          // leftJoin based on the relation between key sets — exactly the
-          // case we're in here since main's keys are a superset of the
-          // linked's join keys (see planner invariant: shared keys ⊆ main split).
           for (const side of linked) {
             joined = joined.join(side as Dataset);
+          }
+          if (crossExt.postJoinSort) {
+            joined = joined.sort(crossExt.postJoinSort.expression, crossExt.postJoinSort.direction);
+          }
+          if (crossExt.postJoinLimit) {
+            joined = joined.limit(crossExt.postJoinLimit.value);
           }
           return joined;
         }),
@@ -2456,6 +2458,8 @@ export abstract class External {
   public getCrossExternalDecomposition(): {
     mainExternal: External;
     linkedExternals: { name: string; external: External; joinKeys: string[] }[];
+    postJoinSort?: SortExpression;
+    postJoinLimit?: LimitExpression;
   } | null {
     if (this.mode !== 'split') return null;
     if (!this.applies || this.applies.length === 0) return null;
@@ -2669,8 +2673,36 @@ export abstract class External {
       ),
       ...mainApplies.map(a => new AttributeInfo({ name: a.name, type: a.expression.type })),
     ];
+
+    // Sort / limit routing. If the sort references a main-side apply or a
+    // main-keepable split alias, keep it on main (pre-join); the engine can
+    // use it for topN optimization. If the sort targets something that lives
+    // only post-join (a linked apply, for instance), strip it from main and
+    // return it as postJoinSort so the caller can apply it to the joined
+    // Dataset. The matching limit moves with the sort — applying a pre-join
+    // limit while sorting post-join would silently drop rows.
+    const mainApplyNames: Record<string, true> = {};
+    for (const a of mainApplies) mainApplyNames[a.name] = true;
+    const mainKeepableNames: Record<string, true> = {};
+    for (const a of mainKeepableAliases) mainKeepableNames[a] = true;
+
+    let postJoinSort: SortExpression | undefined;
+    let postJoinLimit: LimitExpression | undefined;
+    if (this.sort) {
+      const sortRef = this.sort.expression;
+      const sortOnMainSide =
+        sortRef instanceof RefExpression &&
+        (mainApplyNames[sortRef.name] || mainKeepableNames[sortRef.name]);
+      if (!sortOnMainSide) {
+        postJoinSort = this.sort;
+        postJoinLimit = this.limit || undefined;
+        mainValue.sort = null;
+        mainValue.limit = null;
+      }
+    }
+
     const mainExternal = External.fromValue(mainValue);
 
-    return { mainExternal, linkedExternals };
+    return { mainExternal, linkedExternals, postJoinSort, postJoinLimit };
   }
 }
