@@ -272,28 +272,6 @@ export interface SpecialApplyTransform {
   prevTimeRange: TimeRange;
 }
 
-/**
- * Build a type-context fragment describing a linked source's schema so
- * refs like $reviews.reviewsRating resolve during type checking.
- */
-function linkedSourceDatasetType(ls: {
-  attributes?: Attributes;
-  derivedAttributes?: Record<string, Expression>;
-}): Record<string, FullType> {
-  const datasetType: Record<string, FullType> = {};
-  if (ls.attributes) {
-    for (const attr of ls.attributes) {
-      datasetType[attr.name] = { type: <PlyTypeSimple>attr.type };
-    }
-  }
-  if (ls.derivedAttributes) {
-    for (const key in ls.derivedAttributes) {
-      datasetType[key] = { type: <PlyTypeSimple>ls.derivedAttributes[key].type };
-    }
-  }
-  return datasetType;
-}
-
 export interface ExternalValue {
   engine?: string;
   version?: string;
@@ -1659,9 +1637,27 @@ export abstract class External {
 
       const applyExpression = apply.expression;
       if (applyExpression instanceof ExternalExpression) {
-        apply = apply.changeExpression(
-          applyExpression.external.valueExpressionWithinFilter(this.filter),
-        );
+        // When the apply IS a whole external, there are two cases:
+        //   - equalBase(other): same datasource seen through another lens
+        //     (filter etc.) — collapse into our own SQL via valueExpression.
+        //   - !equalBase(other) AND other is one of our linkedSources: leave
+        //     the ExternalExpression intact so getCrossExternalDecomposition
+        //     can route this apply to the foreign sub-query downstream.
+        let isDeclaredLinked = false;
+        if (this.linkedSources) {
+          const foreignSource = String(applyExpression.external.source);
+          for (const lsName in this.linkedSources) {
+            if (String(this.linkedSources[lsName].source) === foreignSource) {
+              isDeclaredLinked = true;
+              break;
+            }
+          }
+        }
+        if (!isDeclaredLinked) {
+          apply = apply.changeExpression(
+            applyExpression.external.valueExpressionWithinFilter(this.filter),
+          );
+        }
       }
 
       value = this.valueOf();
@@ -1890,6 +1886,27 @@ export abstract class External {
       return delegate.simulateValue(lastNode, simulatedQueries, externalForNext);
     }
 
+    // Cross-external decomposition: when foreign applies are present, simulate
+    // a query per sub-external. The synthetic dataset keeps the combined shape
+    // so downstream consumers see the post-join schema. queryBasicValueStream
+    // has the equivalent wiring for the async path.
+    const crossExt = this.getCrossExternalDecomposition();
+    if (crossExt) {
+      crossExt.mainExternal.simulateValue(lastNode, simulatedQueries, externalForNext);
+      for (const le of crossExt.linkedExternals) {
+        le.external.simulateValue(lastNode, simulatedQueries, externalForNext);
+      }
+      // Synthesize a representative Dataset: split keys + all applies (main + linked)
+      const datum: Datum = {};
+      this.split.mapSplits((name, expression) => {
+        datum[name] = getSampleValue(Set.unwrapSetType(expression.type), expression);
+      });
+      for (const apply of this.applies) {
+        datum[apply.name] = getSampleValue(apply.expression.type, apply.expression);
+      }
+      return new Dataset({ keys: this.split.mapSplits(name => name), data: [datum] });
+    }
+
     simulatedQueries.push(this.getQueryAndPostTransform().query);
 
     if (mode === 'value') {
@@ -1953,6 +1970,29 @@ export abstract class External {
   }
 
   protected queryBasicValueStream(rawQueries: any[] | null): ReadableStream {
+    const crossExt = this.getCrossExternalDecomposition();
+    if (crossExt) {
+      const mainPromise = External.buildValueFromStream(
+        crossExt.mainExternal.queryBasicValueStream(rawQueries),
+      );
+      const linkedPromises = crossExt.linkedExternals.map(le =>
+        External.buildValueFromStream(le.external.queryBasicValueStream(rawQueries)),
+      );
+      return External.valuePromiseToStream(
+        Promise.all([mainPromise, ...linkedPromises]).then(([main, ...linked]) => {
+          let joined = main as Dataset;
+          // .join() auto-dispatches to crossJoinOnSharedKeys / broadcastJoin /
+          // leftJoin based on the relation between key sets — exactly the
+          // case we're in here since main's keys are a superset of the
+          // linked's join keys (see planner invariant: shared keys ⊆ main split).
+          for (const side of linked) {
+            joined = joined.join(side as Dataset);
+          }
+          return joined;
+        }),
+      );
+    }
+
     const decomposed = this.getJoinDecompositionShortcut();
     if (decomposed) {
       const { waterfallFilterExpression } = decomposed;
@@ -2365,5 +2405,175 @@ export abstract class External {
     }
 
     return null;
+  }
+
+  /**
+   * Cross-external decomposition: when a main-rooted split carries applies
+   * that reference foreign Externals (e.g. $reviews.average($rating) on a
+   * $main split), partition the applies into per-external sub-plans that
+   * can each be answered by a single datasource query. The caller joins
+   * the results on the shared split keys.
+   *
+   * Returns `null` whenever the query is either single-external or is a
+   * shape we can't decompose safely — the outer pipeline then falls through
+   * to the normal single-query path (which may itself fail at SQL time;
+   * that's expected, the pre-existing behavior, and easier to debug).
+   *
+   * Mirrors the layout of getJoinDecompositionShortcut above.
+   */
+  public getCrossExternalDecomposition(): {
+    mainExternal: External;
+    linkedExternals: { name: string; external: External; joinKeys: string[] }[];
+  } | null {
+    if (this.mode !== 'split') return null;
+    if (!this.applies || this.applies.length === 0) return null;
+    if (!this.linkedSources || Object.keys(this.linkedSources).length === 0) return null;
+
+    // Index linkedSources by source-string so we can match foreign ExternalExpressions back
+    // to their declared linked-source name. Source is the stable identity.
+    const linkedByMaterializedSource = new Map<string, { name: string; config: any }>();
+    for (const name in this.linkedSources) {
+      linkedByMaterializedSource.set(String(this.linkedSources[name].source), {
+        name,
+        config: this.linkedSources[name],
+      });
+    }
+
+    // For each apply, collect the set of foreign linked-source names it touches.
+    // A foreign reference is any ExternalExpression whose external's source does
+    // not match ours. Zero foreign refs → main-side apply. One foreign ref →
+    // that linked side. Two+ → this apply mixes sources, we can't decompose.
+    const mainApplies: ApplyExpression[] = [];
+    const linkedAppliesByName: Record<string, ApplyExpression[]> = {};
+    // Capture the first foreign ExternalExpression instance we see per linked
+    // name — we'll reuse its (already time-filtered, schema-complete) external
+    // as the base for the sub-query. This avoids having to synthesize a fresh
+    // linked External from scratch here.
+    const foreignTemplateByName: Record<string, External> = {};
+
+    for (const apply of this.applies) {
+      const foreignNames: Record<string, true> = {};
+      apply.expression.forEach(sub => {
+        if (!(sub instanceof ExternalExpression)) return;
+        if (this.equalBase(sub.external)) return;
+        const hit = linkedByMaterializedSource.get(String(sub.external.source));
+        if (!hit) return; // a foreign external that isn't a declared linkedSource — leave it
+        foreignNames[hit.name] = true;
+        if (!foreignTemplateByName[hit.name]) foreignTemplateByName[hit.name] = sub.external;
+      });
+
+      const foreignKeys = Object.keys(foreignNames);
+      if (foreignKeys.length === 0) {
+        mainApplies.push(apply);
+      } else if (foreignKeys.length === 1) {
+        (linkedAppliesByName[foreignKeys[0]] ||= []).push(apply);
+      } else {
+        return null;
+      }
+    }
+
+    if (Object.keys(linkedAppliesByName).length === 0) return null;
+
+    // joinKeys configures the underlying COLUMN names that exist in both
+    // datasources. The main split's KEYS are caller-chosen aliases — we need
+    // to find which alias wraps which joinKey column so the linked sub-query
+    // can split by the same alias (Dataset.join matches by key name).
+    // An alias `A` maps to column `C` when `this.split.splits[A]` is `$C`
+    // (RefExpression with name=C).
+    const aliasForColumn: Record<string, string> = {};
+    for (const alias of this.split.keys) {
+      const ex = this.split.splits[alias];
+      if (ex instanceof RefExpression) aliasForColumn[ex.name] = alias;
+    }
+    const linkedExternals: { name: string; external: External; joinKeys: string[] }[] = [];
+
+    // Once we commit to decomposing (there ARE foreign applies), any further
+    // inability to materialize sub-queries is a hard error — falling back to
+    // the single-query path would silently corrupt the result by pretending
+    // the foreign ref is a native column. Clear errors > silent wrong data.
+    for (const lsName in linkedAppliesByName) {
+      const config = this.linkedSources[lsName];
+      // Always synthesize a fresh RAW linked external — the one captured during
+      // apply-absorption is in 'value' mode (it already absorbed an aggregate)
+      // and can't re-accept a split. Same recipe as expandLinkedSourcesInDatum.
+      const template = External.fromValue({
+        engine: this.engine,
+        version: this.version,
+        source: config.source,
+        suppress: true,
+        rollup: this.rollup,
+        concealBuckets: this.concealBuckets,
+        requester: this.requester,
+        attributes: config.attributes,
+        derivedAttributes: config.derivedAttributes,
+        filter: this.filter,
+        timeAttribute: (this as any).timeAttribute,
+        customAggregations: (this as any).customAggregations,
+        customTransforms: (this as any).customTransforms,
+        allowEternity: (this as any).allowEternity,
+        allowSelectQueries: (this as any).allowSelectQueries,
+        exactResultsOnly: (this as any).exactResultsOnly,
+        querySelection: (this as any).querySelection,
+        context: (this as any).context,
+      });
+      // Shared join keys = config.joinKeys whose underlying column is present
+      // among main's split aliases. Each yields an (alias -> columnRef) pair
+      // for the linked side's split.
+      const sharedAliases: string[] = [];
+      const linkedSplitMap: Record<string, Expression> = {};
+      for (const col of config.joinKeys || []) {
+        const alias = aliasForColumn[col];
+        if (!alias) continue;
+        sharedAliases.push(alias);
+        linkedSplitMap[alias] = this.split.splits[alias];
+      }
+      if (sharedAliases.length === 0) {
+        throw new Error(
+          `Cross-source query needs at least one split whose column is a declared joinKey of "${lsName}" [${(
+            config.joinKeys || []
+          ).join(', ')}] — current split aliases map columns [${Object.keys(aliasForColumn).join(
+            ', ',
+          )}]`,
+        );
+      }
+
+      let linkedExternal: External = template;
+      linkedExternal = linkedExternal.addExpression(this.split.changeSplits(linkedSplitMap));
+      if (!linkedExternal) {
+        throw new Error(
+          `Linked source "${lsName}" rejected the shared split — its schema must accept the shared join-key expressions`,
+        );
+      }
+
+      for (const apply of linkedAppliesByName[lsName]) {
+        const next = linkedExternal.addExpression(apply);
+        if (!next) {
+          throw new Error(
+            `Linked source "${lsName}" rejected apply "${apply.name}" — the aggregate's refs must resolve in its schema`,
+          );
+        }
+        linkedExternal = next;
+      }
+
+      linkedExternals.push({
+        name: lsName,
+        external: linkedExternal,
+        joinKeys: sharedAliases,
+      });
+    }
+
+    // Build the main side: drop foreign applies, keep everything else exactly
+    // as it was. The aggregate attributes list must stay in sync with applies.
+    const mainValue = this.valueOf();
+    mainValue.applies = mainApplies;
+    mainValue.attributes = [
+      ...this.split.mapSplits(
+        (name, expression) => new AttributeInfo({ name, type: Set.unwrapSetType(expression.type) }),
+      ),
+      ...mainApplies.map(a => new AttributeInfo({ name: a.name, type: a.expression.type })),
+    ];
+    const mainExternal = External.fromValue(mainValue);
+
+    return { mainExternal, linkedExternals };
   }
 }
