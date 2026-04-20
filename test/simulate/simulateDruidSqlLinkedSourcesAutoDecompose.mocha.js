@@ -155,6 +155,29 @@ describe('External auto-decomposition — cross-source expressions', () => {
     expect(linkedQuery.query).to.match(/AVG\("reviewsRating"\)/);
   });
 
+  // Sort routing: when sort targets a linked apply the main side must NOT
+  // emit ORDER BY on that column (it doesn't SELECT it), the sort applies
+  // post-join. Same for limit — otherwise a pre-join limit drops the wrong
+  // rows before post-join ordering.
+  it('sort by a linked apply strips sort/limit from main, applies them post-join', () => {
+    const ex = $('main')
+      .split('$competitor', 'Competitor')
+      .apply('AvgPrice', '$main.average($price)')
+      .apply('AvgRating', '$reviews.average($reviewsRating)')
+      .sort('$AvgRating', 'descending')
+      .limit(10);
+
+    const plan = ex.simulateQueryPlan({ main: makeMainWithLinkedReviews() });
+    const mainQuery = plan
+      .flat()
+      .find(
+        q => (q.query || '').includes('"main_ds"') && !(q.query || '').includes('main_ds-reviews'),
+      );
+    expect(mainQuery, 'main query must exist').to.exist;
+    // Main SQL must NOT try to ORDER BY AvgRating (doesn't select it)
+    expect(mainQuery.query).to.not.match(/AvgRating/);
+  });
+
   // Failure 1 in the UI: sorting by a linked measure. The algebraically
   // well-formed way to express this is an apply that produces the sort key
   // per group, then a sort on that apply — which is exactly what turnilo
