@@ -3209,6 +3209,29 @@ export abstract class External {
     const mainKeepableNames: Record<string, true> = {};
     for (const a of mainKeepableAliases) mainKeepableNames[a] = true;
 
+    // Sort/limit routing: when main's row identity matches the final
+    // grid row identity, main-side sort + LIMIT is safe and enables
+    // Druid's topN optimization. When the join fans main rows out into
+    // multiple grid rows — because the user split includes a linked-
+    // only dimension — main's LIMIT would cap at main-row count, not
+    // grid-row count, and the result under/over-returns depending on
+    // cardinality.
+    //
+    // Two signals force sort+limit post-join:
+    //   1. The query has linked-only split aliases: the join expands
+    //      main rows into N per (linked-only combination), so main's
+    //      LIMIT doesn't speak to the grid-row count.
+    //   2. The sort references something main can't resolve (a linked
+    //      apply name or a linked-only split): main can't order by it.
+    //
+    // Otherwise (shared-only splits, sort on a main apply or shared
+    // split) main's sort+limit stays put — the topN per-period fan-out
+    // in timeshift decomposition and Druid's LIMIT clause remain
+    // valid and efficient.
+    const hasLinkedOnlySplit = linkedExternals.some(
+      le =>
+        le.external && (le.external as any).split?.keys?.some((k: string) => !mainKeepableNames[k]),
+    );
     let postJoinSort: SortExpression | undefined;
     let postJoinLimit: LimitExpression | undefined;
     if (this.sort) {
@@ -3216,12 +3239,18 @@ export abstract class External {
       const sortOnMainSide =
         sortRef instanceof RefExpression &&
         (mainApplyNames[sortRef.name] || mainKeepableNames[sortRef.name]);
-      if (!sortOnMainSide) {
+      const mustMovePostJoin = !sortOnMainSide || hasLinkedOnlySplit;
+      if (mustMovePostJoin) {
         postJoinSort = this.sort;
         postJoinLimit = this.limit || undefined;
         mainValue.sort = null;
         mainValue.limit = null;
       }
+    } else if (this.limit && hasLinkedOnlySplit) {
+      // No sort but a limit + linked-only splits: the limit has to run
+      // post-join to cap grid rows rather than main rows.
+      postJoinLimit = this.limit;
+      mainValue.limit = null;
     }
 
     // HAVING routing. The outer External's havingFilter was copied into
@@ -3249,18 +3278,10 @@ export abstract class External {
         postJoinHavingFilter = havingOnPost;
       }
 
-      // If any HAVING moved post-join, the main-side LIMIT would starve the
-      // result: main returns N rows, join runs, HAVING drops some, we end
-      // up with fewer than N. Users flipping the sort direction observe the
-      // final row count drifting because different main rows survive the
-      // pre-HAVING limit each time.
-      //
-      // Force both sort and limit to run post-join whenever HAVING is
-      // post-join, regardless of which side the sort originally referenced.
-      // Main may still sort Druid-side as a topN hint, but the authoritative
-      // ordering and cap live downstream of HAVING. For main-apply sorts
-      // that previously stayed on main, we null out mainValue.sort too so
-      // we don't do duplicate work — the post-join sort is definitive.
+      // If any HAVING moved post-join, main's LIMIT would starve the
+      // result: main returns N rows, HAVING drops some, we end up
+      // with fewer than N final rows. Force both sort and limit to
+      // post-join so the cap applies against the HAVING-filtered set.
       if (postJoinHavingFilter) {
         if (this.sort && !postJoinSort) {
           postJoinSort = this.sort;
