@@ -2421,24 +2421,21 @@ export abstract class External {
           // broadcastable subset.
           const mainIsTotals = !(main as Dataset).keys || (main as Dataset).keys.length === 0;
           let joined: Dataset;
-          // Cross-source join uses INNER semantics. If the user split by a
-          // linked-only column (e.g. `review_title`), a main row without a
-          // linked match has no value for that column — keeping it in the
-          // result (left-join default) surfaces rows with undefined splits,
-          // which bubbles up as null-titled rows sorted to the top or bottom
-          // depending on direction. A linked-only split declares the user's
-          // intent that each output row must be anchored by a linked match;
-          // unmatched main rows don't belong.
+          // Per-source join mode comes from the decomposition — each
+          // linked sub declared its own 'inner' | 'left' via config.
+          // Mixed modes are fine: the first linked's mode governs the
+          // main↔first join, subsequent sides apply their own mode
+          // against the accumulating joined Dataset.
           if (mainIsTotals && linked.length > 0) {
             joined = linked[0] as Dataset;
-            joined = joined.join(main as Dataset, 'inner');
+            joined = joined.join(main as Dataset, crossExt.linkedExternals[0].joinMode);
             for (let i = 1; i < linked.length; i++) {
-              joined = joined.join(linked[i] as Dataset, 'inner');
+              joined = joined.join(linked[i] as Dataset, crossExt.linkedExternals[i].joinMode);
             }
           } else {
             joined = main as Dataset;
-            for (const side of linked) {
-              joined = joined.join(side as Dataset, 'inner');
+            for (let i = 0; i < linked.length; i++) {
+              joined = joined.join(linked[i] as Dataset, crossExt.linkedExternals[i].joinMode);
             }
           }
           // Apply the post-join HAVING before sort/limit so sort ordering
@@ -2931,7 +2928,12 @@ export abstract class External {
    */
   public getCrossExternalDecomposition(): {
     mainExternal: External;
-    linkedExternals: { name: string; external: External; joinKeys: string[] }[];
+    linkedExternals: {
+      name: string;
+      external: External;
+      joinKeys: string[];
+      joinMode: 'inner' | 'left';
+    }[];
     postJoinSort?: SortExpression;
     postJoinLimit?: LimitExpression;
     // Aliases the decomposition itself inserted into both sides' splits so
@@ -3043,7 +3045,12 @@ export abstract class External {
     }
     if (Object.keys(involvedLinkedNames).length === 0) return null;
 
-    const linkedExternals: { name: string; external: External; joinKeys: string[] }[] = [];
+    const linkedExternals: {
+      name: string;
+      external: External;
+      joinKeys: string[];
+      joinMode: 'inner' | 'left';
+    }[] = [];
 
     // Once we commit to decomposing, any further inability to materialize
     // sub-queries is a hard error — falling back to the single-query path
@@ -3237,10 +3244,24 @@ export abstract class External {
         linkedExternal = next;
       }
 
+      // Resolve join mode per linked source. The cube MUST declare this
+      // explicitly via config.joinMode — without a default, the engine
+      // refuses to guess whether orphan main rows should survive. A
+      // missing joinMode surfaces as a clear error pointing the cube
+      // author at the required field rather than silently inner- or
+      // left-joining.
+      const resolvedJoinMode = External.resolveLinkedJoinMode(config);
+      if (!resolvedJoinMode) {
+        throw new Error(
+          `Linked source "${lsName}" must declare \`joinMode\` ('inner' | 'left') — cross-source decomposition won't guess which orphan-row semantic you want. 'inner' drops main rows without a linked match (typical for monitoring cubes); 'left' keeps them with linked columns undefined.`,
+        );
+      }
+
       linkedExternals.push({
         name: lsName,
         external: linkedExternal,
         joinKeys: sharedAliases,
+        joinMode: resolvedJoinMode,
       });
 
       // Stash the main-compatible split set for rebuilding main after the loop.

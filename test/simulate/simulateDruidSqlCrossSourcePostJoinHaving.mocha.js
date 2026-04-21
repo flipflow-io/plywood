@@ -45,6 +45,7 @@ function makeMain() {
         // Declared so the decomposition classifies splits over it as shared
         // rather than raising the ambiguous-overlap error.
         sharedDimensions: ['productName'],
+        joinMode: 'inner',
         attributes: [
           { name: '__time', type: 'TIME' },
           { name: 'partition_id', type: 'STRING' },

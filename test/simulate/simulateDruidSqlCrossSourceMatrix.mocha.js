@@ -68,6 +68,9 @@ function makeMainWithLinkedReviews() {
         // anchor only when the user explicitly splits on timeBucket;
         // auto-adding it would explode results by snapshot count.
         autoInjectJoinKeys: ['competitor'],
+        // Drop orphan main rows: a split over a linked-only column
+        // (e.g. review_title) requires a linked match to be meaningful.
+        joinMode: 'inner',
         attributes: [
           { name: '__time', type: 'TIME' },
           { name: 'competitor', type: 'STRING' },

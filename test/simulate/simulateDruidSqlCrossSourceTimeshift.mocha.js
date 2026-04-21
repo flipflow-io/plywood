@@ -64,6 +64,8 @@ const makeMainWithLinkedReviews = () =>
       reviews: {
         source: 'main_ds-reviews',
         joinKeys: ['competitor', '__time'],
+        autoInjectJoinKeys: ['competitor'],
+        joinMode: 'inner',
         attributes: [
           { name: '__time', type: 'TIME' },
           { name: 'competitor', type: 'STRING' },

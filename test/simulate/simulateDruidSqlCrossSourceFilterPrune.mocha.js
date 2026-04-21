@@ -58,6 +58,7 @@ function makeMain() {
         // it as a shared split on both sides rather than raising the
         // "ambiguous — declare it" error.
         sharedDimensions: ['productName'],
+        joinMode: 'inner',
         attributes: [
           { name: '__time', type: 'TIME' },
           { name: 'partition_id', type: 'STRING' },
