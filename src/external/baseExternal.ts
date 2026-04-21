@@ -266,6 +266,90 @@ function findApplyByExpression(
   return null;
 }
 
+/**
+ * Declarative configuration for a foreign datasource joined to a main
+ * External under cross-source decomposition. Every semantic choice that
+ * affects how decomposition routes splits, injects synthetic keys, or
+ * merges rows MUST live here explicitly — no heuristic inference from
+ * schema shape or column types.
+ *
+ * Shapes:
+ *
+ *   joinKeys              Declared anchor of the join. Columns that,
+ *                         when equal on both sides, identify a
+ *                         corresponding row pair. Used for:
+ *                           - classifying split aliases as `shared`
+ *                             (a split whose refs all land in joinKeys
+ *                             is shared automatically),
+ *                           - auto-injecting synthetic `__join_<key>`
+ *                             splits when the user picks no shared
+ *                             split (subset controlled by
+ *                             `autoInjectJoinKeys`).
+ *
+ *   autoInjectJoinKeys    Subset of `joinKeys` that the engine may
+ *                         synthesize as `__join_<key>` splits when
+ *                         the user's query has no shared split. Any
+ *                         joinKey NOT listed here is valid as an
+ *                         explicit user-chosen shared split but never
+ *                         auto-added. Omit to default to `joinKeys`.
+ *                         Typical use: `joinKeys: [partitionId,
+ *                         __time]`, `autoInjectJoinKeys: [partitionId]`
+ *                         — __time is a valid join anchor only when
+ *                         the user explicitly splits on timeBucket,
+ *                         otherwise the auto-inject would explode the
+ *                         result by snapshot count.
+ *
+ *   sharedDimensions      Columns present on BOTH sides that carry the
+ *                         same semantic meaning (e.g. a productName
+ *                         surfaced on linked via derivedAttribute).
+ *                         When the user splits on one of these, both
+ *                         sides group by it at the SQL level and the
+ *                         natural-join aligns equal values. Unlike
+ *                         joinKeys, sharedDimensions aren't the join
+ *                         anchor — they're additional columns that
+ *                         behave like shared splits when referenced.
+ *                         MUST be declared: the decomposition refuses
+ *                         to silently infer shared-ness from schema
+ *                         overlap because the same column name on
+ *                         both sides can legitimately mean different
+ *                         things.
+ *
+ *   joinMode              Row-retention semantic of the in-memory join:
+ *                           'inner' — drop main rows with no linked
+ *                             match (typical for monitoring cubes
+ *                             where a split on a linked-only column
+ *                             implies the row exists only if linked
+ *                             has data),
+ *                           'left'  — keep orphan main rows with
+ *                             linked columns undefined (use when the
+ *                             main side is authoritative and linked
+ *                             contributes optional enrichment).
+ *                         No default — every cube declares which.
+ */
+export interface LinkedSourceConfig {
+  source: string;
+  joinKeys: string[];
+  autoInjectJoinKeys?: string[];
+  sharedDimensions?: string[];
+  joinMode?: 'inner' | 'left';
+  attributes?: Attributes;
+  derivedAttributes?: Record<string, Expression>;
+}
+
+/**
+ * JS-form of LinkedSourceConfig — attributes and derivedAttributes come
+ * in as JS descriptors, to be rehydrated by `fromJS`.
+ */
+export interface LinkedSourceConfigJS {
+  source: string;
+  joinKeys: string[];
+  autoInjectJoinKeys?: string[];
+  sharedDimensions?: string[];
+  joinMode?: 'inner' | 'left';
+  attributes?: AttributeJSs;
+  derivedAttributes?: Record<string, ExpressionJS>;
+}
+
 export interface SpecialApplyTransform {
   mainRangeLiteral: LiteralExpression;
   curTimeRange: TimeRange;
@@ -281,18 +365,7 @@ export interface ExternalValue {
   attributes?: Attributes;
   attributeOverrides?: Attributes;
   derivedAttributes?: Record<string, Expression>;
-  linkedSources?: Record<
-    string,
-    {
-      source: string;
-      joinKeys: string[];
-      // Schema of the linked datasource. When omitted plywood falls back
-      // to inheriting from main's rawAttributes, which is rarely correct for
-      // cross-datasource joins — callers should supply this explicitly.
-      attributes?: Attributes;
-      derivedAttributes?: Record<string, Expression>;
-    }
-  >;
+  linkedSources?: Record<string, LinkedSourceConfig>;
   delegates?: External[];
   concealBuckets?: boolean;
   mode?: QueryMode;
@@ -334,15 +407,7 @@ export interface ExternalJS {
   attributes?: AttributeJSs;
   attributeOverrides?: AttributeJSs;
   derivedAttributes?: Record<string, ExpressionJS>;
-  linkedSources?: Record<
-    string,
-    {
-      source: string;
-      joinKeys: string[];
-      attributes?: AttributeJSs;
-      derivedAttributes?: Record<string, ExpressionJS>;
-    }
-  >;
+  linkedSources?: Record<string, LinkedSourceConfigJS>;
   filter?: ExpressionJS;
   rawAttributes?: AttributeJSs;
   concealBuckets?: boolean;
@@ -1029,6 +1094,9 @@ export abstract class External {
         value.linkedSources[name] = {
           source: ls.source,
           joinKeys: ls.joinKeys,
+          autoInjectJoinKeys: ls.autoInjectJoinKeys,
+          sharedDimensions: ls.sharedDimensions,
+          joinMode: ls.joinMode,
           attributes: ls.attributes ? AttributeInfo.fromJSs(ls.attributes) : undefined,
           derivedAttributes: ls.derivedAttributes
             ? Expression.expressionLookupFromJS(ls.derivedAttributes)
@@ -1255,15 +1323,7 @@ export abstract class External {
   public attributes: Attributes = null;
   public attributeOverrides: Attributes = null;
   public derivedAttributes: Record<string, Expression>;
-  public linkedSources: Record<
-    string,
-    {
-      source: string;
-      joinKeys: string[];
-      attributes?: Attributes;
-      derivedAttributes?: Record<string, Expression>;
-    }
-  >;
+  public linkedSources: Record<string, LinkedSourceConfig>;
 
   public delegates: External[];
   public concealBuckets: boolean;
