@@ -224,18 +224,32 @@ describe('External auto-decomposition — cross-source expressions', () => {
     expect(linkedQuery.query).to.not.match(/isOwn|is_own/i);
   });
 
-  // Degenerate shape: user has linked applies but no split alias maps to
-  // a declared joinKey — there's nothing to join on. The engine must throw
-  // a clear error naming the missing keys, never silently fall through
-  // and pretend the foreign ref is a native column.
-  it('throws a clear error when a linked apply is present but no split column matches any joinKey', () => {
+  // Cross-source query with no user-picked shared split: the engine auto-
+  // injects the declared joinKeys on both sides so the in-memory join has
+  // an anchor. The synthetic columns are projected away post-join.
+  //
+  // This replaces the pre-auto-inject behavior where the engine threw a
+  // clear error; the ergonomic cost of forcing users to pick a joinKey
+  // dimension by hand outweighed the guidance value, and turnilo's
+  // cross-source validator is a better place to surface that kind of
+  // hint (at query-build time, with a UI-actionable message).
+  it('auto-injects joinKeys when a linked apply is present and no user split is shared', () => {
     const ex = $('main')
       .split('$isOwn', 'IsOwn') // main-only, not a joinKey
       .apply('AvgPrice', '$main.average($price)')
       .apply('AvgRating', '$reviews.average($reviewsRating)');
 
-    expect(() => ex.simulateQueryPlan({ main: makeMainWithLinkedReviews() })).to.throw(
-      /joinKey|shared/i,
+    const plan = ex.simulateQueryPlan({ main: makeMainWithLinkedReviews() });
+    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const mains = queries.filter(
+      q => q.query.includes('"main_ds"') && !q.query.includes('main_ds-reviews'),
     );
+    const links = queries.filter(q => q.query.includes('main_ds-reviews'));
+
+    expect(mains).to.have.length(1);
+    expect(links).to.have.length(1);
+    // Both sides group by the synthetic joinKey(s)
+    expect(mains[0].query).to.match(/"__join_(competitor|time)"/);
+    expect(links[0].query).to.match(/"__join_(competitor|time)"/);
   });
 });

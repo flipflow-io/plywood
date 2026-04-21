@@ -851,6 +851,30 @@ export abstract class External {
     return pt as any;
   }
 
+  /**
+   * Project away a set of column names from a Dataset. Used by cross-source
+   * decomposition to strip synthetic join-key columns that served only as
+   * the in-memory join anchor. Keys and attributes are recomputed from the
+   * remaining columns.
+   */
+  static dropColumns(dataset: Dataset, drop: string[]): Dataset {
+    if (!drop || drop.length === 0) return dataset;
+    const dropSet: Record<string, true> = {};
+    for (const n of drop) dropSet[n] = true;
+    const nextData = dataset.data.map(d => {
+      const out: Datum = {};
+      for (const k in d) if (!dropSet[k]) out[k] = d[k];
+      return out;
+    });
+    const nextAttributes = (dataset.attributes || []).filter(a => !dropSet[a.name]);
+    const nextKeys = (dataset.keys || []).filter(k => !dropSet[k]);
+    return new Dataset({
+      attributes: nextAttributes,
+      keys: nextKeys.length ? nextKeys : undefined,
+      data: nextData,
+    });
+  }
+
   static jsToValue(parameters: ExternalJS, requester: PlywoodRequester<any>): ExternalValue {
     const value: ExternalValue = {
       engine: parameters.engine,
@@ -2043,6 +2067,13 @@ export abstract class External {
           if (crossExt.postJoinLimit) {
             joined = joined.limit(crossExt.postJoinLimit.value);
           }
+          // Drop synthetic join-key columns the decomposition inserted so the
+          // caller sees only the columns the user asked for. These columns
+          // served purely as the algebraic anchor for the in-memory join and
+          // carry no user-facing meaning.
+          if (crossExt.syntheticJoinAliases && crossExt.syntheticJoinAliases.length > 0) {
+            joined = External.dropColumns(joined, crossExt.syntheticJoinAliases);
+          }
           return joined;
         }),
       );
@@ -2500,6 +2531,12 @@ export abstract class External {
     linkedExternals: { name: string; external: External; joinKeys: string[] }[];
     postJoinSort?: SortExpression;
     postJoinLimit?: LimitExpression;
+    // Aliases the decomposition itself inserted into both sides' splits so
+    // the join has something to align on (declared joinKeys from the linked
+    // source's config). These are implementation detail — the execution
+    // layer drops them from the final dataset so the caller sees only the
+    // columns they asked for.
+    syntheticJoinAliases?: string[];
   } | null {
     if (this.mode !== 'split') return null;
     if (!this.applies || this.applies.length === 0) return null;
@@ -2675,24 +2712,53 @@ export abstract class External {
           );
         }
       }
-      // Zero shared splits is only valid when main contributes no splits
-      // either — then main is queried as TOTALS (one row of aggregates) and
-      // the linked side broadcasts. With main splits present and no shared
-      // key there's genuinely nothing to join on → invalid.
-      if (sharedAliases.length === 0 && mainOnlyAliases.length > 0) {
-        throw new Error(
-          `Cross-source query has main-side splits [${mainOnlyAliases.join(
-            ', ',
-          )}] but no split whose free refs are all declared joinKeys of "${lsName}" [${(
-            config.joinKeys || []
-          ).join(', ')}]`,
-        );
+      // Zero shared splits AND main/linked contributions exist → auto-inject
+      // one split per declared joinKey onto both sides. The user didn't pick
+      // a shared dimension, but the cube's joinKeys config says "this pair of
+      // columns is the canonical identity for the join". We wire them in as
+      // synthetic splits `__join_<key>` on each side and drop them from the
+      // final projection post-join — the caller sees only the columns they
+      // asked for.
+      //
+      // Semantics note: the effective granularity of the result is the cross
+      // product of user splits × joinKey tuples. For cubes where a joinKey
+      // like `partitionId` identifies a product that maps 1:1 to the user's
+      // dimensions (ean, etc.), this is the expected "one row per product"
+      // behavior. For cubes where that's not true, the user should include
+      // an explicit shared dimension to make their intended granularity
+      // explicit.
+      const syntheticAliasesForThisSource: string[] = [];
+      const syntheticSplits: Record<string, Expression> = {};
+      if (sharedAliases.length === 0 && (config.joinKeys || []).length > 0) {
+        // Resolve the key's type once — ref expressions without a type can't
+        // be simulated and lose joinability downstream. Prefer the main-side
+        // attribute type, fall back to the linked side's declared attributes.
+        const typeForKey: Record<string, PlyType> = {};
+        for (const a of this.rawAttributes || []) typeForKey[a.name] = a.type;
+        for (const k in this.derivedAttributes) {
+          const dtype = (this.derivedAttributes[k] as any).type;
+          if (dtype) typeForKey[k] = dtype;
+        }
+        if (config.attributes) {
+          for (const a of config.attributes as any[]) {
+            if (!typeForKey[a.name]) typeForKey[a.name] = a.type;
+          }
+        }
+        for (const key of config.joinKeys) {
+          const alias = `__join_${key}`;
+          if (this.split.splits[alias]) continue; // collision (unlikely) — skip
+          syntheticSplits[alias] = $(key, typeForKey[key] || 'STRING');
+          syntheticAliasesForThisSource.push(alias);
+          sharedAliases.push(alias);
+        }
       }
 
-      // Linked side: shared splits + this source's linked-only splits
+      // Linked side: shared splits (including synthetic) + this source's linked-only splits
       let linkedExternal: External = template;
       const linkedSplitMap: Record<string, Expression> = {};
-      for (const a of sharedAliases) linkedSplitMap[a] = this.split.splits[a];
+      for (const a of sharedAliases) {
+        linkedSplitMap[a] = this.split.splits[a] || syntheticSplits[a];
+      }
       for (const a of linkedOnlyAliases) linkedSplitMap[a] = this.split.splits[a];
       if (Object.keys(linkedSplitMap).length === 0) {
         throw new Error(
@@ -2729,6 +2795,18 @@ export abstract class External {
       // aliases is the same across sources — linked-only for source A is only
       // valid on A, so it must be dropped from main regardless of B.)
       (this as any)._lastMainKeepableAliases = [...mainOnlyAliases, ...sharedAliases];
+      // Remember the synthetic splits so the main side's split map can pull
+      // from them (they are NOT in this.split.splits).
+      (this as any)._lastSyntheticSplits = {
+        ...((this as any)._lastSyntheticSplits || {}),
+        ...syntheticSplits,
+      };
+      // Collect synthetic aliases across all sources, deduped — the execution
+      // layer will strip these columns from the final joined dataset.
+      for (const a of syntheticAliasesForThisSource) {
+        if (!(this as any)._syntheticAliasMap) (this as any)._syntheticAliasMap = {};
+        (this as any)._syntheticAliasMap[a] = true;
+      }
     }
 
     // Build the main side: keep only splits whose refs resolve in main's own
@@ -2736,20 +2814,32 @@ export abstract class External {
     // main external becomes TOTALS mode — one row of aggregates that the
     // linked side broadcasts across its groupings.
     const mainKeepableAliases: string[] = (this as any)._lastMainKeepableAliases || [];
+    const syntheticSplitsAll: Record<string, Expression> = (this as any)._lastSyntheticSplits || {};
     const mainValue = this.valueOf();
     mainValue.applies = mainApplies;
     if (mainKeepableAliases.length > 0) {
       const mainSplitMap: Record<string, Expression> = {};
-      for (const a of mainKeepableAliases) mainSplitMap[a] = this.split.splits[a];
+      for (const a of mainKeepableAliases)
+        mainSplitMap[a] = this.split.splits[a] || syntheticSplitsAll[a];
       mainValue.split = this.split.changeSplits(mainSplitMap);
+      // Build attributes. For synthetic splits the expression is a bare ref
+      // with no resolved type yet — look the column's type up in the main
+      // external's own schema (rawAttributes + derivedAttributes).
+      const mainAttrTypeByName: Record<string, PlyType> = {};
+      for (const a of this.rawAttributes || []) mainAttrTypeByName[a.name] = a.type;
+      for (const k in this.derivedAttributes) {
+        const dtype = (this.derivedAttributes[k] as any).type;
+        if (dtype) mainAttrTypeByName[k] = dtype;
+      }
       mainValue.attributes = [
-        ...mainKeepableAliases.map(
-          name =>
-            new AttributeInfo({
-              name,
-              type: Set.unwrapSetType(this.split.splits[name].type),
-            }),
-        ),
+        ...mainKeepableAliases.map(name => {
+          const ex = this.split.splits[name] || syntheticSplitsAll[name];
+          let t = Set.unwrapSetType(ex.type);
+          if (!t && ex instanceof RefExpression && mainAttrTypeByName[ex.name]) {
+            t = mainAttrTypeByName[ex.name];
+          }
+          return new AttributeInfo({ name, type: t || 'STRING' });
+        }),
         ...mainApplies.map(a => new AttributeInfo({ name: a.name, type: a.expression.type })),
       ];
     } else {
@@ -2795,6 +2885,15 @@ export abstract class External {
 
     const mainExternal = External.fromValue(mainValue);
 
-    return { mainExternal, linkedExternals, postJoinSort, postJoinLimit };
+    const syntheticAliasMap: Record<string, true> | undefined = (this as any)._syntheticAliasMap;
+    const syntheticJoinAliases = syntheticAliasMap ? Object.keys(syntheticAliasMap) : undefined;
+
+    return {
+      mainExternal,
+      linkedExternals,
+      postJoinSort,
+      postJoinLimit,
+      syntheticJoinAliases,
+    };
   }
 }

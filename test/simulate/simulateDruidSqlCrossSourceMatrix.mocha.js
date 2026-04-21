@@ -142,19 +142,32 @@ describe('Cross-source matrix — canonical shapes', () => {
     expect(queries.every(q => !q.query.includes('reviews'))).to.equal(true);
   });
 
-  it('Shape 4: main split + both aggregates, NO shared split → clear error', () => {
-    // Main-only split + main agg + linked agg can't decompose without a shared
-    // key to join on. The engine must surface a specific error so turnilo can
-    // hoist it to the UI as a dimension requirement — never silently produce
-    // wrong rows (e.g., bleeding linked aggregates across main rows).
+  it('Shape 4: main split + both aggregates, no user-shared split → auto-inject joinKeys', () => {
+    // When a cross-source query has no shared split, the engine auto-injects
+    // every declared joinKey as a synthetic split (`__join_<key>`) on both
+    // sides so the in-memory join has something to align on. The synthetic
+    // columns are projected away from the final dataset, so the caller sees
+    // only what they asked for: (Ean, AvgPrice, AvgRating).
     const ex = $('main')
       .split('$ean', 'Ean')
       .apply('AvgPrice', '$main.average($price)')
       .apply('AvgRating', '$reviews.average($reviewsRating)');
 
-    expect(() => runPlan(ex, makeMainWithLinkedReviews())).to.throw(
-      /shared|joinKey|no split whose/i,
-    );
+    const queries = runPlan(ex, makeMainWithLinkedReviews());
+    const mains = mainQueriesOf(queries);
+    const links = linkedQueriesOf(queries);
+
+    expect(mains, 'main side').to.have.length(1);
+    expect(links, 'linked side').to.have.length(1);
+    // Both sides group by the synthetic join keys declared on the cube
+    expect(mains[0].query).to.match(/"__time" AS "__join___time"/);
+    expect(mains[0].query).to.match(/"competitor" AS "__join_competitor"/);
+    expect(mains[0].query).to.match(/"ean" AS "Ean"/); // user's split stays
+    expect(links[0].query).to.match(/"__time" AS "__join___time"/);
+    expect(links[0].query).to.match(/"competitor" AS "__join_competitor"/);
+    // Sources don't bleed
+    expect(mains[0].query).to.not.match(/reviewsRating/);
+    expect(links[0].query).to.not.match(/AVG\("price"\)/);
   });
 
   it('Shape 5: shared split + both aggregates → 2 queries joined on shared key', () => {
@@ -221,7 +234,12 @@ describe('Cross-source matrix — canonical shapes', () => {
     expect(links[0].query).to.not.match(/"ean"/);
   });
 
-  it('Shape 8: totals main + linked split → broadcast main across linked rows', () => {
+  it('Shape 8: linked-only split + both aggregates → auto-inject joinKeys on both sides', () => {
+    // User's only split is linked-only. The engine auto-injects the declared
+    // joinKeys on both sides so the main aggregate is computed per
+    // (joinKey-tuple) context and joined to the linked rows. Post-join, the
+    // synthetic columns are dropped and the caller sees
+    // (ReviewTitle, AvgPrice, AvgRating).
     const ex = $('main')
       .split('$review_title', 'ReviewTitle')
       .apply('AvgPrice', '$main.average($price)')
@@ -230,14 +248,14 @@ describe('Cross-source matrix — canonical shapes', () => {
 
     const mains = mainQueriesOf(queries);
     const links = linkedQueriesOf(queries);
-    // Main has no compatible split alias → totals mode. Druid writes this
-    // as `GROUP BY ()` which is the SQL form for "aggregate over everything
-    // without any grouping column" — semantically a single-row result.
     expect(mains).to.have.length(1);
-    expect(mains[0].query).to.match(/GROUP BY \(\)/);
-    // Linked carries the linked-only split
     expect(links).to.have.length(1);
+    // Both sides group by the synthetic joinKeys
+    expect(mains[0].query).to.match(/"__time" AS "__join___time"/);
+    expect(mains[0].query).to.match(/"competitor" AS "__join_competitor"/);
+    // Linked carries the linked-only user split + synthetic joinKeys
     expect(links[0].query).to.match(/"review_title"/);
+    expect(links[0].query).to.match(/"__join_competitor"/);
   });
 
   it('Shape 10: main split + shared split + linked split + both aggregates', () => {
