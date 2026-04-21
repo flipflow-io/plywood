@@ -63,6 +63,11 @@ function makeMainWithLinkedReviews() {
       reviews: {
         source: 'main_ds-reviews',
         joinKeys: ['competitor', '__time'],
+        // Only `competitor` is auto-injected as a synthetic split when
+        // the user picks no shared dimension. __time is a valid join
+        // anchor only when the user explicitly splits on timeBucket;
+        // auto-adding it would explode results by snapshot count.
+        autoInjectJoinKeys: ['competitor'],
         attributes: [
           { name: '__time', type: 'TIME' },
           { name: 'competitor', type: 'STRING' },

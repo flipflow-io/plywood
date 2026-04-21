@@ -3184,36 +3184,14 @@ export abstract class External {
             if (!linkedTypeForKey[k]) linkedTypeForKey[k] = 'STRING';
           }
         }
-        // Skip any TIME-typed joinKey. Including it forces both sides to
-        // group by the snapshot timestamp, exploding the output into one
-        // row per (user-split, snapshot) tuple — e.g. a product with 19
-        // scrapes in the filter window shows up 19 times in the grid.
-        // The user's time filter already constrains both sides to the
-        // same window; joining by the identity key (e.g. partitionId)
-        // aggregates across that window, giving one row per product —
-        // the "summary over the time range" semantic retail cubes expect.
-        //
-        // If a user genuinely wants per-snapshot rows, they split on a
-        // timeBucket dimension, which lands in sharedAliases and bypasses
-        // this auto-inject path entirely.
-        //
-        // Detection: check both the TIME attribute type on either side
-        // and the declared `timeAttribute`. Some cubes surface __time
-        // via raw attributes only; others declare timeAttribute too.
-        const mainIsTimeKey: Record<string, true> = {};
-        for (const a of this.rawAttributes || []) {
-          if (a.type === 'TIME' || a.type === 'TIME_RANGE') mainIsTimeKey[a.name] = true;
-        }
-        const linkedIsTimeKey: Record<string, true> = {};
-        if (config.attributes) {
-          for (const a of config.attributes as any[]) {
-            if (a.type === 'TIME' || a.type === 'TIME_RANGE') linkedIsTimeKey[a.name] = true;
-          }
-        }
-        const timeAttr = (this as any).timeAttribute as string | undefined;
-        for (const key of config.joinKeys) {
-          if (timeAttr && key === timeAttr) continue;
-          if (mainIsTimeKey[key] || linkedIsTimeKey[key]) continue;
+        // Iterate exactly the subset declared as auto-injectable. The
+        // cube owns this decision via `config.autoInjectJoinKeys`: keys
+        // listed here become synthetic `__join_<key>` splits; keys
+        // omitted remain legitimate join anchors for user-chosen
+        // explicit shared splits but are never auto-added. Default:
+        // everything in joinKeys is auto-injectable.
+        const injectableKeys = External.resolveAutoInjectJoinKeys(config);
+        for (const key of injectableKeys) {
           const alias = `__join_${key}`;
           if (this.split.splits[alias]) continue; // collision (unlikely) — skip
           const mainRef = $(key, mainTypeForKey[key] || 'STRING');
