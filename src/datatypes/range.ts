@@ -199,7 +199,12 @@ export abstract class Range<T> {
   }
 
   public containsValue(val: T): boolean {
-    if (val === null) return false;
+    // Treat both null and undefined as "not in range" — matches SQL
+    // null-compare semantics: any comparison involving NULL is NULL,
+    // which is falsy in HAVING / WHERE context. Without the undefined
+    // check, callers that pass sparse datums (left-joined orphans with
+    // no matching right-side columns) crash in .valueOf() below.
+    if (val === null || val === undefined) return false;
     val = (val as any).valueOf(); // Turn a Date into a number
     if (!this.validMemberType(val)) return false;
 

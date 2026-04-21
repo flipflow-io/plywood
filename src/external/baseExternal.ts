@@ -2441,25 +2441,14 @@ export abstract class External {
           // Apply the post-join HAVING before sort/limit so sort ordering
           // reflects only the surviving rows, and limit caps against the
           // filtered result — not the pre-filter row count (which would
-          // silently under-return rows).
-          //
-          // Defensive: a left-side main row with no linked match arrives at
-          // the join with its linked-apply columns undefined. Evaluating the
-          // predicate against `undefined` crashes the calc path (e.g.
-          // Range.containsValue calls .valueOf() on the operand). SQL HAVING
-          // semantics say null-valued predicates are false, so we drop such
-          // rows explicitly — matches what Druid would do if the filter had
-          // been pushable to HAVING on the source side.
+          // silently under-return rows). Plywood's predicate evaluation
+          // now treats null/undefined operands as NULL (SQL semantics —
+          // any comparison with NULL is NULL, falsy in HAVING), so no
+          // defensive wrapping is needed: a left-join orphan row with
+          // undefined linked-apply columns fails the predicate naturally
+          // and gets dropped.
           if (crossExt.postJoinHavingFilter) {
-            const refs = crossExt.postJoinHavingFilter.getFreeReferences();
-            const fn = crossExt.postJoinHavingFilter.getFn();
-            joined = joined.filterFn((datum: any) => {
-              for (const r of refs) {
-                const v = datum[r];
-                if (v === undefined || v === null) return false;
-              }
-              return Boolean(fn(datum));
-            });
+            joined = joined.filter(crossExt.postJoinHavingFilter);
           }
           if (crossExt.postJoinSort) {
             joined = joined.sort(crossExt.postJoinSort.expression, crossExt.postJoinSort.direction);
