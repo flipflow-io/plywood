@@ -2751,25 +2751,42 @@ export abstract class External {
       // explicit.
       const syntheticAliasesForThisSource: string[] = [];
       const syntheticSplits: Record<string, Expression> = {};
+      const syntheticSplitsLinked: Record<string, Expression> = {};
       if (sharedAliases.length === 0 && (config.joinKeys || []).length > 0) {
-        // Resolve the key's type once — ref expressions without a type can't
-        // be simulated and lose joinability downstream. Prefer the main-side
-        // attribute type, fall back to the linked side's declared attributes.
-        const typeForKey: Record<string, PlyType> = {};
-        for (const a of this.rawAttributes || []) typeForKey[a.name] = a.type;
+        // Resolve the key's type per side — main and linked may store the
+        // same logical identifier with different native types (BIGINT vs
+        // VARCHAR is common when one side stores the key raw and the other
+        // derives it from a string column). We build each side's synthetic
+        // ref with its side-local type so addExpression accepts the split,
+        // and cast to STRING as the join medium so the in-memory matcher
+        // aligns the rows regardless of native storage. STRING is the
+        // common denominator — any joinKey can round-trip through it.
+        const mainTypeForKey: Record<string, PlyType> = {};
+        for (const a of this.rawAttributes || []) mainTypeForKey[a.name] = a.type;
         for (const k in this.derivedAttributes) {
           const dtype = (this.derivedAttributes[k] as any).type;
-          if (dtype) typeForKey[k] = dtype;
+          if (dtype) mainTypeForKey[k] = dtype;
         }
+        const linkedTypeForKey: Record<string, PlyType> = {};
         if (config.attributes) {
-          for (const a of config.attributes as any[]) {
-            if (!typeForKey[a.name]) typeForKey[a.name] = a.type;
+          for (const a of config.attributes as any[]) linkedTypeForKey[a.name] = a.type;
+        }
+        if (config.derivedAttributes) {
+          // derivedAttributes may be string formulas or parsed Expressions;
+          // their concrete type is whatever their formula resolves to on
+          // the linked side's rawAttributes. For join purposes we cast to
+          // STRING, so we only need a non-null placeholder here.
+          for (const k in config.derivedAttributes) {
+            if (!linkedTypeForKey[k]) linkedTypeForKey[k] = 'STRING';
           }
         }
         for (const key of config.joinKeys) {
           const alias = `__join_${key}`;
           if (this.split.splits[alias]) continue; // collision (unlikely) — skip
-          syntheticSplits[alias] = $(key, typeForKey[key] || 'STRING');
+          const mainRef = $(key, mainTypeForKey[key] || 'STRING');
+          const linkedRef = $(key, linkedTypeForKey[key] || 'STRING');
+          syntheticSplits[alias] = mainRef.cast('STRING');
+          syntheticSplitsLinked[alias] = linkedRef.cast('STRING');
           syntheticAliasesForThisSource.push(alias);
           sharedAliases.push(alias);
         }
@@ -2779,7 +2796,10 @@ export abstract class External {
       let linkedExternal: External = template;
       const linkedSplitMap: Record<string, Expression> = {};
       for (const a of sharedAliases) {
-        linkedSplitMap[a] = this.split.splits[a] || syntheticSplits[a];
+        // For synthetic joinKey splits use the linked-side variant so the
+        // ref carries this side's native type. User-picked shared splits
+        // are the same expression on both sides and reuse this.split.splits.
+        linkedSplitMap[a] = this.split.splits[a] || syntheticSplitsLinked[a] || syntheticSplits[a];
       }
       for (const a of linkedOnlyAliases) linkedSplitMap[a] = this.split.splits[a];
       if (Object.keys(linkedSplitMap).length === 0) {

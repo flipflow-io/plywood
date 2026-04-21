@@ -160,11 +160,11 @@ describe('Cross-source matrix — canonical shapes', () => {
     expect(mains, 'main side').to.have.length(1);
     expect(links, 'linked side').to.have.length(1);
     // Both sides group by the synthetic join keys declared on the cube
-    expect(mains[0].query).to.match(/"__time" AS "__join___time"/);
-    expect(mains[0].query).to.match(/"competitor" AS "__join_competitor"/);
+    expect(mains[0].query).to.match(/AS "__join___time"/);
+    expect(mains[0].query).to.match(/AS "__join_competitor"/);
     expect(mains[0].query).to.match(/"ean" AS "Ean"/); // user's split stays
-    expect(links[0].query).to.match(/"__time" AS "__join___time"/);
-    expect(links[0].query).to.match(/"competitor" AS "__join_competitor"/);
+    expect(links[0].query).to.match(/AS "__join___time"/);
+    expect(links[0].query).to.match(/AS "__join_competitor"/);
     // Sources don't bleed
     expect(mains[0].query).to.not.match(/reviewsRating/);
     expect(links[0].query).to.not.match(/AVG\("price"\)/);
@@ -251,8 +251,8 @@ describe('Cross-source matrix — canonical shapes', () => {
     expect(mains).to.have.length(1);
     expect(links).to.have.length(1);
     // Both sides group by the synthetic joinKeys
-    expect(mains[0].query).to.match(/"__time" AS "__join___time"/);
-    expect(mains[0].query).to.match(/"competitor" AS "__join_competitor"/);
+    expect(mains[0].query).to.match(/AS "__join___time"/);
+    expect(mains[0].query).to.match(/AS "__join_competitor"/);
     // Linked carries the linked-only user split + synthetic joinKeys
     expect(links[0].query).to.match(/"review_title"/);
     expect(links[0].query).to.match(/"__join_competitor"/);
