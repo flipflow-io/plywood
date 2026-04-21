@@ -857,6 +857,48 @@ export abstract class External {
    * the in-memory join anchor. Keys and attributes are recomputed from the
    * remaining columns.
    */
+  /**
+   * Walk a filter expression and replace every atomic predicate whose free
+   * references are not all present in `schemaNames` with TRUE, then simplify.
+   * Atomic predicates are recognized structurally: any RefExpression appears
+   * inside a containing predicate (overlap/is/greaterThan/etc.), and the
+   * chainable's whole predicate is a single AND-leaf.
+   *
+   * Used when propagating a filter from one External to a peer that shares
+   * some but not all columns (e.g. main → linked source). Clauses that
+   * don't resolve in the target schema get dropped silently rather than
+   * blowing up reference-check with "could not resolve $<column>".
+   *
+   * The traversal stops at AND/OR/NOT boundaries: those are combinators,
+   * not predicates. We recurse into their operands and re-combine the
+   * pruned halves. Everything else is treated as an atomic predicate.
+   */
+  static pruneFilterToSchema(filter: Expression, schemaNames: Record<string, true>): Expression {
+    if (!filter) return filter;
+    if (filter.equals(Expression.TRUE) || filter.equals(Expression.FALSE)) return filter;
+
+    const op = (filter as any).op;
+
+    if (op === 'and' || op === 'or') {
+      const left = External.pruneFilterToSchema((filter as any).operand, schemaNames);
+      const right = External.pruneFilterToSchema((filter as any).expression, schemaNames);
+      if (op === 'and') return left.and(right).simplify();
+      return left.or(right).simplify();
+    }
+
+    if (op === 'not') {
+      const inner = External.pruneFilterToSchema((filter as any).operand, schemaNames);
+      return inner.not().simplify();
+    }
+
+    // Atomic predicate: keep iff every free reference exists in the schema.
+    const refs = filter.getFreeReferences();
+    for (const r of refs) {
+      if (!schemaNames[r]) return Expression.TRUE;
+    }
+    return filter;
+  }
+
   static dropColumns(dataset: Dataset, drop: string[]): Dataset {
     if (!drop || drop.length === 0) return dataset;
     const dropSet: Record<string, true> = {};
@@ -1011,6 +1053,22 @@ export abstract class External {
             normalizedDerived[k] = v instanceof Expression ? v : Expression.fromJSLoose(v);
           }
         }
+        // Prune main.filter to only the clauses whose free references exist
+        // in the linked schema. A filter like `$__time.overlap(...) AND
+        // $reference.is(...)` on main is meaningful for main only — the
+        // linked side has no `reference` column. Applying it unfiltered to
+        // the synthesized peer would fail reference-check and blow up the
+        // whole query even though the user's intent was only to narrow the
+        // main-side rows.
+        const linkedNames: Record<string, true> = {};
+        if (normalizedAttrs) {
+          for (const a of normalizedAttrs) linkedNames[a.name] = true;
+        }
+        if (normalizedDerived) {
+          for (const k in normalizedDerived) linkedNames[k] = true;
+        }
+        const prunedFilter = External.pruneFilterToSchema(value.filter, linkedNames);
+
         const linkedValue: ExternalValue = {
           engine: value.engine,
           version: value.version,
@@ -1021,7 +1079,7 @@ export abstract class External {
           requester: value.requester,
           attributes: normalizedAttrs,
           derivedAttributes: normalizedDerived,
-          filter: value.filter,
+          filter: prunedFilter,
           timeAttribute: (value as any).timeAttribute,
           customAggregations: (value as any).customAggregations,
           customTransforms: (value as any).customTransforms,
