@@ -2965,9 +2965,18 @@ export abstract class External {
       for (const k in this.derivedAttributes) mainAttrs[k] = true;
 
       // Partition main's current split aliases by where each is valid:
-      //   shared     = refs ⊆ joinKeys (goes to BOTH sides, becomes the join key)
-      //   mainOnly   = refs ⊆ mainAttrs but not all in joinKeys (stays on main)
-      //   linkedOnly = refs ⊆ linkedAttrs (only this linked source) → goes only to linked
+      //   shared     = refs resolvable on BOTH sides (joinKeys OR any column
+      //                present in both schemas, e.g. a productName surfaced
+      //                as a linked derivedAttribute). Both sides group by it,
+      //                and the natural-join aligns rows with equal values.
+      //                This is broader than Ogievetsky's original "only
+      //                joinKeys count" rule: a dimension that lives on both
+      //                sides SHOULD be a shared grouping column — otherwise
+      //                the side without it aggregates too coarsely and the
+      //                join explodes the result by that dimension's
+      //                cardinality on the other side.
+      //   mainOnly   = resolves only on main
+      //   linkedOnly = resolves only on this linked source
       const sharedAliases: string[] = [];
       const mainOnlyAliases: string[] = [];
       const linkedOnlyAliases: string[] = [];
@@ -2978,13 +2987,16 @@ export abstract class External {
           mainOnlyAliases.push(alias);
           continue;
         }
-        const isShared = refs.every(r => joinKeyCols[r]);
         const isMainResolvable = refs.every(r => mainAttrs[r]);
         const isLinkedResolvable = refs.every(r => linkedAttrs[r]);
-        if (isShared) sharedAliases.push(alias);
-        else if (isMainResolvable) mainOnlyAliases.push(alias);
-        else if (isLinkedResolvable) linkedOnlyAliases.push(alias);
-        else {
+        const isSharedViaJoinKeys = refs.every(r => joinKeyCols[r]);
+        if (isSharedViaJoinKeys || (isMainResolvable && isLinkedResolvable)) {
+          sharedAliases.push(alias);
+        } else if (isMainResolvable) {
+          mainOnlyAliases.push(alias);
+        } else if (isLinkedResolvable) {
+          linkedOnlyAliases.push(alias);
+        } else {
           throw new Error(
             `Split alias "${alias}" references columns that resolve in neither main nor "${lsName}" (refs: [${refs.join(
               ', ',
@@ -3038,7 +3050,36 @@ export abstract class External {
             if (!linkedTypeForKey[k]) linkedTypeForKey[k] = 'STRING';
           }
         }
+        // Skip any TIME-typed joinKey. Including it forces both sides to
+        // group by the snapshot timestamp, exploding the output into one
+        // row per (user-split, snapshot) tuple — e.g. a product with 19
+        // scrapes in the filter window shows up 19 times in the grid.
+        // The user's time filter already constrains both sides to the
+        // same window; joining by the identity key (e.g. partitionId)
+        // aggregates across that window, giving one row per product —
+        // the "summary over the time range" semantic retail cubes expect.
+        //
+        // If a user genuinely wants per-snapshot rows, they split on a
+        // timeBucket dimension, which lands in sharedAliases and bypasses
+        // this auto-inject path entirely.
+        //
+        // Detection: check both the TIME attribute type on either side
+        // and the declared `timeAttribute`. Some cubes surface __time
+        // via raw attributes only; others declare timeAttribute too.
+        const mainIsTimeKey: Record<string, true> = {};
+        for (const a of this.rawAttributes || []) {
+          if (a.type === 'TIME' || a.type === 'TIME_RANGE') mainIsTimeKey[a.name] = true;
+        }
+        const linkedIsTimeKey: Record<string, true> = {};
+        if (config.attributes) {
+          for (const a of config.attributes as any[]) {
+            if (a.type === 'TIME' || a.type === 'TIME_RANGE') linkedIsTimeKey[a.name] = true;
+          }
+        }
+        const timeAttr = (this as any).timeAttribute as string | undefined;
         for (const key of config.joinKeys) {
+          if (timeAttr && key === timeAttr) continue;
+          if (mainIsTimeKey[key] || linkedIsTimeKey[key]) continue;
           const alias = `__join_${key}`;
           if (this.split.splits[alias]) continue; // collision (unlikely) — skip
           const mainRef = $(key, mainTypeForKey[key] || 'STRING');

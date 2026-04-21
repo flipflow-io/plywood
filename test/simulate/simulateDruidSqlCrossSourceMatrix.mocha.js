@@ -144,10 +144,17 @@ describe('Cross-source matrix — canonical shapes', () => {
 
   it('Shape 4: main split + both aggregates, no user-shared split → auto-inject joinKeys', () => {
     // When a cross-source query has no shared split, the engine auto-injects
-    // every declared joinKey as a synthetic split (`__join_<key>`) on both
-    // sides so the in-memory join has something to align on. The synthetic
-    // columns are projected away from the final dataset, so the caller sees
-    // only what they asked for: (Ean, AvgPrice, AvgRating).
+    // every non-time declared joinKey as a synthetic split (`__join_<key>`)
+    // on both sides so the in-memory join has something to align on. The
+    // synthetic columns are projected away from the final dataset, so the
+    // caller sees only what they asked for: (Ean, AvgPrice, AvgRating).
+    //
+    // Time-typed joinKeys are intentionally NOT auto-injected: doing so
+    // would force both sides to group by snapshot timestamp, producing
+    // one output row per (user-split, snapshot) tuple — a product with N
+    // scrapes in the filter window would appear N times in the grid. The
+    // user's time filter already constrains both sides to the same
+    // window; the identity-key join aggregates across it.
     const ex = $('main')
       .split('$ean', 'Ean')
       .apply('AvgPrice', '$main.average($price)')
@@ -159,12 +166,12 @@ describe('Cross-source matrix — canonical shapes', () => {
 
     expect(mains, 'main side').to.have.length(1);
     expect(links, 'linked side').to.have.length(1);
-    // Both sides group by the synthetic join keys declared on the cube
-    expect(mains[0].query).to.match(/AS "__join___time"/);
+    // Identity joinKey injected on both sides; __time is NOT.
     expect(mains[0].query).to.match(/AS "__join_competitor"/);
+    expect(mains[0].query).to.not.match(/AS "__join___time"/);
     expect(mains[0].query).to.match(/"ean" AS "Ean"/); // user's split stays
-    expect(links[0].query).to.match(/AS "__join___time"/);
     expect(links[0].query).to.match(/AS "__join_competitor"/);
+    expect(links[0].query).to.not.match(/AS "__join___time"/);
     // Sources don't bleed
     expect(mains[0].query).to.not.match(/reviewsRating/);
     expect(links[0].query).to.not.match(/AVG\("price"\)/);
@@ -236,10 +243,12 @@ describe('Cross-source matrix — canonical shapes', () => {
 
   it('Shape 8: linked-only split + both aggregates → auto-inject joinKeys on both sides', () => {
     // User's only split is linked-only. The engine auto-injects the declared
-    // joinKeys on both sides so the main aggregate is computed per
+    // non-time joinKeys on both sides so the main aggregate is computed per
     // (joinKey-tuple) context and joined to the linked rows. Post-join, the
     // synthetic columns are dropped and the caller sees
     // (ReviewTitle, AvgPrice, AvgRating).
+    //
+    // Time-typed joinKeys are skipped — see Shape 4 for the rationale.
     const ex = $('main')
       .split('$review_title', 'ReviewTitle')
       .apply('AvgPrice', '$main.average($price)')
@@ -250,12 +259,13 @@ describe('Cross-source matrix — canonical shapes', () => {
     const links = linkedQueriesOf(queries);
     expect(mains).to.have.length(1);
     expect(links).to.have.length(1);
-    // Both sides group by the synthetic joinKeys
-    expect(mains[0].query).to.match(/AS "__join___time"/);
+    // Identity joinKey injected on both sides; __time is NOT.
     expect(mains[0].query).to.match(/AS "__join_competitor"/);
-    // Linked carries the linked-only user split + synthetic joinKeys
+    expect(mains[0].query).to.not.match(/AS "__join___time"/);
+    // Linked carries the linked-only user split + identity synthetic joinKey
     expect(links[0].query).to.match(/"review_title"/);
     expect(links[0].query).to.match(/"__join_competitor"/);
+    expect(links[0].query).to.not.match(/AS "__join___time"/);
   });
 
   it('Shape 10: main split + shared split + linked split + both aggregates', () => {
