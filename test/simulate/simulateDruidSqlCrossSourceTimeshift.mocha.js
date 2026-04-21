@@ -17,10 +17,12 @@
  * External).
  *
  * Structural invariants this spec asserts:
- *   - 4 Druid SQL queries total (1 main×2 periods + 1 linked×2 periods)
- *   - Each query's WHERE clause pins a single time range
  *   - Main queries only project main-side applies (Count); linked queries
- *     only project linked-side applies (AvgRating)
+ *     only project linked-side applies (AvgRating) — sources don't bleed
+ *   - Each (source, period) pair is reachable in exactly one query's output
+ *     (a Druid plain-groupBy can carry multiple periods via filtered-agg
+ *     CASE WHEN; a topN must split into one query per period). Plywood
+ *     should emit the minimal correct shape for each sub-External
  *   - Main-only timeshift (no linked) continues to emit 2 queries via the
  *     pre-existing getJoinDecompositionShortcut path — we don't regress it
  */
@@ -31,17 +33,20 @@ const plywood = require('../plywood');
 
 const { External, $, r } = plywood;
 
+// Non-contiguous on purpose: if prev.end === curr.start, both queries carry
+// the shared boundary timestamp, which makes WHERE-clause string matching
+// ambiguous. Two clear gap days guarantee distinct date strings per query.
 const currRange = {
   start: new Date('2026-04-20T00:00:00Z'),
   end: new Date('2026-04-21T00:00:00Z'),
 };
 const prevRange = {
-  start: new Date('2026-04-19T00:00:00Z'),
-  end: new Date('2026-04-20T00:00:00Z'),
+  start: new Date('2026-04-13T00:00:00Z'),
+  end: new Date('2026-04-14T00:00:00Z'),
 };
 
-const outerTimeFilter = $('time').overlap({
-  start: new Date('2026-04-19T00:00:00Z'),
+const outerTimeFilter = $('__time').overlap({
+  start: new Date('2026-04-13T00:00:00Z'),
   end: new Date('2026-04-21T00:00:00Z'),
 });
 
@@ -49,18 +54,18 @@ const makeMainWithLinkedReviews = () =>
   External.fromJS({
     engine: 'druidsql',
     source: 'main_ds',
-    timeAttribute: 'time',
+    timeAttribute: '__time',
     attributes: [
-      { name: 'time', type: 'TIME' },
+      { name: '__time', type: 'TIME' },
       { name: 'competitor', type: 'STRING' },
       { name: 'price', type: 'NUMBER', unsplitable: true },
     ],
     linkedSources: {
       reviews: {
         source: 'main_ds-reviews',
-        joinKeys: ['competitor', 'time'],
+        joinKeys: ['competitor', '__time'],
         attributes: [
-          { name: 'time', type: 'TIME' },
+          { name: '__time', type: 'TIME' },
           { name: 'competitor', type: 'STRING' },
           { name: 'reviewsRating', type: 'NUMBER', unsplitable: true },
         ],
@@ -73,9 +78,9 @@ const makeMainOnly = () =>
   External.fromJS({
     engine: 'druidsql',
     source: 'main_ds',
-    timeAttribute: 'time',
+    timeAttribute: '__time',
     attributes: [
-      { name: 'time', type: 'TIME' },
+      { name: '__time', type: 'TIME' },
       { name: 'competitor', type: 'STRING' },
       { name: 'price', type: 'NUMBER', unsplitable: true },
     ],
@@ -83,22 +88,22 @@ const makeMainOnly = () =>
   });
 
 describe('External auto-decomposition — cross-source TIMESHIFT', () => {
-  it('topN: main + linked with current/previous applies → 4 parallel queries', () => {
-    // Emulates the turnilo grid: split by competitor, sort by a measure
-    // (descending), limit 50. This is the shape where getJoinDecomposition
-    // Shortcut takes its "topN" path for plain (non-linked) timeshift —
-    // we assert that cross-source fans out to 4 queries in the same shape.
+  it('topN sort on main apply: main splits per period, linked uses filtered-aggs', () => {
+    // Emulates the turnilo grid: split by competitor, sort by main measure,
+    // limit 50. Main takes the topN path (2 queries, one per period), linked
+    // has no sort so stays in 1 query with two filtered aggregates. Sources
+    // never bleed applies across their queries.
     const structured = $('main')
       .split('$competitor', 'Competitor')
-      .apply('Count', $('main').filter($('time').overlap(currRange)).count())
-      .apply('Count_previous', $('main').filter($('time').overlap(prevRange)).count())
+      .apply('Count', $('main').filter($('__time').overlap(currRange)).count())
+      .apply('Count_previous', $('main').filter($('__time').overlap(prevRange)).count())
       .apply(
         'AvgRating',
-        $('reviews').filter($('time').overlap(currRange)).average('$reviewsRating'),
+        $('reviews').filter($('__time').overlap(currRange)).average('$reviewsRating'),
       )
       .apply(
         'AvgRating_previous',
-        $('reviews').filter($('time').overlap(prevRange)).average('$reviewsRating'),
+        $('reviews').filter($('__time').overlap(prevRange)).average('$reviewsRating'),
       )
       .sort('$Count', 'descending')
       .limit(50);
@@ -106,47 +111,87 @@ describe('External auto-decomposition — cross-source TIMESHIFT', () => {
     const plan = structured.simulateQueryPlan({ main: makeMainWithLinkedReviews() });
     const realQueries = plan.flat().filter(q => typeof q.query === 'string');
 
-    // 4 queries: main×{curr,prev} + linked×{curr,prev}
-    expect(realQueries, 'four parallel SQL queries').to.have.length(4);
+    const mainQueries = realQueries.filter(
+      q => q.query.includes('"main_ds"') && !q.query.includes('main_ds-reviews'),
+    );
+    const linkedQueries = realQueries.filter(q => q.query.includes('main_ds-reviews'));
+
+    // Main has topN (sort+limit) → 1 query per period
+    expect(mainQueries, 'main splits per period for topN').to.have.length(2);
+    // Linked has no sort/limit → filtered-agg CASE WHEN in a single query
+    expect(linkedQueries, 'linked fits in one query with filtered aggs').to.have.length(1);
+
+    // Source non-bleed: no main query references linked columns, no linked
+    // query references main columns.
+    for (const q of mainQueries) {
+      expect(q.query).to.not.match(/reviewsRating/);
+    }
+    for (const q of linkedQueries) {
+      expect(q.query).to.not.match(/COUNT\(\*\)/i);
+      expect(q.query).to.match(/AVG\(CASE WHEN.*"reviewsRating"/);
+    }
+
+    // Each main query pins exactly one period range in its WHERE clause
+    const curDay = currRange.start.toISOString().slice(0, 10);
+    const prevDay = prevRange.start.toISOString().slice(0, 10);
+    const mainCurr = mainQueries.find(q => q.query.includes(curDay) && !q.query.includes(prevDay));
+    const mainPrev = mainQueries.find(q => q.query.includes(prevDay) && !q.query.includes(curDay));
+    expect(mainCurr, 'main-current period query with only curr filter').to.exist;
+    expect(mainPrev, 'main-previous period query with only prev filter').to.exist;
+
+    // Linked query carries BOTH periods (one per CASE WHEN)
+    expect(linkedQueries[0].query).to.include(curDay);
+    expect(linkedQueries[0].query).to.include(prevDay);
+  });
+
+  it('sort on a linked apply strips sort/limit from both sides → one query per source', () => {
+    // When the sort targets a linked apply, neither side can serve a
+    // per-period topN: doing so on the linked side would pre-limit to
+    // "top 50 by curr AvgRating" which is an approximation, not the
+    // true top 50 by AvgRating after the join. The correct shape is:
+    // each source emits one query with both periods as CASE WHEN aggs,
+    // and sort+limit are applied AFTER the join. Plywood emits this
+    // shape today via postJoinSort / postJoinLimit.
+    const structured = $('main')
+      .split('$competitor', 'Competitor')
+      .apply('Count', $('main').filter($('__time').overlap(currRange)).count())
+      .apply('Count_previous', $('main').filter($('__time').overlap(prevRange)).count())
+      .apply(
+        'AvgRating',
+        $('reviews').filter($('__time').overlap(currRange)).average('$reviewsRating'),
+      )
+      .apply(
+        'AvgRating_previous',
+        $('reviews').filter($('__time').overlap(prevRange)).average('$reviewsRating'),
+      )
+      .sort('$AvgRating', 'descending')
+      .limit(50);
+
+    const plan = structured.simulateQueryPlan({ main: makeMainWithLinkedReviews() });
+    const realQueries = plan.flat().filter(q => typeof q.query === 'string');
 
     const mainQueries = realQueries.filter(
       q => q.query.includes('"main_ds"') && !q.query.includes('main_ds-reviews'),
     );
     const linkedQueries = realQueries.filter(q => q.query.includes('main_ds-reviews'));
 
-    expect(mainQueries, 'exactly 2 main queries').to.have.length(2);
-    expect(linkedQueries, 'exactly 2 linked queries').to.have.length(2);
+    expect(mainQueries, 'main: one query with both periods as CASE WHEN').to.have.length(1);
+    expect(linkedQueries, 'linked: one query with both periods as CASE WHEN').to.have.length(1);
 
-    // Each main query projects only main-side apply (Count), never the linked ones
-    for (const q of mainQueries) {
-      expect(q.query).to.match(/COUNT\(\*\)|COUNT\(1\)/i);
-      expect(q.query).to.not.match(/reviewsRating/);
-    }
+    // Each sub-query carries BOTH periods (the filtered-agg pattern)
+    expect(mainQueries[0].query).to.match(/CASE WHEN.*"__time".*CASE WHEN.*"__time"/s);
+    expect(linkedQueries[0].query).to.match(/CASE WHEN.*"__time".*CASE WHEN.*"__time"/s);
 
-    // Each linked query projects only linked-side apply (AvgRating), never Count(*)
-    for (const q of linkedQueries) {
-      expect(q.query).to.match(/AVG\("reviewsRating"\)/);
-    }
-
-    // Period filters are pinned per query — one query per distinct time range
-    const curStr = currRange.start.toISOString();
-    const prevStr = prevRange.start.toISOString();
-    const mainCurr = mainQueries.find(q => q.query.includes(curStr.slice(0, 10)));
-    const mainPrev = mainQueries.find(q => q.query.includes(prevStr.slice(0, 10)));
-    const linkedCurr = linkedQueries.find(q => q.query.includes(curStr.slice(0, 10)));
-    const linkedPrev = linkedQueries.find(q => q.query.includes(prevStr.slice(0, 10)));
-
-    expect(mainCurr, 'main current period query').to.exist;
-    expect(mainPrev, 'main previous period query').to.exist;
-    expect(linkedCurr, 'linked current period query').to.exist;
-    expect(linkedPrev, 'linked previous period query').to.exist;
+    // Neither sub-query pre-limits (sort+limit must run post-join)
+    expect(mainQueries[0].query).to.not.match(/LIMIT\s+50/i);
+    expect(linkedQueries[0].query).to.not.match(/LIMIT\s+50/i);
   });
 
   it('main-only topN timeshift (no linked sources) still emits 2 queries', () => {
     const structured = $('main')
       .split('$competitor', 'Competitor')
-      .apply('Count', $('main').filter($('time').overlap(currRange)).count())
-      .apply('Count_previous', $('main').filter($('time').overlap(prevRange)).count())
+      .apply('Count', $('main').filter($('__time').overlap(currRange)).count())
+      .apply('Count_previous', $('main').filter($('__time').overlap(prevRange)).count())
       .sort('$Count', 'descending')
       .limit(50);
 

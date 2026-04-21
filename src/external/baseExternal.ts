@@ -1920,6 +1920,30 @@ export abstract class External {
       return new Dataset({ keys: this.split.mapSplits(name => name), data: [datum] });
     }
 
+    // Time-shift decomposition (Ogievetsky's groupAppliesByTimeFilterValue):
+    // when two apply groups differ only by an overlap filter on the time
+    // ref, split into two sub-Externals — one per period. queryBasicValue
+    // Stream does this via leftJoin/fullJoin; simulation just needs each
+    // sub-query pushed so callers can assert on query count and shape.
+    const timeDecomposed = this.getJoinDecompositionShortcut();
+    if (timeDecomposed) {
+      timeDecomposed.external1.simulateValue(lastNode, simulatedQueries, externalForNext);
+      timeDecomposed.external2.simulateValue(lastNode, simulatedQueries, externalForNext);
+      const datum: Datum = {};
+      if (this.split) {
+        this.split.mapSplits((name, expression) => {
+          datum[name] = getSampleValue(Set.unwrapSetType(expression.type), expression);
+        });
+      }
+      for (const apply of this.applies || []) {
+        datum[apply.name] = getSampleValue(apply.expression.type, apply.expression);
+      }
+      return new Dataset({
+        keys: this.split ? this.split.mapSplits(name => name) : null,
+        data: [datum],
+      });
+    }
+
     simulatedQueries.push(this.getQueryAndPostTransform().query);
 
     if (mode === 'value') {
