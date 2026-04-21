@@ -911,6 +911,69 @@ export abstract class External {
     return filter;
   }
 
+  /**
+   * Split a filter by which side of a cross-source decomposition can evaluate
+   * each clause. Returns `{ main, post }` where `main` is the subset pushable
+   * to the main sub-External's HAVING (Druid-side), and `post` is the subset
+   * that must be applied after the in-memory join (because it references
+   * apply names or split aliases routed to a linked sub-External).
+   *
+   * Algebra:
+   *   - AND combinator: recurse; each side's main/post halves combine
+   *     independently. A mixed-scope AND `(mainRef > 0) AND (linkedRef > 0)`
+   *     becomes `{ main: mainRef > 0, post: linkedRef > 0 }`.
+   *   - OR / NOT combinator: can't split — if the expression references any
+   *     post-join name anywhere, the whole thing must move post-join. Pushing
+   *     half of an OR down would over-prune the main side and silently drop
+   *     rows the join should have re-admitted via the post-join branch.
+   *   - Atomic predicate: the left operand's ref decides. If it names a
+   *     main-resolvable apply/split → stays on main. Otherwise → post-join.
+   *
+   * This is the per-clause decomposition Ogievetsky flagged as the correct
+   * move in 0f9cbf3 ("the correct thing to do would be to decompose the
+   * havingFilter into havingOnExternal1 AND havingOnExternal2"). His fix at
+   * that commit dropped external2's havingFilter pragmatically; here we do
+   * the full split.
+   */
+  static splitFilterByScope(
+    filter: Expression,
+    mainNames: Record<string, true>,
+  ): { main: Expression; post: Expression } {
+    if (!filter || filter.equals(Expression.TRUE)) {
+      return { main: Expression.TRUE, post: Expression.TRUE };
+    }
+    if (filter.equals(Expression.FALSE)) {
+      // FALSE on either side collapses the whole query. Keep it on main so
+      // Druid returns an empty set cheaply; post-join filtering would still
+      // produce the same result but after doing the join work.
+      return { main: Expression.FALSE, post: Expression.TRUE };
+    }
+
+    const op = (filter as any).op;
+
+    if (op === 'and') {
+      const l = External.splitFilterByScope((filter as any).operand, mainNames);
+      const r = External.splitFilterByScope((filter as any).expression, mainNames);
+      return {
+        main: l.main.and(r.main).simplify(),
+        post: l.post.and(r.post).simplify(),
+      };
+    }
+
+    if (op === 'or' || op === 'not') {
+      const refs = filter.getFreeReferences();
+      const allInMain = refs.every(r => mainNames[r]);
+      if (allInMain) return { main: filter, post: Expression.TRUE };
+      return { main: Expression.TRUE, post: filter };
+    }
+
+    const operand: Expression | undefined = (filter as any).operand;
+    if (operand instanceof RefExpression && !mainNames[operand.name]) {
+      return { main: Expression.TRUE, post: filter };
+    }
+    return { main: filter, post: Expression.TRUE };
+  }
+
   static dropColumns(dataset: Dataset, drop: string[]): Dataset {
     if (!drop || drop.length === 0) return dataset;
     const dropSet: Record<string, true> = {};
@@ -2194,6 +2257,13 @@ export abstract class External {
               joined = joined.join(side as Dataset);
             }
           }
+          // Apply the post-join HAVING before sort/limit so sort ordering
+          // reflects only the surviving rows, and limit caps against the
+          // filtered result — not the pre-filter row count (which would
+          // silently under-return rows).
+          if (crossExt.postJoinHavingFilter) {
+            joined = joined.filter(crossExt.postJoinHavingFilter);
+          }
           if (crossExt.postJoinSort) {
             joined = joined.sort(crossExt.postJoinSort.expression, crossExt.postJoinSort.direction);
           }
@@ -2670,6 +2740,12 @@ export abstract class External {
     // layer drops them from the final dataset so the caller sees only the
     // columns they asked for.
     syntheticJoinAliases?: string[];
+    // HAVING clauses that reference apply names or split aliases routed to
+    // a linked sub-External. They can't be pushed into the main side's
+    // Druid SQL (the column doesn't exist there) so the execution layer
+    // applies them against the joined Dataset after the in-memory join,
+    // before postJoinSort / postJoinLimit run.
+    postJoinHavingFilter?: Expression;
   } | null {
     if (this.mode !== 'split') return null;
     if (!this.applies || this.applies.length === 0) return null;
@@ -3072,6 +3148,32 @@ export abstract class External {
       }
     }
 
+    // HAVING routing. The outer External's havingFilter was copied into
+    // mainValue by valueOf(). If it references an apply routed to a linked
+    // sub-External (e.g. `$avg_rating_linked > 0` where avg_rating_linked
+    // lives on the reviews side), pushing it into main's SQL emits a
+    // predicate over a column Druid can't resolve and the query 500s.
+    //
+    // Split per Ogievetsky's TODO in 0f9cbf3: clauses over main-resolvable
+    // names stay on main's HAVING (Druid-side, fast); clauses over post-
+    // join names (linked applies, linked-only splits) move to a post-join
+    // .filter() on the joined Dataset. AND combines both halves; OR/NOT
+    // that mix scopes are all post-join.
+    let postJoinHavingFilter: Expression | undefined;
+    if (mainValue.havingFilter && !mainValue.havingFilter.equals(Expression.TRUE)) {
+      const mainResolvable: Record<string, true> = {};
+      for (const a of mainApplies) mainResolvable[a.name] = true;
+      for (const a of mainKeepableAliases) mainResolvable[a] = true;
+      const { main: havingOnMain, post: havingOnPost } = External.splitFilterByScope(
+        mainValue.havingFilter,
+        mainResolvable,
+      );
+      mainValue.havingFilter = havingOnMain;
+      if (!havingOnPost.equals(Expression.TRUE)) {
+        postJoinHavingFilter = havingOnPost;
+      }
+    }
+
     const mainExternal = External.fromValue(mainValue);
 
     const syntheticAliasMap: Record<string, true> | undefined = (this as any)._syntheticAliasMap;
@@ -3083,6 +3185,7 @@ export abstract class External {
       postJoinSort,
       postJoinLimit,
       syntheticJoinAliases,
+      postJoinHavingFilter,
     };
   }
 }
