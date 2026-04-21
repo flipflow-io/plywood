@@ -208,19 +208,44 @@ function buildGridRequestExpression() {
 }
 
 describe('Cross-source filter prune — autonomous plywood-level validation', () => {
-  it('RED: unpruned main-only filter ref on linked side throws before fix', () => {
+  it('auto-prunes the main filter to the linked schema and emits a clean plan', () => {
     // The turnilo-emitted shape routes the raw main filter (with $reference
     // — a main-only column) into .apply("reviews", $reviews.filter(F)).
-    // Without auto-prune at absorb time, refcheck on the linked external
-    // fails because $reference doesn't exist in reviews.
-    //
-    // This spec PINS the pre-fix behavior; commit B flips the assertion
-    // to the correct SQL shape.
+    // The engine's pre-refcheck rewrite recognises every .filter() applied
+    // to a foreign linked-source ref and prunes F to that source's schema
+    // (kept: $__time, $productName; dropped: $reference). The cross-source
+    // decomposition template inherits an already-pruned filter, so the
+    // downstream linked external resolves cleanly.
     const exprJS = buildGridRequestExpression();
     const ex = Expression.fromJS(exprJS);
 
-    expect(() => ex.simulateQueryPlan({ main: makeMain() })).to.throw(
-      /could not resolve \$reference|could not resolve \$__time|not within the segment/i,
+    const plan = ex.simulateQueryPlan({ main: makeMain() });
+    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    expect(queries.length, 'at least one main query and one linked query').to.be.at.least(2);
+
+    const mainQueries = queries.filter(
+      q => q.query.includes('"main_ds"') && !q.query.includes('main_ds-reviews'),
     );
+    const linkedQueries = queries.filter(q => q.query.includes('main_ds-reviews'));
+    expect(mainQueries, 'main side present').to.have.length.at.least(1);
+    expect(linkedQueries, 'linked side present').to.have.length.at.least(1);
+
+    // Main keeps the full filter: $reference clause is present somewhere
+    const anyMainHasReference = mainQueries.some(q => /"reference"\s*=\s*'REF1'/.test(q.query));
+    expect(anyMainHasReference, 'main side retains reference clause').to.equal(true);
+
+    // Linked never sees $reference — pruned out before it reached the linked
+    // external. Any linked SQL that mentions it is a prune regression.
+    for (const q of linkedQueries) {
+      expect(q.query).to.not.match(/"reference"\s*=/);
+    }
+
+    // Productname filter: main has productName as a raw column; linked has it
+    // as a derivedAttribute → after resolve + SQL lowering, the literal value
+    // appears on both sides (main via "productName", linked via "product_name").
+    const anyMainHasProduct = mainQueries.some(q => /productName/.test(q.query));
+    const anyLinkedHasProduct = linkedQueries.some(q => /product_name|productName/.test(q.query));
+    expect(anyMainHasProduct, 'main side keeps productName clause').to.equal(true);
+    expect(anyLinkedHasProduct, 'linked side keeps productName clause').to.equal(true);
   });
 });

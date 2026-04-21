@@ -1026,6 +1026,56 @@ export abstract class External {
    * Idempotent: if a linked-source name is already bound in the datum (caller
    * supplied it explicitly), we leave it untouched.
    */
+  /**
+   * Pre-refcheck rewrite: for every `.filter(F)` applied to a ref whose
+   * name matches a declared linkedSource in the context, prune F to
+   * that source's schema. Without this pass, refcheck walks F against
+   * the linked source's type context and throws on the first ref that
+   * doesn't resolve (e.g. a main-only column like `$reference`).
+   *
+   * Algebraic justification: `$linked.filter(F)` where F references a
+   * column not in linked's schema is a type error — F can't be
+   * evaluated on a row from the linked side. The clause must be
+   * dropped (replaced with TRUE and simplified). The downstream join
+   * on shared or synthetic joinKeys propagates the main-side narrowing
+   * to the linked rows, so no information is lost.
+   *
+   * This runs BEFORE referenceCheck so malformed shapes the UI emits
+   * (where the client lacks schema awareness for the linked sources)
+   * get rewritten to their correct algebraic form before any type
+   * checking.
+   */
+  static pruneLinkedFilterRefsInTree(expression: Expression, context: Datum): Expression {
+    // Build lookup: { linkedSourceName: Set<schemaColumnName> }
+    const schemas: Record<string, Record<string, true>> = {};
+    for (const k in context) {
+      const v = context[k];
+      if (!(v instanceof External)) continue;
+      if (!v.linkedSources) continue;
+      for (const lsName in v.linkedSources) {
+        const ls = v.linkedSources[lsName];
+        const schema: Record<string, true> = {};
+        if (ls.attributes) for (const a of ls.attributes as any[]) schema[a.name] = true;
+        if (ls.derivedAttributes) for (const kk in ls.derivedAttributes) schema[kk] = true;
+        schemas[lsName] = schema;
+      }
+    }
+    if (Object.keys(schemas).length === 0) return expression;
+
+    return expression.substitute(e => {
+      // Target: .filter(F) whose operand is a RefExpression to a known linked source
+      if (!(e instanceof FilterExpression)) return null;
+      const op = e.operand;
+      if (!(op instanceof RefExpression)) return null;
+      const schema = schemas[op.name];
+      if (!schema) return null;
+      const originalFilter = e.expression;
+      const pruned = External.pruneFilterToSchema(originalFilter, schema);
+      if (pruned === originalFilter) return null;
+      return op.filter(pruned);
+    });
+  }
+
   static expandLinkedSourcesInDatum(datum: Datum): Datum {
     let expanded: Datum | null = null;
     for (const k in datum) {
@@ -2726,6 +2776,20 @@ export abstract class External {
           normalizedDerived[k] = v instanceof Expression ? v : Expression.fromJSLoose(v);
         }
       }
+      // Prune the inherited filter to the linked side's schema — main's
+      // filter may reference columns only in main's own rawAttributes
+      // (e.g. `reference`), and those clauses are identity on the linked
+      // side. The join on shared/synthetic joinKeys propagates main's
+      // extra narrowing into the linked rows.
+      const linkedSchemaNames: Record<string, true> = {};
+      if (normalizedAttributes) {
+        for (const a of normalizedAttributes) linkedSchemaNames[a.name] = true;
+      }
+      if (normalizedDerived) {
+        for (const k in normalizedDerived) linkedSchemaNames[k] = true;
+      }
+      const templateFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames);
+
       const template = External.fromValue({
         engine: this.engine,
         version: this.version,
@@ -2736,7 +2800,7 @@ export abstract class External {
         requester: this.requester,
         attributes: normalizedAttributes,
         derivedAttributes: normalizedDerived,
-        filter: this.filter,
+        filter: templateFilter,
         timeAttribute: (this as any).timeAttribute,
         customAggregations: (this as any).customAggregations,
         customTransforms: (this as any).customTransforms,

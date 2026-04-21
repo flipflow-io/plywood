@@ -1794,10 +1794,16 @@ export abstract class Expression implements Instance<ExpressionValue, Expression
 
   private _initialPrepare(context: Datum, environment: Environment): Expression {
     const expanded = External.expandLinkedSourcesInDatum(context);
-    return this.defineEnvironment(environment)
-      .referenceCheck(expanded)
-      .resolve(expanded)
-      .simplify();
+    // Pre-refcheck: rewrite any `.filter(F)` on a ref that matches a
+    // declared linkedSource so F is pruned to that source's schema.
+    // The turnilo client lacks the linked schema and emits raw main
+    // filters against the linked scope; without this rewrite,
+    // referenceCheck throws on main-only columns like `$reference`.
+    const rewritten = External.pruneLinkedFilterRefsInTree(
+      this.defineEnvironment(environment),
+      expanded,
+    );
+    return rewritten.referenceCheck(expanded).resolve(expanded).simplify();
   }
 
   /**
