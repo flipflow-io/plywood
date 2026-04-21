@@ -3199,6 +3199,29 @@ export abstract class External {
       if (!havingOnPost.equals(Expression.TRUE)) {
         postJoinHavingFilter = havingOnPost;
       }
+
+      // If any HAVING moved post-join, the main-side LIMIT would starve the
+      // result: main returns N rows, join runs, HAVING drops some, we end
+      // up with fewer than N. Users flipping the sort direction observe the
+      // final row count drifting because different main rows survive the
+      // pre-HAVING limit each time.
+      //
+      // Force both sort and limit to run post-join whenever HAVING is
+      // post-join, regardless of which side the sort originally referenced.
+      // Main may still sort Druid-side as a topN hint, but the authoritative
+      // ordering and cap live downstream of HAVING. For main-apply sorts
+      // that previously stayed on main, we null out mainValue.sort too so
+      // we don't do duplicate work — the post-join sort is definitive.
+      if (postJoinHavingFilter) {
+        if (this.sort && !postJoinSort) {
+          postJoinSort = this.sort;
+          mainValue.sort = null;
+        }
+        if (this.limit && !postJoinLimit) {
+          postJoinLimit = this.limit;
+          mainValue.limit = null;
+        }
+      }
     }
 
     const mainExternal = External.fromValue(mainValue);

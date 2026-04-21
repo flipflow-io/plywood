@@ -134,4 +134,42 @@ describe('Cross-source post-join HAVING decomposition', () => {
       );
     }
   });
+
+  it('pushes LIMIT post-join when HAVING is post-join (main-apply sort)', () => {
+    // Regression from live: user sorts by a main apply (avg_price desc)
+    // with a post-join HAVING on a linked apply (avg_rating > 0 AND <= 4.9).
+    // If main keeps its LIMIT 50, main returns 50 rows, join happens, HAVING
+    // drops some, final count drifts below 50. Worse, flipping the sort
+    // direction surfaces DIFFERENT top-50s on main, each with a different
+    // post-HAVING survival rate — the row count "changes with the order".
+    //
+    // With the routing fix: when HAVING is post-join, main's LIMIT is
+    // stripped and the authoritative LIMIT runs after HAVING. Result count
+    // is stable regardless of sort direction.
+    const main = makeMain();
+    const ex = $('main')
+      .split('$productName', 'productName')
+      .apply('avg_price', '$main.average($price)')
+      .apply('avg_rating', $('reviews').average('$rating'))
+      .filter('$avg_rating > 0')
+      .sort('$avg_price', 'descending')
+      .limit(50);
+
+    const plan = ex.simulateQueryPlan({ main });
+    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const mainQueries = queries.filter(
+      q => q.query.includes('"main_ds"') && !q.query.includes('main_ds-reviews'),
+    );
+    expect(mainQueries, 'main side present').to.have.length.at.least(1);
+
+    // Main SQL must not carry LIMIT — post-join HAVING may shrink the
+    // output, so the LIMIT must apply to the surviving set, not the
+    // pre-HAVING candidate set.
+    for (const q of mainQueries) {
+      expect(
+        q.query,
+        'main SQL must not carry its own LIMIT when HAVING is post-join',
+      ).to.not.match(/\bLIMIT\b/i);
+    }
+  });
 });
