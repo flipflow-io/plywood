@@ -203,22 +203,106 @@ export class DruidSQLExternal extends SQLExternal {
       return DruidSQLExternal.postProcessIntrospect(
         Introspect.decodeQueryColumnIntrospectionResult(queryResult),
       );
+    }
+
+    let table: string;
+    if (Array.isArray(source)) {
+      table = source[0];
     } else {
-      let table: string;
-      if (Array.isArray(source)) {
-        table = source[0];
-      } else {
-        table = source;
+      table = source;
+    }
+
+    // SQL-native introspection via INFORMATION_SCHEMA.COLUMNS. On clusters
+    // with many segments, Druid's native segmentMetadata query can take
+    // minutes or time out entirely; INFORMATION_SCHEMA is sub-second and
+    // returns everything we need for an External's attribute list. Since
+    // we're already a druidsql External we can use the same endpoint.
+    // We fall back to segmentMetadata only if the SQL path fails — that
+    // way existing clusters that somehow lack INFORMATION_SCHEMA continue
+    // to work.
+    try {
+      const rawResult = await toArray(
+        this.requester({
+          query: {
+            query: `SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ${this.dialect.escapeLiteral(
+              table,
+            )} ORDER BY ORDINAL_POSITION`,
+            context: this.context,
+          },
+        }),
+      );
+      if (rawResult.length > 0) {
+        return DruidSQLExternal.postProcessInformationSchemaIntrospect(
+          rawResult as DruidSQLDescribeRow[],
+        );
+      }
+    } catch (e) {
+      // Fall through to segmentMetadata. Not logged — the fallback is the
+      // safety net; noise would drown the real failure if segmentMetadata
+      // itself fails too.
+    }
+
+    return DruidExternal.introspectAttributesWithSegmentMetadata(
+      table,
+      this.requester,
+      '__time',
+      this.context,
+      depth,
+    );
+  }
+
+  static postProcessInformationSchemaIntrospect(columns: DruidSQLDescribeRow[]): Attributes {
+    return columns.map(column => {
+      const name = column.COLUMN_NAME;
+      const nativeType = String(column.DATA_TYPE || '').toUpperCase();
+
+      let type: PlyType;
+      switch (nativeType) {
+        case 'TIMESTAMP':
+        case 'DATE':
+          type = 'TIME';
+          break;
+
+        case 'IPADDRESS':
+        case 'IPPREFIX':
+          type = 'IP';
+          break;
+
+        case 'VARCHAR':
+        case 'STRING':
+        case 'CHAR':
+          type = 'STRING';
+          break;
+
+        case 'DOUBLE':
+        case 'FLOAT':
+        case 'REAL':
+        case 'BIGINT':
+        case 'INTEGER':
+        case 'SMALLINT':
+        case 'TINYINT':
+        case 'LONG':
+          type = 'NUMBER';
+          break;
+
+        case 'BOOLEAN':
+          type = 'BOOLEAN';
+          break;
+
+        default:
+          // Unknown native types fall back to STRING — plywood can still
+          // reference and filter them, and an explicit attributeOverrides
+          // on the External can correct a specific column if needed.
+          type = 'STRING';
+          break;
       }
 
-      return DruidExternal.introspectAttributesWithSegmentMetadata(
-        table,
-        this.requester,
-        '__time',
-        this.context,
-        depth,
-      );
-    }
+      return new AttributeInfo({
+        name,
+        type,
+        nativeType,
+      });
+    });
   }
 
   protected sqlToQuery(sql: string): any {
