@@ -879,15 +879,26 @@ export abstract class External {
 
     const op = (filter as any).op;
 
+    // Combinators: recurse into both halves. Only rebuild the combinator
+    // when one side actually changed — otherwise return the original
+    // filter so callers can detect "no-op prune" via reference equality
+    // and skip rewriting. Always-rebuilding triggers downstream refcheck
+    // state loss (the substitute in pruneLinkedFilterRefsInTree re-walks
+    // the new tree without the original's resolved type metadata).
     if (op === 'and' || op === 'or') {
-      const left = External.pruneFilterToSchema((filter as any).operand, schemaNames);
-      const right = External.pruneFilterToSchema((filter as any).expression, schemaNames);
+      const origLeft: Expression = (filter as any).operand;
+      const origRight: Expression = (filter as any).expression;
+      const left = External.pruneFilterToSchema(origLeft, schemaNames);
+      const right = External.pruneFilterToSchema(origRight, schemaNames);
+      if (left === origLeft && right === origRight) return filter;
       if (op === 'and') return left.and(right).simplify();
       return left.or(right).simplify();
     }
 
     if (op === 'not') {
-      const inner = External.pruneFilterToSchema((filter as any).operand, schemaNames);
+      const origInner: Expression = (filter as any).operand;
+      const inner = External.pruneFilterToSchema(origInner, schemaNames);
+      if (inner === origInner) return filter;
       return inner.not().simplify();
     }
 
@@ -2261,8 +2272,24 @@ export abstract class External {
           // reflects only the surviving rows, and limit caps against the
           // filtered result — not the pre-filter row count (which would
           // silently under-return rows).
+          //
+          // Defensive: a left-side main row with no linked match arrives at
+          // the join with its linked-apply columns undefined. Evaluating the
+          // predicate against `undefined` crashes the calc path (e.g.
+          // Range.containsValue calls .valueOf() on the operand). SQL HAVING
+          // semantics say null-valued predicates are false, so we drop such
+          // rows explicitly — matches what Druid would do if the filter had
+          // been pushable to HAVING on the source side.
           if (crossExt.postJoinHavingFilter) {
-            joined = joined.filter(crossExt.postJoinHavingFilter);
+            const refs = crossExt.postJoinHavingFilter.getFreeReferences();
+            const fn = crossExt.postJoinHavingFilter.getFn();
+            joined = joined.filterFn((datum: any) => {
+              for (const r of refs) {
+                const v = datum[r];
+                if (v === undefined || v === null) return false;
+              }
+              return Boolean(fn(datum));
+            });
           }
           if (crossExt.postJoinSort) {
             joined = joined.sort(crossExt.postJoinSort.expression, crossExt.postJoinSort.direction);

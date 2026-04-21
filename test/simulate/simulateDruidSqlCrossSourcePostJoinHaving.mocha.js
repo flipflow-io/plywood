@@ -112,11 +112,7 @@ describe('Cross-source post-join HAVING decomposition', () => {
       .split('$productName', 'productName')
       .apply('avg_price', '$main.average($price)')
       .apply('avg_rating', $('reviews').average('$rating'))
-      .filter(
-        $('avg_price')
-          .greaterThan(10)
-          .and($('avg_rating').greaterThan(0)),
-      );
+      .filter($('avg_price').greaterThan(10).and($('avg_rating').greaterThan(0)));
 
     const plan = ex.simulateQueryPlan({ main });
     const queries = plan.flat().filter(q => typeof q.query === 'string');
