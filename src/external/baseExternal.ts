@@ -1993,9 +1993,25 @@ export abstract class External {
       );
       return External.valuePromiseToStream(
         Promise.all([mainPromise, ...linkedPromises]).then(([main, ...linked]) => {
-          let joined = main as Dataset;
-          for (const side of linked) {
-            joined = joined.join(side as Dataset);
+          // If main is a totals-only dataset (no split keys), its rows
+          // broadcast onto every linked row. Dataset.join's auto-dispatch
+          // only handles "other's keys ⊂ this.keys" as broadcast — for the
+          // inverse case (this.keys empty, other has keys) we must call
+          // join from the linked side so the matcher sees main as a
+          // broadcastable subset.
+          const mainIsTotals = !(main as Dataset).keys || (main as Dataset).keys.length === 0;
+          let joined: Dataset;
+          if (mainIsTotals && linked.length > 0) {
+            joined = linked[0] as Dataset;
+            joined = joined.join(main as Dataset);
+            for (let i = 1; i < linked.length; i++) {
+              joined = joined.join(linked[i] as Dataset);
+            }
+          } else {
+            joined = main as Dataset;
+            for (const side of linked) {
+              joined = joined.join(side as Dataset);
+            }
           }
           if (crossExt.postJoinSort) {
             joined = joined.sort(crossExt.postJoinSort.expression, crossExt.postJoinSort.direction);
@@ -2508,15 +2524,41 @@ export abstract class External {
       }
     }
 
-    if (Object.keys(linkedAppliesByName).length === 0) return null;
+    // The other trigger: a split alias whose refs resolve only in a linked
+    // source. Even without a foreign apply, decomposition must fire — main's
+    // SQL would otherwise GROUP BY a column it can't see, silently yielding
+    // zero rows. We scan the splits once to pick up involved linked sources.
+    const involvedLinkedNames: Record<string, true> = Object.keys(linkedAppliesByName).reduce(
+      (acc, n) => ((acc[n] = true), acc),
+      {} as Record<string, true>,
+    );
+    for (const alias of this.split.keys) {
+      const ex = this.split.splits[alias];
+      const refs = ex.getFreeReferences();
+      if (refs.length === 0) continue;
+      for (const lsName in this.linkedSources) {
+        const ls = this.linkedSources[lsName];
+        const linkedAttrs: Record<string, true> = {};
+        if (ls.attributes) for (const a of ls.attributes as any[]) linkedAttrs[a.name] = true;
+        if (ls.derivedAttributes) for (const k in ls.derivedAttributes) linkedAttrs[k] = true;
+        const mainAttrs: Record<string, true> = {};
+        for (const a of this.rawAttributes || []) mainAttrs[a.name] = true;
+        for (const k in this.derivedAttributes) mainAttrs[k] = true;
+        const allInLinked = refs.every(r => linkedAttrs[r]);
+        const anyInMain = refs.some(r => mainAttrs[r]);
+        if (allInLinked && !anyInMain) involvedLinkedNames[lsName] = true;
+      }
+    }
+
+    if (Object.keys(involvedLinkedNames).length === 0) return null;
 
     const linkedExternals: { name: string; external: External; joinKeys: string[] }[] = [];
 
-    // Once we commit to decomposing (there ARE foreign applies), any further
-    // inability to materialize sub-queries is a hard error — falling back to
-    // the single-query path would silently corrupt the result by pretending
-    // the foreign ref is a native column. Clear errors > silent wrong data.
-    for (const lsName in linkedAppliesByName) {
+    // Once we commit to decomposing, any further inability to materialize
+    // sub-queries is a hard error — falling back to the single-query path
+    // would silently corrupt the result by pretending the foreign ref is
+    // a native column. Clear errors > silent wrong data.
+    for (const lsName in involvedLinkedNames) {
       const config = this.linkedSources[lsName];
       // A main split alias is valid on the linked side iff every free
       // reference in its expression is a declared joinKey column. This
@@ -2610,11 +2652,17 @@ export abstract class External {
           );
         }
       }
-      if (sharedAliases.length === 0) {
+      // Zero shared splits is only valid when main contributes no splits
+      // either — then main is queried as TOTALS (one row of aggregates) and
+      // the linked side broadcasts. With main splits present and no shared
+      // key there's genuinely nothing to join on → invalid.
+      if (sharedAliases.length === 0 && mainOnlyAliases.length > 0) {
         throw new Error(
-          `Cross-source query needs at least one split whose free refs are all declared joinKeys of "${lsName}" [${(
+          `Cross-source query has main-side splits [${mainOnlyAliases.join(
+            ', ',
+          )}] but no split whose free refs are all declared joinKeys of "${lsName}" [${(
             config.joinKeys || []
-          ).join(', ')}] — current split aliases [${this.split.keys.join(', ')}]`,
+          ).join(', ')}]`,
         );
       }
 
@@ -2623,6 +2671,11 @@ export abstract class External {
       const linkedSplitMap: Record<string, Expression> = {};
       for (const a of sharedAliases) linkedSplitMap[a] = this.split.splits[a];
       for (const a of linkedOnlyAliases) linkedSplitMap[a] = this.split.splits[a];
+      if (Object.keys(linkedSplitMap).length === 0) {
+        throw new Error(
+          `Cross-source query for "${lsName}" produced no usable split on the linked side`,
+        );
+      }
       linkedExternal = linkedExternal.addExpression(this.split.changeSplits(linkedSplitMap));
       if (!linkedExternal) {
         throw new Error(
@@ -2632,7 +2685,7 @@ export abstract class External {
         );
       }
 
-      for (const apply of linkedAppliesByName[lsName]) {
+      for (const apply of linkedAppliesByName[lsName] || []) {
         const next = linkedExternal.addExpression(apply);
         if (!next) {
           throw new Error(
@@ -2656,23 +2709,39 @@ export abstract class External {
     }
 
     // Build the main side: keep only splits whose refs resolve in main's own
-    // schema, drop foreign applies.
+    // schema, drop foreign applies. When no main-keepable split remains the
+    // main external becomes TOTALS mode — one row of aggregates that the
+    // linked side broadcasts across its groupings.
     const mainKeepableAliases: string[] = (this as any)._lastMainKeepableAliases || [];
     const mainValue = this.valueOf();
     mainValue.applies = mainApplies;
-    const mainSplitMap: Record<string, Expression> = {};
-    for (const a of mainKeepableAliases) mainSplitMap[a] = this.split.splits[a];
-    mainValue.split = this.split.changeSplits(mainSplitMap);
-    mainValue.attributes = [
-      ...mainKeepableAliases.map(
-        name =>
-          new AttributeInfo({
-            name,
-            type: Set.unwrapSetType(this.split.splits[name].type),
-          }),
-      ),
-      ...mainApplies.map(a => new AttributeInfo({ name: a.name, type: a.expression.type })),
-    ];
+    if (mainKeepableAliases.length > 0) {
+      const mainSplitMap: Record<string, Expression> = {};
+      for (const a of mainKeepableAliases) mainSplitMap[a] = this.split.splits[a];
+      mainValue.split = this.split.changeSplits(mainSplitMap);
+      mainValue.attributes = [
+        ...mainKeepableAliases.map(
+          name =>
+            new AttributeInfo({
+              name,
+              type: Set.unwrapSetType(this.split.splits[name].type),
+            }),
+        ),
+        ...mainApplies.map(a => new AttributeInfo({ name: a.name, type: a.expression.type })),
+      ];
+    } else {
+      // No main split → totals mode. rawAttributes comes back as attributes,
+      // split drops, applies stay as the aggregate list.
+      mainValue.mode = 'total';
+      mainValue.split = null;
+      mainValue.dataName = undefined;
+      mainValue.rawAttributes = this.rawAttributes;
+      mainValue.attributes = mainApplies.map(
+        a => new AttributeInfo({ name: a.name, type: a.expression.type }),
+      );
+      mainValue.sort = null;
+      mainValue.limit = null;
+    }
 
     // Sort / limit routing. If the sort references a main-side apply or a
     // main-keepable split alias, keep it on main (pre-join); the engine can
