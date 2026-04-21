@@ -53,6 +53,11 @@ function makeMain() {
       reviews: {
         source: 'main_ds-reviews',
         joinKeys: ['partitionId', '__time'],
+        // productName lives on both sides (main as raw attr, linked via
+        // derivedAttribute) — declared shared so the classifier treats
+        // it as a shared split on both sides rather than raising the
+        // "ambiguous — declare it" error.
+        sharedDimensions: ['productName'],
         attributes: [
           { name: '__time', type: 'TIME' },
           { name: 'partition_id', type: 'STRING' },

@@ -40,6 +40,11 @@ function makeMain() {
       reviews: {
         source: 'main_ds-reviews',
         joinKeys: ['partitionId'],
+        // productName exists on both sides with the same semantic meaning —
+        // main as raw attr, linked via derivedAttribute on product_name.
+        // Declared so the decomposition classifies splits over it as shared
+        // rather than raising the ambiguous-overlap error.
+        sharedDimensions: ['productName'],
         attributes: [
           { name: '__time', type: 'TIME' },
           { name: 'partition_id', type: 'STRING' },

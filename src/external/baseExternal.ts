@@ -3052,12 +3052,6 @@ export abstract class External {
     for (const lsName in involvedLinkedNames) {
       const config = this.linkedSources[lsName];
       // A main split alias is valid on the linked side iff every free
-      // reference in its expression is a declared joinKey column. This
-      // covers plain refs ($competitor), derived expressions (timeBucket
-      // ($__time, "P1D")), and rejects mixed forms like
-      // $competitor.concat($price) where only some refs are shared.
-      const joinKeyCols: Record<string, true> = {};
-      for (const c of config.joinKeys || []) joinKeyCols[c] = true;
       // Always synthesize a fresh RAW linked external — the one captured during
       // apply-absorption is in 'value' mode (it already absorbed an aggregate)
       // and can't re-accept a split. Same recipe as expandLinkedSourcesInDatum.
@@ -3129,46 +3123,21 @@ export abstract class External {
       for (const a of this.rawAttributes || []) mainAttrs[a.name] = true;
       for (const k in this.derivedAttributes) mainAttrs[k] = true;
 
-      // Partition main's current split aliases by where each is valid:
-      //   shared     = refs resolvable on BOTH sides (joinKeys OR any column
-      //                present in both schemas, e.g. a productName surfaced
-      //                as a linked derivedAttribute). Both sides group by it,
-      //                and the natural-join aligns rows with equal values.
-      //                This is broader than Ogievetsky's original "only
-      //                joinKeys count" rule: a dimension that lives on both
-      //                sides SHOULD be a shared grouping column — otherwise
-      //                the side without it aggregates too coarsely and the
-      //                join explodes the result by that dimension's
-      //                cardinality on the other side.
-      //   mainOnly   = resolves only on main
-      //   linkedOnly = resolves only on this linked source
-      const sharedAliases: string[] = [];
-      const mainOnlyAliases: string[] = [];
-      const linkedOnlyAliases: string[] = [];
-      for (const alias of this.split.keys) {
-        const ex = this.split.splits[alias];
-        const refs = ex.getFreeReferences();
-        if (refs.length === 0) {
-          mainOnlyAliases.push(alias);
-          continue;
-        }
-        const isMainResolvable = refs.every(r => mainAttrs[r]);
-        const isLinkedResolvable = refs.every(r => linkedAttrs[r]);
-        const isSharedViaJoinKeys = refs.every(r => joinKeyCols[r]);
-        if (isSharedViaJoinKeys || (isMainResolvable && isLinkedResolvable)) {
-          sharedAliases.push(alias);
-        } else if (isMainResolvable) {
-          mainOnlyAliases.push(alias);
-        } else if (isLinkedResolvable) {
-          linkedOnlyAliases.push(alias);
-        } else {
-          throw new Error(
-            `Split alias "${alias}" references columns that resolve in neither main nor "${lsName}" (refs: [${refs.join(
-              ', ',
-            )}])`,
-          );
-        }
-      }
+      // Delegate to the declarative classifier. The classifier reads
+      // `config.sharedDimensions` for dimensions that live on both sides
+      // with the same meaning, and refuses to silently infer shared-ness
+      // from schema overlap — an actionable error fires when the user's
+      // intent is ambiguous. See External.classifySplitAliases.
+      const classified = External.classifySplitAliases(
+        this.split,
+        mainAttrs,
+        linkedAttrs,
+        config,
+        lsName,
+      );
+      const sharedAliases: string[] = [...classified.shared];
+      const mainOnlyAliases: string[] = [...classified.mainOnly];
+      const linkedOnlyAliases: string[] = [...classified.linkedOnly];
       // Zero shared splits AND main/linked contributions exist → auto-inject
       // one split per declared joinKey onto both sides. The user didn't pick
       // a shared dimension, but the cube's joinKeys config says "this pair of
