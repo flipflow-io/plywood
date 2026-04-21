@@ -304,22 +304,26 @@ describe('Cross-source matrix — canonical shapes', () => {
     expect(mains, 'at least one main query').to.have.length.at.least(1);
   });
 
-  it('Shape 11c: ACTUAL user bug — linked-only split refs without linked agg → no false decomposition', () => {
-    // Exact repro from the failing curl: split includes `review_content`
-    // whose expression `$content` resolves to a column ONLY in reviews.
-    // The query has no linked aggregate — `avg_price` is pure main. Plywood
-    // today throws:
+  it('Shape 11c: ACTUAL user bug — linked-only split refs without linked agg → single-source plan', () => {
+    // Repro of the failing curl: the outer ply registers `reviews` as a
+    // scope (turnilo's ply-level kludge) and the inner SPLIT groups by
+    // `review_title`, `review_content`, `ean` with a pure-main aggregate
+    // `$main.average($price)`. The query has no linked aggregate.
+    //
+    // Before fix: Plywood's schema-overlap heuristic classified
+    // `review_content` as linked-only (exists in reviews.attributes, not
+    // main.attributes) and fired cross-source decomposition. Decomposition
+    // then demanded a shared joinKey split, found none, and threw:
     //   "Cross-source query has main-side splits [ean] but no split whose
     //    free refs are all declared joinKeys of 'reviews' [...]"
     //
-    // The error is algebraically honest (can't decompose) but it's the
-    // WRONG response to the input: the query is actually main-only.
-    // Expected behavior: either (a) Plywood recognizes this isn't a real
-    // cross-source query and emits 1 main query where Druid itself decides
-    // $content exists or not, or (b) the error points the user to what's
-    // missing in a turnilo-actionable way.
-    //
-    // This spec PINS the current behavior so any change is deliberate.
+    // After fix: decomposition triggers only when a VALUE apply aggregates
+    // from a foreign source (semantic contribution). A linked scope
+    // registration at the ply level is a dataset apply, not an output
+    // contribution — Plywood leaves the query main-only and emits its
+    // natural main-side SQL. Druid will then say "column not found" if
+    // the linked-only columns aren't in main_ds; the turnilo-side
+    // validator catches this before emission in the normal path.
     const innerTimeFilter = $('__time').overlap(currRange);
     const ex = ply()
       .apply('main', $('main').filter(innerTimeFilter))
@@ -338,12 +342,18 @@ describe('Cross-source matrix — canonical shapes', () => {
           .limit(50),
       );
 
-    // As of this commit, decomposition mis-triggers via the schema-overlap
-    // heuristic because `review_content` is only in reviews.attributes and
-    // no shared joinKey split is present — matching the user's real error.
-    expect(() => runPlan(ex, makeMainWithLinkedReviews())).to.throw(
-      /shared|joinKey|partitionId|no split whose/i,
+    const queries = runPlan(ex, makeMainWithLinkedReviews());
+    const links = linkedQueriesOf(queries);
+    const mains = mainQueriesOf(queries);
+
+    expect(links, 'no linked query when no linked value apply').to.have.length(0);
+    expect(mains, 'main emits its queries — Druid owns schema validation').to.have.length.at.least(
+      1,
     );
+    // Main's SPLIT query carries the linked-only split aliases untouched —
+    // Plywood isn't in the business of pre-validating column existence.
+    const splitQuery = mains.find(q => q.query.includes('review_content'));
+    expect(splitQuery, 'split query retains linked-only column refs').to.exist;
   });
 
   it('Shape 12: totals cross-source (no splits) → 2 queries, both totals mode', () => {
