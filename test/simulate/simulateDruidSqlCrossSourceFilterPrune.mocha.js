@@ -248,4 +248,101 @@ describe('Cross-source filter prune — autonomous plywood-level validation', ()
     expect(anyMainHasProduct, 'main side keeps productName clause').to.equal(true);
     expect(anyLinkedHasProduct, 'linked side keeps productName clause').to.equal(true);
   });
+
+  it('auto-prunes a linked-only clause off the main filter', () => {
+    // Mirror of the scenario above: turnilo also routes the raw main filter
+    // into .apply("main", $main.filter(F)). If F contains a clause over a
+    // LINKED-only column (e.g. `$content.overlap("hola")`), main's SQL
+    // lowering would blow up with "Column 'content' not found". The pre-
+    // refcheck rewrite must prune the main side symmetrically: keep clauses
+    // whose left operand resolves in main's schema, drop the rest.
+    //
+    // Keeps: $__time, $productName. Drops: $content (reviews-only).
+    const curr = { start: '2026-04-14T00:00:00.000Z', end: '2026-04-21T00:00:00.000Z' };
+    const prev = { start: '2026-04-07T00:00:00.000Z', end: '2026-04-14T00:00:00.000Z' };
+
+    const timeFilter = {
+      op: 'overlap',
+      operand: { op: 'ref', name: '__time' },
+      expression: {
+        op: 'literal',
+        value: { setType: 'TIME_RANGE', elements: [curr, prev] },
+        type: 'SET',
+      },
+    };
+    const productNameFilter = {
+      op: 'overlap',
+      operand: { op: 'ref', name: 'productName' },
+      expression: {
+        op: 'literal',
+        value: { setType: 'STRING', elements: ['AMASA-20'] },
+        type: 'SET',
+      },
+    };
+    const contentFilter = {
+      op: 'overlap',
+      operand: { op: 'ref', name: 'content' },
+      expression: {
+        op: 'literal',
+        value: { setType: 'STRING', elements: ['hola'] },
+        type: 'SET',
+      },
+    };
+    const mainFilter = {
+      op: 'and',
+      operand: { op: 'and', operand: timeFilter, expression: productNameFilter },
+      expression: contentFilter,
+    };
+
+    const filter_ = (operand, expression) => ({ op: 'filter', operand, expression });
+    const apply_ = (operand, expression, name) => ({ op: 'apply', operand, expression, name });
+    const base = { op: 'literal', value: { attributes: [], data: [{}] }, type: 'DATASET' };
+
+    let e = apply_(base, filter_({ op: 'ref', name: 'main' }, mainFilter), 'main');
+    e = apply_(e, filter_({ op: 'ref', name: 'reviews' }, mainFilter), 'reviews');
+    e = apply_(
+      e,
+      {
+        op: 'average',
+        operand: { op: 'ref', name: 'main' },
+        expression: { op: 'ref', name: 'price' },
+      },
+      'avg_price',
+    );
+    e = apply_(
+      e,
+      {
+        op: 'average',
+        operand: { op: 'ref', name: 'reviews' },
+        expression: { op: 'ref', name: 'rating' },
+      },
+      'avg_rating',
+    );
+
+    const ex = Expression.fromJS(e);
+    const plan = ex.simulateQueryPlan({ main: makeMain() });
+    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    expect(queries.length, 'at least one main and one linked query').to.be.at.least(2);
+
+    const mainQueries = queries.filter(
+      q => q.query.includes('"main_ds"') && !q.query.includes('main_ds-reviews'),
+    );
+    const linkedQueries = queries.filter(q => q.query.includes('main_ds-reviews'));
+    expect(mainQueries, 'main side present').to.have.length.at.least(1);
+    expect(linkedQueries, 'linked side present').to.have.length.at.least(1);
+
+    // Main never sees $content — pruned out before refcheck. Any main SQL
+    // that references it is a prune regression (and in live Druid would
+    // surface as a 500 "Column 'content' not found in any table").
+    for (const q of mainQueries) {
+      expect(q.query, 'main SQL must not reference linked-only $content').to.not.match(
+        /"content"\s*=|'hola'/,
+      );
+    }
+
+    // Linked keeps its own column resolution — $content here is the raw
+    // linked attribute, not pruned from the linked side.
+    const anyLinkedHasContent = linkedQueries.some(q => /'hola'/.test(q.query));
+    expect(anyLinkedHasContent, 'linked side keeps its own content clause').to.equal(true);
+  });
 });

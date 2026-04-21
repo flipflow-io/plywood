@@ -891,10 +891,22 @@ export abstract class External {
       return inner.not().simplify();
     }
 
-    // Atomic predicate: keep iff every free reference exists in the schema.
-    const refs = filter.getFreeReferences();
-    for (const r of refs) {
-      if (!schemaNames[r]) return Expression.TRUE;
+    // Atomic predicate (overlap, is, greaterThan, contains, etc.): the
+    // semantic column the predicate targets is its `operand` — the left
+    // side of the comparison. If that's a RefExpression naming a column
+    // not in our schema, the predicate can't evaluate here and becomes
+    // TRUE (identity) for this side.
+    //
+    // Critically, we do NOT inspect `getFreeReferences()` because a
+    // well-formed predicate like `$color.is($col)` refers to `$col` as
+    // an outer-scope escalation — that ref resolves in the parent
+    // dataset, not in the current external's schema. Dropping the whole
+    // predicate because `$col` isn't a column here would break a
+    // pattern that Plywood users rely on.
+    const anyOp: any = filter;
+    const operand: Expression | undefined = anyOp.operand;
+    if (operand instanceof RefExpression && !schemaNames[operand.name]) {
+      return Expression.TRUE;
     }
     return filter;
   }
@@ -1046,11 +1058,24 @@ export abstract class External {
    * checking.
    */
   static pruneLinkedFilterRefsInTree(expression: Expression, context: Datum): Expression {
-    // Build lookup: { linkedSourceName: Set<schemaColumnName> }
+    // Build a schema lookup for every External-named binding in the context —
+    // both the primary (usually `main`) and each declared linkedSource. A
+    // `.filter(F)` applied to any of those refs gets F pruned to that
+    // side's own schema, because a clause over a column the side doesn't
+    // have is identity there (the join on shared/synthetic joinKeys
+    // propagates main's narrowing to the linked rows, and vice-versa).
     const schemas: Record<string, Record<string, true>> = {};
     for (const k in context) {
       const v = context[k];
       if (!(v instanceof External)) continue;
+
+      // Primary binding (e.g. `main`) — schema is its own raw + derived attrs
+      const mainSchema: Record<string, true> = {};
+      for (const a of v.rawAttributes || []) mainSchema[a.name] = true;
+      for (const dk in v.derivedAttributes || {}) mainSchema[dk] = true;
+      schemas[k] = mainSchema;
+
+      // Linked sources — their declared attributes + derivedAttributes
       if (!v.linkedSources) continue;
       for (const lsName in v.linkedSources) {
         const ls = v.linkedSources[lsName];
@@ -1063,7 +1088,7 @@ export abstract class External {
     if (Object.keys(schemas).length === 0) return expression;
 
     return expression.substitute(e => {
-      // Target: .filter(F) whose operand is a RefExpression to a known linked source
+      // Target: .filter(F) whose operand is a RefExpression to a known source
       if (!(e instanceof FilterExpression)) return null;
       const op = e.operand;
       if (!(op instanceof RefExpression)) return null;
