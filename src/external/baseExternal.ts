@@ -1050,6 +1050,111 @@ export abstract class External {
     return { main: filter, post: Expression.TRUE };
   }
 
+  /**
+   * Classify user split aliases against a cross-source boundary. Every
+   * alias is placed in exactly one bucket:
+   *
+   *   shared     → alias's free refs ⊆ joinKeys ∪ sharedDimensions.
+   *                Both sides group by it; the natural-join aligns
+   *                rows with equal values.
+   *   mainOnly   → refs resolve only in main's schema. The alias stays
+   *                on main; the join broadcasts its value across
+   *                matching linked rows.
+   *   linkedOnly → refs resolve only in the linked source's schema.
+   *                The alias stays on linked; main rows fan out into
+   *                multiple grid rows via the join.
+   *
+   * Refs that resolve on NEITHER side throw an error with an actionable
+   * message — the alias was written against columns the decomposition
+   * can't find.
+   *
+   * Refs that resolve on BOTH sides but were NOT declared as a shared
+   * dimension (or joinKey) ALSO throw: silently treating them as shared
+   * would change aggregation granularity based on a coincidence of
+   * naming. The caller MUST declare the intent via `sharedDimensions`.
+   *
+   * Constant-valued splits (zero free refs) are treated as shared — a
+   * literal expression evaluates identically on both sides.
+   */
+  static classifySplitAliases(
+    split: SplitExpression,
+    mainSchema: Record<string, true>,
+    linkedSchema: Record<string, true>,
+    config: LinkedSourceConfig,
+    linkedSourceName: string,
+  ): { shared: string[]; mainOnly: string[]; linkedOnly: string[] } {
+    const shared: string[] = [];
+    const mainOnly: string[] = [];
+    const linkedOnly: string[] = [];
+
+    const declaredShared: Record<string, true> = {};
+    for (const k of config.joinKeys || []) declaredShared[k] = true;
+    for (const k of config.sharedDimensions || []) declaredShared[k] = true;
+
+    for (const alias of split.keys) {
+      const ex = split.splits[alias];
+      const refs = ex.getFreeReferences();
+
+      if (refs.length === 0) {
+        shared.push(alias);
+        continue;
+      }
+
+      const isDeclaredShared = refs.every(r => declaredShared[r]);
+      if (isDeclaredShared) {
+        shared.push(alias);
+        continue;
+      }
+
+      const inMain = refs.every(r => mainSchema[r]);
+      const inLinked = refs.every(r => linkedSchema[r]);
+
+      if (inMain && inLinked) {
+        throw new Error(
+          `Split alias "${alias}" refs [${refs.join(
+            ', ',
+          )}] resolve on both main and linked source "${linkedSourceName}" — declare them in \`sharedDimensions\` to use them as a shared split, or qualify the reference to a side-specific column. The engine refuses to infer shared-ness from schema overlap because same-named columns on different sides can legitimately carry different semantics.`,
+        );
+      }
+      if (inMain) {
+        mainOnly.push(alias);
+      } else if (inLinked) {
+        linkedOnly.push(alias);
+      } else {
+        throw new Error(
+          `Split alias "${alias}" references columns that resolve in neither main nor "${linkedSourceName}" (refs: [${refs.join(
+            ', ',
+          )}])`,
+        );
+      }
+    }
+
+    return { shared, mainOnly, linkedOnly };
+  }
+
+  /**
+   * Resolve the subset of joinKeys the engine may auto-inject as
+   * `__join_<key>` synthetic splits. Reads from `config.autoInjectJoinKeys`
+   * when declared; falls back to `config.joinKeys` (default: every join
+   * key is auto-injectable).
+   *
+   * Cubes with a TIME-typed joinKey that don't want per-snapshot row
+   * explosion declare a subset that excludes the time key.
+   */
+  static resolveAutoInjectJoinKeys(config: LinkedSourceConfig): string[] {
+    if (config.autoInjectJoinKeys) return config.autoInjectJoinKeys;
+    return config.joinKeys || [];
+  }
+
+  /**
+   * Resolve the join mode for a linked source. The cube declares it
+   * explicitly via `config.joinMode`; if omitted, the caller gets
+   * undefined and must decide whether to default or error.
+   */
+  static resolveLinkedJoinMode(config: LinkedSourceConfig): 'inner' | 'left' | undefined {
+    return config.joinMode;
+  }
+
   static dropColumns(dataset: Dataset, drop: string[]): Dataset {
     if (!drop || drop.length === 0) return dataset;
     const dropSet: Record<string, true> = {};
