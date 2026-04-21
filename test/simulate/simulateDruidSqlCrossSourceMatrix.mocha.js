@@ -322,26 +322,21 @@ describe('Cross-source matrix — canonical shapes', () => {
     expect(mains, 'at least one main query').to.have.length.at.least(1);
   });
 
-  it('Shape 11c: ACTUAL user bug — linked-only split refs without linked agg → single-source plan', () => {
-    // Repro of the failing curl: the outer ply registers `reviews` as a
-    // scope (turnilo's ply-level kludge) and the inner SPLIT groups by
-    // `review_title`, `review_content`, `ean` with a pure-main aggregate
-    // `$main.average($price)`. The query has no linked aggregate.
+  it('Shape 11c: user flow — linked-only split refs without linked agg → auto-inject + projection', () => {
+    // The canonical repro: a grid query where the user picked review-side
+    // dimensions (`review_title`, `review_content`) alongside a main
+    // dimension (`ean`) and a main aggregate (`avg_price`). No shared
+    // split, no linked aggregate.
     //
-    // Before fix: Plywood's schema-overlap heuristic classified
-    // `review_content` as linked-only (exists in reviews.attributes, not
-    // main.attributes) and fired cross-source decomposition. Decomposition
-    // then demanded a shared joinKey split, found none, and threw:
-    //   "Cross-source query has main-side splits [ean] but no split whose
-    //    free refs are all declared joinKeys of 'reviews' [...]"
-    //
-    // After fix: decomposition triggers only when a VALUE apply aggregates
-    // from a foreign source (semantic contribution). A linked scope
-    // registration at the ply level is a dataset apply, not an output
-    // contribution — Plywood leaves the query main-only and emits its
-    // natural main-side SQL. Druid will then say "column not found" if
-    // the linked-only columns aren't in main_ds; the turnilo-side
-    // validator catches this before emission in the normal path.
+    // The schema-overlap trigger fires on `review_content` / `review_title`
+    // (columns only in reviews.attributes) → decomposition engages → no
+    // user-shared split → auto-inject the declared joinKeys [partitionId,
+    // __time-analog on this fixture: `competitor`, `__time`] on both sides.
+    // Main's SQL groups by (Ean, __join_competitor, __join___time) and
+    // aggregates AvgPrice; linked's SQL groups by (review_title,
+    // review_content, __join_*). The in-memory join aligns on the synthetic
+    // keys, post-join drops them, and the caller sees exactly
+    // (review_title, review_content, Ean, avg_price).
     const innerTimeFilter = $('__time').overlap(currRange);
     const ex = ply()
       .apply('main', $('main').filter(innerTimeFilter))
@@ -364,14 +359,23 @@ describe('Cross-source matrix — canonical shapes', () => {
     const links = linkedQueriesOf(queries);
     const mains = mainQueriesOf(queries);
 
-    expect(links, 'no linked query when no linked value apply').to.have.length(0);
-    expect(mains, 'main emits its queries — Druid owns schema validation').to.have.length.at.least(
-      1,
-    );
-    // Main's SPLIT query carries the linked-only split aliases untouched —
-    // Plywood isn't in the business of pre-validating column existence.
-    const splitQuery = mains.find(q => q.query.includes('review_content'));
-    expect(splitQuery, 'split query retains linked-only column refs').to.exist;
+    expect(mains, 'main side present').to.have.length.at.least(1);
+    expect(links, 'linked side present').to.have.length.at.least(1);
+    // No main query references the linked-only columns — those are routed
+    // exclusively to the linked side.
+    for (const q of mains) {
+      expect(q.query).to.not.match(/review_content|review_title/);
+    }
+    // The SPLIT sub-query decomposes with synthetic joinKeys: there's a
+    // main query that groups by "Ean" alongside "__join_" keys.
+    const mainSplitQuery = mains.find(q => /"ean" AS "ean"/.test(q.query));
+    expect(mainSplitQuery, 'main side of the SPLIT decomposition').to.exist;
+    expect(mainSplitQuery.query).to.match(/"__join_/);
+    // Linked groups by the linked-only user splits + synthetic joinKeys,
+    // projects no main aggregate.
+    const linkedSplitQuery = links.find(q => /review_content/.test(q.query));
+    expect(linkedSplitQuery, 'linked side carries review_content split').to.exist;
+    expect(linkedSplitQuery.query).to.match(/"__join_/);
   });
 
   it('Shape 12: totals cross-source (no splits) → 2 queries, both totals mode', () => {

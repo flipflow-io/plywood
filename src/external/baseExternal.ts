@@ -2596,20 +2596,42 @@ export abstract class External {
       }
     }
 
-    // The trigger for cross-source decomposition is a foreign apply — an
-    // apply whose expression aggregates from a declared linked source. No
-    // schema-overlap heuristic on splits: if a split alias resolves to a
-    // column only in linked attributes but no linked apply is present, the
-    // query isn't semantically cross-source. Druid will return the right
-    // error (column not found) if the user passed a linked-only column
-    // to the main side without an output contribution from linked.
+    // A cross-source query is triggered by either of two signals:
     //
-    // Why this matters: the old schema-overlap trigger fired when a column
-    // name happened to be linked-only, even for a query whose output was
-    // purely main. That produced a misleading "no shared joinKey" error
-    // from our own layer, instead of letting Druid or our turnilo-side
-    // validator surface the real issue.
-    const involvedLinkedNames = linkedAppliesByName;
+    //   1. A VALUE apply whose expression aggregates from a declared linked
+    //      source (a semantic output contribution).
+    //   2. A split alias whose free refs resolve only in a linked source's
+    //      attributes (the user grouped by a column that main can't see).
+    //
+    // Signal (2) was removed at one point because, without auto-inject, it
+    // produced a misleading "no shared joinKey" error from our own layer.
+    // Now that sharedAliases.length === 0 is handled by synthesizing the
+    // joinKeys, the schema-driven trigger is safe again — and necessary:
+    // without it, a query like `.split($content)` where `content` only
+    // lives in reviews would be handed to the main side and rejected by
+    // Druid with "column not found", even though the query has a
+    // well-defined cross-source meaning.
+    const involvedLinkedNames: Record<string, true> = Object.keys(linkedAppliesByName).reduce(
+      (acc, n) => ((acc[n] = true), acc),
+      {} as Record<string, true>,
+    );
+    for (const alias of this.split.keys) {
+      const ex = this.split.splits[alias];
+      const refs = ex.getFreeReferences();
+      if (refs.length === 0) continue;
+      const mainAttrs: Record<string, true> = {};
+      for (const a of this.rawAttributes || []) mainAttrs[a.name] = true;
+      for (const k in this.derivedAttributes) mainAttrs[k] = true;
+      const anyInMain = refs.some(r => mainAttrs[r]);
+      for (const lsName in this.linkedSources) {
+        const ls = this.linkedSources[lsName];
+        const linkedAttrs: Record<string, true> = {};
+        if (ls.attributes) for (const a of ls.attributes as any[]) linkedAttrs[a.name] = true;
+        if (ls.derivedAttributes) for (const k in ls.derivedAttributes) linkedAttrs[k] = true;
+        const allInLinked = refs.every(r => linkedAttrs[r]);
+        if (allInLinked && !anyInMain) involvedLinkedNames[lsName] = true;
+      }
+    }
     if (Object.keys(involvedLinkedNames).length === 0) return null;
 
     const linkedExternals: { name: string; external: External; joinKeys: string[] }[] = [];
