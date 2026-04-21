@@ -1098,12 +1098,17 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
     return mapping;
   }
 
-  public join(other: Dataset): Dataset {
+  public join(other: Dataset, mode: 'left' | 'inner' = 'left'): Dataset {
     // Auto-dispatch based on the relation between key sets:
     //   - other ⊂ this          → broadcastJoin (expand partial-key result)
     //   - this.keys == other    → leftJoin (row-wise align on identical keys)
     //   - keys overlap but each has exclusives → crossJoinOnSharedKeys
     //     (cartesian on shared keys, each side contributes its own extras)
+    //
+    // `mode` is forwarded to crossJoinOnSharedKeys — 'inner' drops rows
+    // from `this` that have no match in `other`. broadcastJoin and
+    // leftJoin ignore the mode (neither produces orphan rows under their
+    // semantics).
     if (other && this.keys && other.keys) {
       const thisKeys = this.keys;
       const otherKeys = other.keys;
@@ -1115,7 +1120,7 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
         sharedKeys.length > 0 &&
         (sharedKeys.length < thisKeys.length || sharedKeys.length < otherKeys.length)
       ) {
-        return this.crossJoinOnSharedKeys(other, sharedKeys);
+        return this.crossJoinOnSharedKeys(other, sharedKeys, mode);
       }
     }
     return this.leftJoin(other);
@@ -1127,9 +1132,27 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
    * (matched by sharedKeys). Both sides contribute their own exclusive keys,
    * producing a dataset with the union of keys. Think "SQL INNER JOIN on
    * sharedKeys" when neither side's keys are a subset of the other.
+   *
+   * `mode`:
+   *   - 'left' (default): unmatched rows from `this` pass through with
+   *      the other side's fields undefined. Preserves row count from
+   *      `this`; use when you need every left-side row to survive.
+   *   - 'inner': unmatched rows from `this` are dropped. Use when both
+   *      sides must contribute columns to a meaningful output row —
+   *      typical for cross-source decomposition where the split
+   *      references columns only one side can produce.
    */
-  public crossJoinOnSharedKeys(other: Dataset, sharedKeys: string[]): Dataset {
-    if (!other || !other.data.length) return this;
+  public crossJoinOnSharedKeys(
+    other: Dataset,
+    sharedKeys: string[],
+    mode: 'left' | 'inner' = 'left',
+  ): Dataset {
+    if (!other || !other.data.length) {
+      if (mode === 'inner') {
+        return new Dataset({ keys: this.keys, attributes: this.attributes, data: [] });
+      }
+      return this;
+    }
     const { data, keys, attributes } = this;
     if (!data.length) return this;
 
@@ -1153,7 +1176,8 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
     for (const datum of data) {
       const matches = otherBuckets[hashDatum(datum)] || [];
       if (matches.length === 0) {
-        newData.push(datum);
+        if (mode === 'left') newData.push(datum);
+        // mode === 'inner': drop unmatched row
       } else {
         for (const m of matches) {
           newData.push(joinDatums(datum, m));

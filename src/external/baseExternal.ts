@@ -2256,16 +2256,24 @@ export abstract class External {
           // broadcastable subset.
           const mainIsTotals = !(main as Dataset).keys || (main as Dataset).keys.length === 0;
           let joined: Dataset;
+          // Cross-source join uses INNER semantics. If the user split by a
+          // linked-only column (e.g. `review_title`), a main row without a
+          // linked match has no value for that column — keeping it in the
+          // result (left-join default) surfaces rows with undefined splits,
+          // which bubbles up as null-titled rows sorted to the top or bottom
+          // depending on direction. A linked-only split declares the user's
+          // intent that each output row must be anchored by a linked match;
+          // unmatched main rows don't belong.
           if (mainIsTotals && linked.length > 0) {
             joined = linked[0] as Dataset;
-            joined = joined.join(main as Dataset);
+            joined = joined.join(main as Dataset, 'inner');
             for (let i = 1; i < linked.length; i++) {
-              joined = joined.join(linked[i] as Dataset);
+              joined = joined.join(linked[i] as Dataset, 'inner');
             }
           } else {
             joined = main as Dataset;
             for (const side of linked) {
-              joined = joined.join(side as Dataset);
+              joined = joined.join(side as Dataset, 'inner');
             }
           }
           // Apply the post-join HAVING before sort/limit so sort ordering
