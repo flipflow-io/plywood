@@ -1093,10 +1093,24 @@ export abstract class External {
     linkedSchema: Record<string, true>,
     config: LinkedSourceConfig,
     linkedSourceName: string,
-  ): { shared: string[]; mainOnly: string[]; linkedOnly: string[] } {
+  ): { shared: string[]; mainOnly: string[]; linkedOnly: string[]; foreignLinked: string[] } {
     const shared: string[] = [];
     const mainOnly: string[] = [];
     const linkedOnly: string[] = [];
+    // `foreignLinked` — aliases whose refs resolve in neither main nor
+    // THIS linkedSource. They belong to a SIBLING linkedSource and will
+    // be classified in that sibling's own iteration. Reporting them
+    // separately (instead of throwing) is what makes cross-source
+    // queries over multiple linkedSources work: e.g. a query splitting
+    // on [brand_tier, competitor_size] where brand_tier lives in
+    // linkedSource A and competitor_size in B must not explode when
+    // A's classifier encounters competitor_size.
+    //
+    // The OUTER caller (getCrossExternalDecomposition) is responsible
+    // for asserting every alias got classified somewhere — a
+    // wholly-dangling alias (not in main, not in any linkedSource) is
+    // still an error, raised at the loop's tail.
+    const foreignLinked: string[] = [];
 
     const declaredShared: Record<string, true> = {};
     for (const k of config.joinKeys || []) declaredShared[k] = true;
@@ -1132,15 +1146,14 @@ export abstract class External {
       } else if (inLinked) {
         linkedOnly.push(alias);
       } else {
-        throw new Error(
-          `Split alias "${alias}" references columns that resolve in neither main nor "${linkedSourceName}" (refs: [${refs.join(
-            ', ',
-          )}])`,
-        );
+        // Belongs to a sibling linkedSource (or is truly dangling).
+        // Defer the decision to the outer loop, which sees every
+        // linkedSource's classification and can tell the two apart.
+        foreignLinked.push(alias);
       }
     }
 
-    return { shared, mainOnly, linkedOnly };
+    return { shared, mainOnly, linkedOnly, foreignLinked };
   }
 
   /**
@@ -3053,6 +3066,13 @@ export abstract class External {
       joinMode: 'inner' | 'left';
     }[] = [];
 
+    // Track which aliases of `this.split` got routed to SOME
+    // classification (main/shared/linkedOnly) across any iteration.
+    // After the loop, any alias never classified anywhere is truly
+    // dangling — surfaced as a clear error below instead of silently
+    // producing an incomplete join.
+    const everClassifiedAliases: Record<string, true> = {};
+
     // Once we commit to decomposing, any further inability to materialize
     // sub-queries is a hard error — falling back to the single-query path
     // would silently corrupt the result by pretending the foreign ref is
@@ -3175,6 +3195,14 @@ export abstract class External {
       const sharedAliases: string[] = [...classified.shared];
       const mainOnlyAliases: string[] = [...classified.mainOnly];
       const linkedOnlyAliases: string[] = [...classified.linkedOnly];
+      // Record what this iteration classified. Foreign-linked aliases
+      // (classifier returned them in `foreignLinked`) are deliberately
+      // NOT recorded here — they belong to a sibling iteration. Only
+      // at the post-loop guard do we assert every alias was covered
+      // somewhere.
+      for (const a of sharedAliases) everClassifiedAliases[a] = true;
+      for (const a of mainOnlyAliases) everClassifiedAliases[a] = true;
+      for (const a of linkedOnlyAliases) everClassifiedAliases[a] = true;
       // Zero shared splits AND main/linked contributions exist → auto-inject
       // one split per declared joinKey onto both sides. The user didn't pick
       // a shared dimension, but the cube's joinKeys config says "this pair of
@@ -3311,6 +3339,24 @@ export abstract class External {
         if (!(this as any)._syntheticAliasMap) (this as any)._syntheticAliasMap = {};
         (this as any)._syntheticAliasMap[a] = true;
       }
+    }
+
+    // Dangling-alias guard — a split whose refs resolved in neither
+    // main nor ANY linkedSource's attributes is a real error (and
+    // would have been caught by pre-refactor classifier that threw).
+    // The new classifier skips such aliases at each iteration via
+    // `foreignLinked`; we surface the dangling case here so the error
+    // message names every unclassified alias in one go.
+    const dangling: string[] = [];
+    for (const alias of this.split.keys) {
+      if (!everClassifiedAliases[alias]) dangling.push(alias);
+    }
+    if (dangling.length > 0) {
+      throw new Error(
+        `Cross-source decomposition: split aliases [${dangling.join(
+          ', ',
+        )}] reference columns that resolve in neither main nor any declared linkedSource's attributes. Check that the linkedSource whose schema contains these refs is declared on the cube and has been introspected (attributes populated).`,
+      );
     }
 
     // Build the main side: keep only splits whose refs resolve in main's own

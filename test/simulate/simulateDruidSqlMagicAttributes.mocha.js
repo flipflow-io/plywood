@@ -130,9 +130,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
   // attribute (category). Pins that the dim-only path itself works
   // when the split ref resolves via ls.attributes.
   it('[control] split by raw linked attribute (category) → two queries + join', () => {
-    const ex = $('main')
-      .split('$category', 'category')
-      .apply('AvgPrice', '$main.average($price)');
+    const ex = $('main').split('$category', 'category').apply('AvgPrice', '$main.average($price)');
 
     const plan = ex.simulateQueryPlan({ main: makeMainWithDerivedAttrLookup() });
     const queries = plan.flat().filter(q => typeof q.query === 'string');
@@ -172,9 +170,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
   // linkedSources must NOT force decomposition on queries that don't
   // touch linked data.
   it('[control] split by main attribute only → single query, lookup untouched', () => {
-    const ex = $('main')
-      .split('$brand', 'Brand')
-      .apply('AvgPrice', '$main.average($price)');
+    const ex = $('main').split('$brand', 'Brand').apply('AvgPrice', '$main.average($price)');
 
     const plan = ex.simulateQueryPlan({ main: makeMainWithRawAttrLookup() });
     const queries = plan.flat().filter(q => typeof q.query === 'string');
@@ -192,8 +188,9 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       .split('$brand_tier', 'brand_tier')
       .apply('AvgPrice', '$main.average($price)');
 
-    expect(() => ex.simulateQueryPlan({ main: makeMainWithDerivedAttrLookup() }))
-      .to.throw(/unsupported simulation on: null/);
+    expect(() => ex.simulateQueryPlan({ main: makeMainWithDerivedAttrLookup() })).to.throw(
+      /unsupported simulation on: null/,
+    );
   });
 
   // Turnilo-style nested expression — the exact shape the /plywood
@@ -208,7 +205,8 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
   //     .apply('main',  $main.filter(time in R))
   //     .apply('SPLIT', $main.split(X).apply(Y).limit(N))
   it('[plan-B] turnilo-style nested expression with filter+limit wrapper → decomposes', () => {
-    const ex = plywood.ply()
+    const ex = plywood
+      .ply()
       .apply('main', $('main').filter('$time.overlap({...})' ? timeFilter : timeFilter))
       .apply(
         'SPLIT',
@@ -254,18 +252,16 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       op: 'literal',
       value: {
         setType: 'TIME_RANGE',
-        elements: [
-          { start: '2026-04-22T00:00:00.000Z', end: '2026-04-23T00:00:00.000Z' },
-        ],
+        elements: [{ start: '2026-04-22T00:00:00.000Z', end: '2026-04-23T00:00:00.000Z' }],
       },
       type: 'SET',
     };
-    const avgRef = (col) => ({
+    const avgRef = col => ({
       op: 'average',
       operand: { op: 'ref', name: 'main' },
       expression: { op: 'ref', name: col },
     });
-    const minRef = (col) => ({
+    const minRef = col => ({
       op: 'min',
       operand: { op: 'ref', name: 'main' },
       expression: { op: 'ref', name: col },
@@ -515,9 +511,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       op: 'literal',
       value: {
         setType: 'TIME_RANGE',
-        elements: [
-          { start: '2026-04-22T00:00:00.000Z', end: '2026-04-23T00:00:00.000Z' },
-        ],
+        elements: [{ start: '2026-04-22T00:00:00.000Z', end: '2026-04-23T00:00:00.000Z' }],
       },
       type: 'SET',
     };
@@ -656,7 +650,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       {
         engine: 'druidsql',
         source: 'histories-42f0bec',
-        suppress: true,   // ← matches turnilo's dataCubeToExternal.ts
+        suppress: true, // ← matches turnilo's dataCubeToExternal.ts
         timeAttribute: '__time',
         attributes: [
           { name: '__time', type: 'TIME' },
@@ -818,9 +812,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const linked = queries.filter(q => q.query.includes('"lookup_abc_rev1"'));
     expect(linked, 'lookup query dispatched').to.have.length(1);
     // Bucketed default: time filter must propagate.
-    expect(linked[0].query, 'bucketed lookup carries time filter').to.match(
-      /"__time"/,
-    );
+    expect(linked[0].query, 'bucketed lookup carries time filter').to.match(/"__time"/);
     expect(linked[0].query).to.match(/2026-04-22/);
   });
 
@@ -847,9 +839,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
 
     // Lookup must NOT reference __time in its WHERE (the point of eternal).
     expect(linked[0].query, 'lookup query text').to.not.match(/"__time"/);
-    expect(linked[0].query, 'lookup query has no 2026 bound').to.not.match(
-      /2026-04-22/,
-    );
+    expect(linked[0].query, 'lookup query has no 2026 bound').to.not.match(/2026-04-22/);
   });
 
   it('[timeAlignment=eternal compute] lookup at 1970 joined into main rows', async () => {
