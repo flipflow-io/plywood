@@ -334,6 +334,16 @@ export interface LinkedSourceConfig {
   joinMode?: 'inner' | 'left';
   attributes?: Attributes;
   derivedAttributes?: Record<string, Expression>;
+  /**
+   * How main's filter relates to the linked source's time dimension:
+   *   - undefined / "bucketed" — main's __time clause propagates to the
+   *     lookup query (default; correct for time-partitioned joins).
+   *   - "eternal"              — __time is withheld from the linked
+   *     schema so `pruneFilterToSchema` rewrites its refs to TRUE.
+   *     Used for materialised snapshots whose rows live at a sentinel
+   *     timestamp (e.g. MSQ-ingested lookups at 1970).
+   */
+  timeAlignment?: 'bucketed' | 'eternal';
 }
 
 /**
@@ -348,6 +358,7 @@ export interface LinkedSourceConfigJS {
   joinMode?: 'inner' | 'left';
   attributes?: AttributeJSs;
   derivedAttributes?: Record<string, ExpressionJS>;
+  timeAlignment?: 'bucketed' | 'eternal';
 }
 
 export interface SpecialApplyTransform {
@@ -1206,6 +1217,7 @@ export abstract class External {
           derivedAttributes: ls.derivedAttributes
             ? Expression.expressionLookupFromJS(ls.derivedAttributes)
             : undefined,
+          timeAlignment: ls.timeAlignment,
         };
       }
     }
@@ -3072,14 +3084,43 @@ export abstract class External {
       // (e.g. `reference`), and those clauses are identity on the linked
       // side. The join on shared/synthetic joinKeys propagates main's
       // extra narrowing into the linked rows.
+      //
+      // `timeAlignment` on the linkedSource config opts out of
+      // propagating main's __time clause:
+      //   - undefined / "bucketed" — __time stays in linkedSchemaNames;
+      //     the filter clause survives the prune and reaches the lookup.
+      //   - "eternal"              — the timeAttribute is deliberately
+      //     withheld so `pruneFilterToSchema` treats its refs as
+      //     out-of-scope and rewrites them to TRUE. Used when the
+      //     lookup is a materialised snapshot whose rows carry a
+      //     sentinel __time (e.g. 1970) and main's interval would
+      //     return zero rows.
+      const timeAttrName =
+        (typeof (this as any).getTimeAttribute === 'function'
+          ? (this as any).getTimeAttribute()
+          : undefined) || (this as any).timeAttribute;
+      const timeAlignment = (config as any).timeAlignment;
       const linkedSchemaNames: Record<string, true> = {};
       if (normalizedAttributes) {
-        for (const a of normalizedAttributes) linkedSchemaNames[a.name] = true;
+        for (const a of normalizedAttributes) {
+          if (timeAlignment === 'eternal' && a.name === timeAttrName) continue;
+          linkedSchemaNames[a.name] = true;
+        }
       }
       if (normalizedDerived) {
-        for (const k in normalizedDerived) linkedSchemaNames[k] = true;
+        for (const k in normalizedDerived) {
+          if (timeAlignment === 'eternal' && k === timeAttrName) continue;
+          linkedSchemaNames[k] = true;
+        }
       }
       const templateFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames);
+      // When `timeAlignment: "eternal"` strips the time clause, the
+      // resulting Druid query has no __time bound and would throw
+      // "must filter on time unless the allowEternity flag is set".
+      // Force-enable allowEternity on the template: declaring the
+      // linked source eternal is declaring this permission too.
+      const templateAllowEternity =
+        timeAlignment === 'eternal' ? true : (this as any).allowEternity;
 
       const template = External.fromValue({
         engine: this.engine,
@@ -3095,7 +3136,7 @@ export abstract class External {
         timeAttribute: (this as any).timeAttribute,
         customAggregations: (this as any).customAggregations,
         customTransforms: (this as any).customTransforms,
-        allowEternity: (this as any).allowEternity,
+        allowEternity: templateAllowEternity,
         allowSelectQueries: (this as any).allowSelectQueries,
         exactResultsOnly: (this as any).exactResultsOnly,
         querySelection: (this as any).querySelection,
