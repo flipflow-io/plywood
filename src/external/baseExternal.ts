@@ -1236,6 +1236,15 @@ export abstract class External {
     }
 
     value.filter = parameters.filter ? Expression.fromJS(parameters.filter) : Expression.TRUE;
+    // The distinguished time column travels through this seam too.
+    // Without this line, a Druid SQL / Postgres / MySQL external whose
+    // cube declares `timeAttribute: 'time'` would silently lose the
+    // value at fromJS time — only `DruidExternal.fromJS` (the legacy
+    // native Druid path) was previously copying it across, which is
+    // why time-bound cubes worked there but not on the SQL transports.
+    if (typeof parameters.timeAttribute === 'string' && parameters.timeAttribute.length > 0) {
+      value.timeAttribute = parameters.timeAttribute;
+    }
 
     return value;
   }
@@ -1341,10 +1350,18 @@ export abstract class External {
       const v = context[k];
       if (!(v instanceof External)) continue;
 
-      // Primary binding (e.g. `main`) — schema is its own raw + derived attrs
+      // Primary binding (e.g. `main`) — schema is its own raw + derived attrs,
+      // PLUS timeAttribute. Druid SQL introspect emits the time column only
+      // as `timeAttribute` (never as a member of `attributes`); without
+      // adding it here the `pruneFilterToSchema` call below rewrites
+      // `$time.overlap(...)` to TRUE, the main sub-query goes to Druid with
+      // no time bound and `allowEternity: false`, and Druid throws
+      // "must filter on time unless the allowEternity flag is set".
       const mainSchema: Record<string, true> = {};
       for (const a of v.rawAttributes || []) mainSchema[a.name] = true;
       for (const dk in v.derivedAttributes || {}) mainSchema[dk] = true;
+      const ta = (v as any).timeAttribute;
+      if (typeof ta === 'string' && ta.length > 0) mainSchema[ta] = true;
       schemas[k] = mainSchema;
 
       // Linked sources — their declared attributes + derivedAttributes
@@ -1454,6 +1471,17 @@ export abstract class External {
   public attributeOverrides: Attributes = null;
   public derivedAttributes: Record<string, Expression>;
   public linkedSources: Record<string, LinkedSourceConfig>;
+  // The distinguished time column for this external. Druid native
+  // (`DruidExternal`) re-declared this for legacy reasons; lifting it
+  // here makes every transport (Druid SQL, Postgres, MySQL, …) honour
+  // the timeAttribute uniformly. Without it, a cube that declares
+  // `timeAttribute: 'time'` to a Druid-SQL external simply forgets the
+  // value, and any `$time`-referencing expression fails
+  // `expressionDefined` because `getRawFullType` has no entry for the
+  // time column. The downstream symptom is "must filter on time unless
+  // the allowEternity flag is set" raised by Druid when the absorbed
+  // filter never made it into the SQL.
+  public timeAttribute: string | undefined;
 
   public delegates: External[];
   public concealBuckets: boolean;
@@ -1500,6 +1528,14 @@ export abstract class External {
       this.delegates = parameters.delegates;
     }
     this.concealBuckets = parameters.concealBuckets;
+    // Lifted here so SQL externals (DruidSQLExternal in particular)
+    // honour the timeAttribute the cube declares. DruidExternal still
+    // re-assigns this in its own constructor with a fallback to
+    // DruidExternal.TIME_ATTRIBUTE; that overwrite is benign — the
+    // DruidExternal subclass runs after super() and its assignment wins.
+    if (typeof parameters.timeAttribute === 'string' && parameters.timeAttribute.length > 0) {
+      this.timeAttribute = parameters.timeAttribute;
+    }
 
     this.rawAttributes = parameters.rawAttributes || parameters.attributes || [];
     this.requester = parameters.requester;
@@ -1575,6 +1611,7 @@ export abstract class External {
     if (nonEmptyLookup(this.linkedSources)) value.linkedSources = this.linkedSources;
     if (this.delegates) value.delegates = this.delegates;
     value.concealBuckets = this.concealBuckets;
+    if (this.timeAttribute) value.timeAttribute = this.timeAttribute;
 
     if (this.mode !== 'raw' && this.rawAttributes) {
       value.rawAttributes = this.rawAttributes;
@@ -1628,6 +1665,11 @@ export abstract class External {
       js.derivedAttributes = Expression.expressionLookupToJS(this.derivedAttributes);
     if (nonEmptyLookup(this.linkedSources)) js.linkedSources = this.linkedSources;
     if (this.concealBuckets) js.concealBuckets = true;
+    // timeAttribute round-trips on toJS for SQL externals (Druid SQL,
+    // Postgres, MySQL). DruidExternal overrides this method and re-emits
+    // it under its legacy "skip if equal to '__time'" rule; that override
+    // wins because it runs after super().toJS().
+    if (this.timeAttribute && this.engine !== 'druid') js.timeAttribute = this.timeAttribute;
 
     if (this.mode !== 'raw' && this.rawAttributes)
       js.rawAttributes = AttributeInfo.toJSs(this.rawAttributes);
@@ -2678,6 +2720,24 @@ export abstract class External {
       }
     }
 
+    // Druid SQL externals declare their time column ONLY via the
+    // `timeAttribute` field — it is not duplicated into `attributes`.
+    // Surface it in the type context so `$time`-referencing expressions
+    // (the cube's own time filter, in particular) pass `definedInTypeContext`
+    // and absorb correctly into `External.filter`. Without this, a
+    // `$main.filter($time.overlap(...))` on a cube with linkedSources fails
+    // `_addFilterExpression`'s `expressionDefined` check, the filter is
+    // never absorbed, and the main sub-query reaches Druid with no time
+    // bound — which Druid rejects as "must filter on time unless the
+    // allowEternity flag is set". The first declaration wins on name
+    // collision (rawAttributes already populated above), so explicitly
+    // listing `time` in attributes — as fixtures sometimes do — keeps the
+    // explicit type and we don't override it.
+    const ta = (this as any).timeAttribute;
+    if (typeof ta === 'string' && ta.length > 0 && !(ta in myDatasetType)) {
+      myDatasetType[ta] = { type: 'TIME' };
+    }
+
     // Flat-expose linked source attributes at main's top level so expressions
     // like $title (a column that lives only in `reviews`) type-check against
     // this external. Main attributes win on name collisions (the column is
@@ -3044,9 +3104,17 @@ export abstract class External {
       const ex = this.split.splits[alias];
       const refs = ex.getFreeReferences();
       if (refs.length === 0) continue;
+      // Main-resolvable names: rawAttributes ∪ derivedAttributes ∪
+      // timeAttribute. Without timeAttribute here, a split on the time
+      // column would be classified as "not in main" and routed to a
+      // linkedSource — falsely triggering cross-source decomposition or
+      // throwing "dangling alias" depending on what the linked side
+      // declares.
       const mainAttrs: Record<string, true> = {};
       for (const a of this.rawAttributes || []) mainAttrs[a.name] = true;
       for (const k in this.derivedAttributes) mainAttrs[k] = true;
+      const ta = (this as any).timeAttribute;
+      if (typeof ta === 'string' && ta.length > 0) mainAttrs[ta] = true;
       const anyInMain = refs.some(r => mainAttrs[r]);
       for (const lsName in this.linkedSources) {
         const ls = this.linkedSources[lsName];
@@ -3173,12 +3241,16 @@ export abstract class External {
       if (config.derivedAttributes) {
         for (const k in config.derivedAttributes) linkedAttrs[k] = true;
       }
-      // Main's own schema (rawAttributes + derivedAttributes) — used to
-      // classify splits that are main-compatible. rawAttributes is populated
-      // from attributes via the constructor.
+      // Main's own schema (rawAttributes + derivedAttributes + timeAttribute)
+      // — used to classify splits that are main-compatible. rawAttributes is
+      // populated from attributes via the constructor; timeAttribute is
+      // declared separately on Druid SQL externals and must be added in
+      // explicitly so a split on the time column is recognised as main-side.
       const mainAttrs: Record<string, true> = {};
       for (const a of this.rawAttributes || []) mainAttrs[a.name] = true;
       for (const k in this.derivedAttributes) mainAttrs[k] = true;
+      const ta = (this as any).timeAttribute;
+      if (typeof ta === 'string' && ta.length > 0) mainAttrs[ta] = true;
 
       // Delegate to the declarative classifier. The classifier reads
       // `config.sharedDimensions` for dimensions that live on both sides
@@ -3236,6 +3308,12 @@ export abstract class External {
           const dtype = (this.derivedAttributes[k] as any).type;
           if (dtype) mainTypeForKey[k] = dtype;
         }
+        // Include timeAttribute — when a joinKey happens to be the time
+        // column, the main-side type lookup must resolve it as TIME so the
+        // synthetic split rebuilds with the correct native type before the
+        // join cast to STRING.
+        const taKey = (this as any).timeAttribute;
+        if (typeof taKey === 'string' && taKey.length > 0) mainTypeForKey[taKey] = 'TIME';
         const linkedTypeForKey: Record<string, PlyType> = {};
         if (config.attributes) {
           for (const a of config.attributes as any[]) linkedTypeForKey[a.name] = a.type;
@@ -3374,12 +3452,20 @@ export abstract class External {
       mainValue.split = this.split.changeSplits(mainSplitMap);
       // Build attributes. For synthetic splits the expression is a bare ref
       // with no resolved type yet — look the column's type up in the main
-      // external's own schema (rawAttributes + derivedAttributes).
+      // external's own schema (rawAttributes + derivedAttributes +
+      // timeAttribute). The timeAttribute entry covers splits that group
+      // by the time column directly (rare but legal — e.g. a TIME_FLOOR'd
+      // bucket); without it the synthetic split would default to STRING
+      // and lose the temporal type.
       const mainAttrTypeByName: Record<string, PlyType> = {};
       for (const a of this.rawAttributes || []) mainAttrTypeByName[a.name] = a.type;
       for (const k in this.derivedAttributes) {
         const dtype = (this.derivedAttributes[k] as any).type;
         if (dtype) mainAttrTypeByName[k] = dtype;
+      }
+      const taType = (this as any).timeAttribute;
+      if (typeof taType === 'string' && taType.length > 0) {
+        mainAttrTypeByName[taType] = 'TIME';
       }
       mainValue.attributes = [
         ...mainKeepableAliases.map(name => {
