@@ -266,6 +266,101 @@ function findApplyByExpression(
   return null;
 }
 
+/**
+ * Declarative configuration for a foreign datasource joined to a main
+ * External under cross-source decomposition. Every semantic choice that
+ * affects how decomposition routes splits, injects synthetic keys, or
+ * merges rows MUST live here explicitly — no heuristic inference from
+ * schema shape or column types.
+ *
+ * Shapes:
+ *
+ *   joinKeys              Declared anchor of the join. Columns that,
+ *                         when equal on both sides, identify a
+ *                         corresponding row pair. Used for:
+ *                           - classifying split aliases as `shared`
+ *                             (a split whose refs all land in joinKeys
+ *                             is shared automatically),
+ *                           - auto-injecting synthetic `__join_<key>`
+ *                             splits when the user picks no shared
+ *                             split (subset controlled by
+ *                             `autoInjectJoinKeys`).
+ *
+ *   autoInjectJoinKeys    Subset of `joinKeys` that the engine may
+ *                         synthesize as `__join_<key>` splits when
+ *                         the user's query has no shared split. Any
+ *                         joinKey NOT listed here is valid as an
+ *                         explicit user-chosen shared split but never
+ *                         auto-added. Omit to default to `joinKeys`.
+ *                         Typical use: `joinKeys: [partitionId,
+ *                         __time]`, `autoInjectJoinKeys: [partitionId]`
+ *                         — __time is a valid join anchor only when
+ *                         the user explicitly splits on timeBucket,
+ *                         otherwise the auto-inject would explode the
+ *                         result by snapshot count.
+ *
+ *   sharedDimensions      Columns present on BOTH sides that carry the
+ *                         same semantic meaning (e.g. a productName
+ *                         surfaced on linked via derivedAttribute).
+ *                         When the user splits on one of these, both
+ *                         sides group by it at the SQL level and the
+ *                         natural-join aligns equal values. Unlike
+ *                         joinKeys, sharedDimensions aren't the join
+ *                         anchor — they're additional columns that
+ *                         behave like shared splits when referenced.
+ *                         MUST be declared: the decomposition refuses
+ *                         to silently infer shared-ness from schema
+ *                         overlap because the same column name on
+ *                         both sides can legitimately mean different
+ *                         things.
+ *
+ *   joinMode              Row-retention semantic of the in-memory join:
+ *                           'inner' — drop main rows with no linked
+ *                             match (typical for monitoring cubes
+ *                             where a split on a linked-only column
+ *                             implies the row exists only if linked
+ *                             has data),
+ *                           'left'  — keep orphan main rows with
+ *                             linked columns undefined (use when the
+ *                             main side is authoritative and linked
+ *                             contributes optional enrichment).
+ *                         No default — every cube declares which.
+ */
+export interface LinkedSourceConfig {
+  source: string;
+  joinKeys: string[];
+  autoInjectJoinKeys?: string[];
+  sharedDimensions?: string[];
+  joinMode?: 'inner' | 'left';
+  attributes?: Attributes;
+  derivedAttributes?: Record<string, Expression>;
+  /**
+   * How main's filter relates to the linked source's time dimension:
+   *   - undefined / "bucketed" — main's __time clause propagates to the
+   *     lookup query (default; correct for time-partitioned joins).
+   *   - "eternal"              — __time is withheld from the linked
+   *     schema so `pruneFilterToSchema` rewrites its refs to TRUE.
+   *     Used for materialised snapshots whose rows live at a sentinel
+   *     timestamp (e.g. MSQ-ingested lookups at 1970).
+   */
+  timeAlignment?: 'bucketed' | 'eternal';
+}
+
+/**
+ * JS-form of LinkedSourceConfig — attributes and derivedAttributes come
+ * in as JS descriptors, to be rehydrated by `fromJS`.
+ */
+export interface LinkedSourceConfigJS {
+  source: string;
+  joinKeys: string[];
+  autoInjectJoinKeys?: string[];
+  sharedDimensions?: string[];
+  joinMode?: 'inner' | 'left';
+  attributes?: AttributeJSs;
+  derivedAttributes?: Record<string, ExpressionJS>;
+  timeAlignment?: 'bucketed' | 'eternal';
+}
+
 export interface SpecialApplyTransform {
   mainRangeLiteral: LiteralExpression;
   curTimeRange: TimeRange;
@@ -281,7 +376,7 @@ export interface ExternalValue {
   attributes?: Attributes;
   attributeOverrides?: Attributes;
   derivedAttributes?: Record<string, Expression>;
-  linkedSources?: Record<string, { source: string; joinKeys: string[] }>;
+  linkedSources?: Record<string, LinkedSourceConfig>;
   delegates?: External[];
   concealBuckets?: boolean;
   mode?: QueryMode;
@@ -323,7 +418,7 @@ export interface ExternalJS {
   attributes?: AttributeJSs;
   attributeOverrides?: AttributeJSs;
   derivedAttributes?: Record<string, ExpressionJS>;
-  linkedSources?: Record<string, { source: string; joinKeys: string[] }>;
+  linkedSources?: Record<string, LinkedSourceConfigJS>;
   filter?: ExpressionJS;
   rawAttributes?: AttributeJSs;
   concealBuckets?: boolean;
@@ -832,6 +927,276 @@ export abstract class External {
     return pt as any;
   }
 
+  /**
+   * Project away a set of column names from a Dataset. Used by cross-source
+   * decomposition to strip synthetic join-key columns that served only as
+   * the in-memory join anchor. Keys and attributes are recomputed from the
+   * remaining columns.
+   */
+  /**
+   * Walk a filter expression and replace every atomic predicate whose free
+   * references are not all present in `schemaNames` with TRUE, then simplify.
+   * Atomic predicates are recognized structurally: any RefExpression appears
+   * inside a containing predicate (overlap/is/greaterThan/etc.), and the
+   * chainable's whole predicate is a single AND-leaf.
+   *
+   * Used when propagating a filter from one External to a peer that shares
+   * some but not all columns (e.g. main → linked source). Clauses that
+   * don't resolve in the target schema get dropped silently rather than
+   * blowing up reference-check with "could not resolve $<column>".
+   *
+   * The traversal stops at AND/OR/NOT boundaries: those are combinators,
+   * not predicates. We recurse into their operands and re-combine the
+   * pruned halves. Everything else is treated as an atomic predicate.
+   */
+  static pruneFilterToSchema(filter: Expression, schemaNames: Record<string, true>): Expression {
+    if (!filter) return filter;
+    if (filter.equals(Expression.TRUE) || filter.equals(Expression.FALSE)) return filter;
+
+    const op = (filter as any).op;
+
+    // Combinators: recurse into both halves. Only rebuild the combinator
+    // when one side actually changed — otherwise return the original
+    // filter so callers can detect "no-op prune" via reference equality
+    // and skip rewriting. Always-rebuilding triggers downstream refcheck
+    // state loss (the substitute in pruneLinkedFilterRefsInTree re-walks
+    // the new tree without the original's resolved type metadata).
+    if (op === 'and' || op === 'or') {
+      const origLeft: Expression = (filter as any).operand;
+      const origRight: Expression = (filter as any).expression;
+      const left = External.pruneFilterToSchema(origLeft, schemaNames);
+      const right = External.pruneFilterToSchema(origRight, schemaNames);
+      if (left === origLeft && right === origRight) return filter;
+      if (op === 'and') return left.and(right).simplify();
+      return left.or(right).simplify();
+    }
+
+    if (op === 'not') {
+      const origInner: Expression = (filter as any).operand;
+      const inner = External.pruneFilterToSchema(origInner, schemaNames);
+      if (inner === origInner) return filter;
+      return inner.not().simplify();
+    }
+
+    // Atomic predicate (overlap, is, greaterThan, contains, etc.): the
+    // semantic column the predicate targets is its `operand` — the left
+    // side of the comparison. If that's a RefExpression naming a column
+    // not in our schema, the predicate can't evaluate here and becomes
+    // TRUE (identity) for this side.
+    //
+    // Critically, we do NOT inspect `getFreeReferences()` because a
+    // well-formed predicate like `$color.is($col)` refers to `$col` as
+    // an outer-scope escalation — that ref resolves in the parent
+    // dataset, not in the current external's schema. Dropping the whole
+    // predicate because `$col` isn't a column here would break a
+    // pattern that Plywood users rely on.
+    const anyOp: any = filter;
+    const operand: Expression | undefined = anyOp.operand;
+    if (operand instanceof RefExpression && !schemaNames[operand.name]) {
+      return Expression.TRUE;
+    }
+    return filter;
+  }
+
+  /**
+   * Split a filter by which side of a cross-source decomposition can evaluate
+   * each clause. Returns `{ main, post }` where `main` is the subset pushable
+   * to the main sub-External's HAVING (Druid-side), and `post` is the subset
+   * that must be applied after the in-memory join (because it references
+   * apply names or split aliases routed to a linked sub-External).
+   *
+   * Algebra:
+   *   - AND combinator: recurse; each side's main/post halves combine
+   *     independently. A mixed-scope AND `(mainRef > 0) AND (linkedRef > 0)`
+   *     becomes `{ main: mainRef > 0, post: linkedRef > 0 }`.
+   *   - OR / NOT combinator: can't split — if the expression references any
+   *     post-join name anywhere, the whole thing must move post-join. Pushing
+   *     half of an OR down would over-prune the main side and silently drop
+   *     rows the join should have re-admitted via the post-join branch.
+   *   - Atomic predicate: the left operand's ref decides. If it names a
+   *     main-resolvable apply/split → stays on main. Otherwise → post-join.
+   *
+   * This is the per-clause decomposition Ogievetsky flagged as the correct
+   * move in 0f9cbf3 ("the correct thing to do would be to decompose the
+   * havingFilter into havingOnExternal1 AND havingOnExternal2"). His fix at
+   * that commit dropped external2's havingFilter pragmatically; here we do
+   * the full split.
+   */
+  static splitFilterByScope(
+    filter: Expression,
+    mainNames: Record<string, true>,
+  ): { main: Expression; post: Expression } {
+    if (!filter || filter.equals(Expression.TRUE)) {
+      return { main: Expression.TRUE, post: Expression.TRUE };
+    }
+    if (filter.equals(Expression.FALSE)) {
+      // FALSE on either side collapses the whole query. Keep it on main so
+      // Druid returns an empty set cheaply; post-join filtering would still
+      // produce the same result but after doing the join work.
+      return { main: Expression.FALSE, post: Expression.TRUE };
+    }
+
+    const op = (filter as any).op;
+
+    if (op === 'and') {
+      const l = External.splitFilterByScope((filter as any).operand, mainNames);
+      const r = External.splitFilterByScope((filter as any).expression, mainNames);
+      return {
+        main: l.main.and(r.main).simplify(),
+        post: l.post.and(r.post).simplify(),
+      };
+    }
+
+    if (op === 'or' || op === 'not') {
+      const refs = filter.getFreeReferences();
+      const allInMain = refs.every(r => mainNames[r]);
+      if (allInMain) return { main: filter, post: Expression.TRUE };
+      return { main: Expression.TRUE, post: filter };
+    }
+
+    const operand: Expression | undefined = (filter as any).operand;
+    if (operand instanceof RefExpression && !mainNames[operand.name]) {
+      return { main: Expression.TRUE, post: filter };
+    }
+    return { main: filter, post: Expression.TRUE };
+  }
+
+  /**
+   * Classify user split aliases against a cross-source boundary. Every
+   * alias is placed in exactly one bucket:
+   *
+   *   shared     → alias's free refs ⊆ joinKeys ∪ sharedDimensions.
+   *                Both sides group by it; the natural-join aligns
+   *                rows with equal values.
+   *   mainOnly   → refs resolve only in main's schema. The alias stays
+   *                on main; the join broadcasts its value across
+   *                matching linked rows.
+   *   linkedOnly → refs resolve only in the linked source's schema.
+   *                The alias stays on linked; main rows fan out into
+   *                multiple grid rows via the join.
+   *
+   * Refs that resolve on NEITHER side throw an error with an actionable
+   * message — the alias was written against columns the decomposition
+   * can't find.
+   *
+   * Refs that resolve on BOTH sides but were NOT declared as a shared
+   * dimension (or joinKey) ALSO throw: silently treating them as shared
+   * would change aggregation granularity based on a coincidence of
+   * naming. The caller MUST declare the intent via `sharedDimensions`.
+   *
+   * Constant-valued splits (zero free refs) are treated as shared — a
+   * literal expression evaluates identically on both sides.
+   */
+  static classifySplitAliases(
+    split: SplitExpression,
+    mainSchema: Record<string, true>,
+    linkedSchema: Record<string, true>,
+    config: LinkedSourceConfig,
+    linkedSourceName: string,
+  ): { shared: string[]; mainOnly: string[]; linkedOnly: string[]; foreignLinked: string[] } {
+    const shared: string[] = [];
+    const mainOnly: string[] = [];
+    const linkedOnly: string[] = [];
+    // `foreignLinked` — aliases whose refs resolve in neither main nor
+    // THIS linkedSource. They belong to a SIBLING linkedSource and will
+    // be classified in that sibling's own iteration. Reporting them
+    // separately (instead of throwing) is what makes cross-source
+    // queries over multiple linkedSources work: e.g. a query splitting
+    // on [brand_tier, competitor_size] where brand_tier lives in
+    // linkedSource A and competitor_size in B must not explode when
+    // A's classifier encounters competitor_size.
+    //
+    // The OUTER caller (getCrossExternalDecomposition) is responsible
+    // for asserting every alias got classified somewhere — a
+    // wholly-dangling alias (not in main, not in any linkedSource) is
+    // still an error, raised at the loop's tail.
+    const foreignLinked: string[] = [];
+
+    const declaredShared: Record<string, true> = {};
+    for (const k of config.joinKeys || []) declaredShared[k] = true;
+    for (const k of config.sharedDimensions || []) declaredShared[k] = true;
+
+    for (const alias of split.keys) {
+      const ex = split.splits[alias];
+      const refs = ex.getFreeReferences();
+
+      if (refs.length === 0) {
+        shared.push(alias);
+        continue;
+      }
+
+      const isDeclaredShared = refs.every(r => declaredShared[r]);
+      if (isDeclaredShared) {
+        shared.push(alias);
+        continue;
+      }
+
+      const inMain = refs.every(r => mainSchema[r]);
+      const inLinked = refs.every(r => linkedSchema[r]);
+
+      if (inMain && inLinked) {
+        throw new Error(
+          `Split alias "${alias}" refs [${refs.join(
+            ', ',
+          )}] resolve on both main and linked source "${linkedSourceName}" — declare them in \`sharedDimensions\` to use them as a shared split, or qualify the reference to a side-specific column. The engine refuses to infer shared-ness from schema overlap because same-named columns on different sides can legitimately carry different semantics.`,
+        );
+      }
+      if (inMain) {
+        mainOnly.push(alias);
+      } else if (inLinked) {
+        linkedOnly.push(alias);
+      } else {
+        // Belongs to a sibling linkedSource (or is truly dangling).
+        // Defer the decision to the outer loop, which sees every
+        // linkedSource's classification and can tell the two apart.
+        foreignLinked.push(alias);
+      }
+    }
+
+    return { shared, mainOnly, linkedOnly, foreignLinked };
+  }
+
+  /**
+   * Resolve the subset of joinKeys the engine may auto-inject as
+   * `__join_<key>` synthetic splits. Reads from `config.autoInjectJoinKeys`
+   * when declared; falls back to `config.joinKeys` (default: every join
+   * key is auto-injectable).
+   *
+   * Cubes with a TIME-typed joinKey that don't want per-snapshot row
+   * explosion declare a subset that excludes the time key.
+   */
+  static resolveAutoInjectJoinKeys(config: LinkedSourceConfig): string[] {
+    if (config.autoInjectJoinKeys) return config.autoInjectJoinKeys;
+    return config.joinKeys || [];
+  }
+
+  /**
+   * Resolve the join mode for a linked source. The cube declares it
+   * explicitly via `config.joinMode`; if omitted, the caller gets
+   * undefined and must decide whether to default or error.
+   */
+  static resolveLinkedJoinMode(config: LinkedSourceConfig): 'inner' | 'left' | undefined {
+    return config.joinMode;
+  }
+
+  static dropColumns(dataset: Dataset, drop: string[]): Dataset {
+    if (!drop || drop.length === 0) return dataset;
+    const dropSet: Record<string, true> = {};
+    for (const n of drop) dropSet[n] = true;
+    const nextData = dataset.data.map(d => {
+      const out: Datum = {};
+      for (const k in d) if (!dropSet[k]) out[k] = d[k];
+      return out;
+    });
+    const nextAttributes = (dataset.attributes || []).filter(a => !dropSet[a.name]);
+    const nextKeys = (dataset.keys || []).filter(k => !dropSet[k]);
+    return new Dataset({
+      attributes: nextAttributes,
+      keys: nextKeys.length ? nextKeys : undefined,
+      data: nextData,
+    });
+  }
+
   static jsToValue(parameters: ExternalJS, requester: PlywoodRequester<any>): ExternalValue {
     const value: ExternalValue = {
       engine: parameters.engine,
@@ -852,10 +1217,34 @@ export abstract class External {
       value.derivedAttributes = Expression.expressionLookupFromJS(parameters.derivedAttributes);
     }
     if (parameters.linkedSources) {
-      value.linkedSources = parameters.linkedSources;
+      value.linkedSources = {};
+      for (const name in parameters.linkedSources) {
+        const ls = parameters.linkedSources[name];
+        value.linkedSources[name] = {
+          source: ls.source,
+          joinKeys: ls.joinKeys,
+          autoInjectJoinKeys: ls.autoInjectJoinKeys,
+          sharedDimensions: ls.sharedDimensions,
+          joinMode: ls.joinMode,
+          attributes: ls.attributes ? AttributeInfo.fromJSs(ls.attributes) : undefined,
+          derivedAttributes: ls.derivedAttributes
+            ? Expression.expressionLookupFromJS(ls.derivedAttributes)
+            : undefined,
+          timeAlignment: ls.timeAlignment,
+        };
+      }
     }
 
     value.filter = parameters.filter ? Expression.fromJS(parameters.filter) : Expression.TRUE;
+    // The distinguished time column travels through this seam too.
+    // Without this line, a Druid SQL / Postgres / MySQL external whose
+    // cube declares `timeAttribute: 'time'` would silently lose the
+    // value at fromJS time — only `DruidExternal.fromJS` (the legacy
+    // native Druid path) was previously copying it across, which is
+    // why time-bound cubes worked there but not on the SQL transports.
+    if (typeof parameters.timeAttribute === 'string' && parameters.timeAttribute.length > 0) {
+      value.timeAttribute = parameters.timeAttribute;
+    }
 
     return value;
   }
@@ -918,6 +1307,161 @@ export abstract class External {
     return new ClassFn(parameters);
   }
 
+  /**
+   * When a datum contains an External that declares linkedSources, synthesize
+   * a sibling External for each linked source and inject it at the same scope.
+   *
+   * This mirrors the manual `ply().apply('main', main).apply('reviews', reviews)`
+   * pattern callers used to write by hand: the auto-decomposition pipeline
+   * downstream assumes every external referenced in the expression is
+   * directly addressable in the enclosing context.
+   *
+   * Idempotent: if a linked-source name is already bound in the datum (caller
+   * supplied it explicitly), we leave it untouched.
+   */
+  /**
+   * Pre-refcheck rewrite: for every `.filter(F)` applied to a ref whose
+   * name matches a declared linkedSource in the context, prune F to
+   * that source's schema. Without this pass, refcheck walks F against
+   * the linked source's type context and throws on the first ref that
+   * doesn't resolve (e.g. a main-only column like `$reference`).
+   *
+   * Algebraic justification: `$linked.filter(F)` where F references a
+   * column not in linked's schema is a type error — F can't be
+   * evaluated on a row from the linked side. The clause must be
+   * dropped (replaced with TRUE and simplified). The downstream join
+   * on shared or synthetic joinKeys propagates the main-side narrowing
+   * to the linked rows, so no information is lost.
+   *
+   * This runs BEFORE referenceCheck so malformed shapes the UI emits
+   * (where the client lacks schema awareness for the linked sources)
+   * get rewritten to their correct algebraic form before any type
+   * checking.
+   */
+  static pruneLinkedFilterRefsInTree(expression: Expression, context: Datum): Expression {
+    // Build a schema lookup for every External-named binding in the context —
+    // both the primary (usually `main`) and each declared linkedSource. A
+    // `.filter(F)` applied to any of those refs gets F pruned to that
+    // side's own schema, because a clause over a column the side doesn't
+    // have is identity there (the join on shared/synthetic joinKeys
+    // propagates main's narrowing to the linked rows, and vice-versa).
+    const schemas: Record<string, Record<string, true>> = {};
+    for (const k in context) {
+      const v = context[k];
+      if (!(v instanceof External)) continue;
+
+      // Primary binding (e.g. `main`) — schema is its own raw + derived attrs,
+      // PLUS timeAttribute. Druid SQL introspect emits the time column only
+      // as `timeAttribute` (never as a member of `attributes`); without
+      // adding it here the `pruneFilterToSchema` call below rewrites
+      // `$time.overlap(...)` to TRUE, the main sub-query goes to Druid with
+      // no time bound and `allowEternity: false`, and Druid throws
+      // "must filter on time unless the allowEternity flag is set".
+      const mainSchema: Record<string, true> = {};
+      for (const a of v.rawAttributes || []) mainSchema[a.name] = true;
+      for (const dk in v.derivedAttributes || {}) mainSchema[dk] = true;
+      const ta = (v as any).timeAttribute;
+      if (typeof ta === 'string' && ta.length > 0) mainSchema[ta] = true;
+      schemas[k] = mainSchema;
+
+      // Linked sources — their declared attributes + derivedAttributes
+      if (!v.linkedSources) continue;
+      for (const lsName in v.linkedSources) {
+        const ls = v.linkedSources[lsName];
+        const schema: Record<string, true> = {};
+        if (ls.attributes) for (const a of ls.attributes as any[]) schema[a.name] = true;
+        if (ls.derivedAttributes) for (const kk in ls.derivedAttributes) schema[kk] = true;
+        schemas[lsName] = schema;
+      }
+    }
+    if (Object.keys(schemas).length === 0) return expression;
+
+    return expression.substitute(e => {
+      // Target: .filter(F) whose operand is a RefExpression to a known source
+      if (!(e instanceof FilterExpression)) return null;
+      const op = e.operand;
+      if (!(op instanceof RefExpression)) return null;
+      const schema = schemas[op.name];
+      if (!schema) return null;
+      const originalFilter = e.expression;
+      const pruned = External.pruneFilterToSchema(originalFilter, schema);
+      if (pruned === originalFilter) return null;
+      return op.filter(pruned);
+    });
+  }
+
+  static expandLinkedSourcesInDatum(datum: Datum): Datum {
+    let expanded: Datum | null = null;
+    for (const k in datum) {
+      if (!hasOwnProp(datum, k)) continue;
+      const value = datum[k];
+      if (!(value instanceof External)) continue;
+      if (!value.linkedSources || Object.keys(value.linkedSources).length === 0) continue;
+
+      for (const lsName in value.linkedSources) {
+        if (lsName === k) continue;
+        if (hasOwnProp(datum, lsName)) continue;
+        if (expanded && hasOwnProp(expanded, lsName)) continue;
+
+        const ls = value.linkedSources[lsName];
+        const normalizedAttrs: Attributes | undefined = ls.attributes
+          ? (ls.attributes as any[]).map(a =>
+              a instanceof AttributeInfo ? a : AttributeInfo.fromJS(a),
+            )
+          : undefined;
+        let normalizedDerived: Record<string, Expression> | undefined;
+        if (ls.derivedAttributes) {
+          normalizedDerived = {};
+          for (const k in ls.derivedAttributes) {
+            const v = (ls.derivedAttributes as any)[k];
+            normalizedDerived[k] = v instanceof Expression ? v : Expression.fromJSLoose(v);
+          }
+        }
+        // Prune main.filter to only the clauses whose free references exist
+        // in the linked schema. A filter like `$__time.overlap(...) AND
+        // $reference.is(...)` on main is meaningful for main only — the
+        // linked side has no `reference` column. Applying it unfiltered to
+        // the synthesized peer would fail reference-check and blow up the
+        // whole query even though the user's intent was only to narrow the
+        // main-side rows.
+        const linkedNames: Record<string, true> = {};
+        if (normalizedAttrs) {
+          for (const a of normalizedAttrs) linkedNames[a.name] = true;
+        }
+        if (normalizedDerived) {
+          for (const k in normalizedDerived) linkedNames[k] = true;
+        }
+        const prunedFilter = External.pruneFilterToSchema(value.filter, linkedNames);
+
+        const linkedValue: ExternalValue = {
+          engine: value.engine,
+          version: value.version,
+          source: ls.source,
+          suppress: true,
+          rollup: value.rollup,
+          concealBuckets: value.concealBuckets,
+          requester: value.requester,
+          attributes: normalizedAttrs,
+          derivedAttributes: normalizedDerived,
+          filter: prunedFilter,
+          timeAttribute: (value as any).timeAttribute,
+          customAggregations: (value as any).customAggregations,
+          customTransforms: (value as any).customTransforms,
+          allowEternity: (value as any).allowEternity,
+          allowSelectQueries: (value as any).allowSelectQueries,
+          exactResultsOnly: (value as any).exactResultsOnly,
+          querySelection: (value as any).querySelection,
+          context: (value as any).context,
+        };
+        const linkedExt = External.fromValue(linkedValue);
+
+        if (!expanded) expanded = { ...datum };
+        expanded[lsName] = linkedExt;
+      }
+    }
+    return expanded || datum;
+  }
+
   public engine: string;
   public version: string;
   public source: string | string[];
@@ -926,7 +1470,19 @@ export abstract class External {
   public attributes: Attributes = null;
   public attributeOverrides: Attributes = null;
   public derivedAttributes: Record<string, Expression>;
-  public linkedSources: Record<string, { source: string; joinKeys: string[] }>;
+  public linkedSources: Record<string, LinkedSourceConfig>;
+  // The distinguished time column for this external. Druid native
+  // (`DruidExternal`) re-declared this for legacy reasons; lifting it
+  // here makes every transport (Druid SQL, Postgres, MySQL, …) honour
+  // the timeAttribute uniformly. Without it, a cube that declares
+  // `timeAttribute: 'time'` to a Druid-SQL external simply forgets the
+  // value, and any `$time`-referencing expression fails
+  // `expressionDefined` because `getRawFullType` has no entry for the
+  // time column. The downstream symptom is "must filter on time unless
+  // the allowEternity flag is set" raised by Druid when the absorbed
+  // filter never made it into the SQL.
+  public timeAttribute: string | undefined;
+
   public delegates: External[];
   public concealBuckets: boolean;
 
@@ -972,6 +1528,14 @@ export abstract class External {
       this.delegates = parameters.delegates;
     }
     this.concealBuckets = parameters.concealBuckets;
+    // Lifted here so SQL externals (DruidSQLExternal in particular)
+    // honour the timeAttribute the cube declares. DruidExternal still
+    // re-assigns this in its own constructor with a fallback to
+    // DruidExternal.TIME_ATTRIBUTE; that overwrite is benign — the
+    // DruidExternal subclass runs after super() and its assignment wins.
+    if (typeof parameters.timeAttribute === 'string' && parameters.timeAttribute.length > 0) {
+      this.timeAttribute = parameters.timeAttribute;
+    }
 
     this.rawAttributes = parameters.rawAttributes || parameters.attributes || [];
     this.requester = parameters.requester;
@@ -1047,6 +1611,7 @@ export abstract class External {
     if (nonEmptyLookup(this.linkedSources)) value.linkedSources = this.linkedSources;
     if (this.delegates) value.delegates = this.delegates;
     value.concealBuckets = this.concealBuckets;
+    if (this.timeAttribute) value.timeAttribute = this.timeAttribute;
 
     if (this.mode !== 'raw' && this.rawAttributes) {
       value.rawAttributes = this.rawAttributes;
@@ -1100,6 +1665,11 @@ export abstract class External {
       js.derivedAttributes = Expression.expressionLookupToJS(this.derivedAttributes);
     if (nonEmptyLookup(this.linkedSources)) js.linkedSources = this.linkedSources;
     if (this.concealBuckets) js.concealBuckets = true;
+    // timeAttribute round-trips on toJS for SQL externals (Druid SQL,
+    // Postgres, MySQL). DruidExternal overrides this method and re-emits
+    // it under its legacy "skip if equal to '__time'" rule; that override
+    // wins because it runs after super().toJS().
+    if (this.timeAttribute && this.engine !== 'druid') js.timeAttribute = this.timeAttribute;
 
     if (this.mode !== 'raw' && this.rawAttributes)
       js.rawAttributes = AttributeInfo.toJSs(this.rawAttributes);
@@ -1306,6 +1876,9 @@ export abstract class External {
     value.mode = 'total';
     value.suppress = false;
     value.rawAttributes = value.attributes;
+    // Only called with homogeneous externals (same base). The caller in
+    // Dataset.ts groups applies by equalBase() before invoking this path, so
+    // a schema-safe merge of derivedAttributes is guaranteed.
     value.derivedAttributes = External.getMergedDerivedAttributesFromExternals(externals);
     value.filter = commonFilter;
     value.attributes = [];
@@ -1540,9 +2113,27 @@ export abstract class External {
 
       const applyExpression = apply.expression;
       if (applyExpression instanceof ExternalExpression) {
-        apply = apply.changeExpression(
-          applyExpression.external.valueExpressionWithinFilter(this.filter),
-        );
+        // When the apply IS a whole external, there are two cases:
+        //   - equalBase(other): same datasource seen through another lens
+        //     (filter etc.) — collapse into our own SQL via valueExpression.
+        //   - !equalBase(other) AND other is one of our linkedSources: leave
+        //     the ExternalExpression intact so getCrossExternalDecomposition
+        //     can route this apply to the foreign sub-query downstream.
+        let isDeclaredLinked = false;
+        if (this.linkedSources) {
+          const foreignSource = String(applyExpression.external.source);
+          for (const lsName in this.linkedSources) {
+            if (String(this.linkedSources[lsName].source) === foreignSource) {
+              isDeclaredLinked = true;
+              break;
+            }
+          }
+        }
+        if (!isDeclaredLinked) {
+          apply = apply.changeExpression(
+            applyExpression.external.valueExpressionWithinFilter(this.filter),
+          );
+        }
       }
 
       value = this.valueOf();
@@ -1771,6 +2362,51 @@ export abstract class External {
       return delegate.simulateValue(lastNode, simulatedQueries, externalForNext);
     }
 
+    // Cross-external decomposition: when foreign applies are present, simulate
+    // a query per sub-external. The synthetic dataset keeps the combined shape
+    // so downstream consumers see the post-join schema. queryBasicValueStream
+    // has the equivalent wiring for the async path.
+    const crossExt = this.getCrossExternalDecomposition();
+    if (crossExt) {
+      crossExt.mainExternal.simulateValue(lastNode, simulatedQueries, externalForNext);
+      for (const le of crossExt.linkedExternals) {
+        le.external.simulateValue(lastNode, simulatedQueries, externalForNext);
+      }
+      // Synthesize a representative Dataset: split keys + all applies (main + linked)
+      const datum: Datum = {};
+      this.split.mapSplits((name, expression) => {
+        datum[name] = getSampleValue(Set.unwrapSetType(expression.type), expression);
+      });
+      for (const apply of this.applies) {
+        datum[apply.name] = getSampleValue(apply.expression.type, apply.expression);
+      }
+      return new Dataset({ keys: this.split.mapSplits(name => name), data: [datum] });
+    }
+
+    // Time-shift decomposition (Ogievetsky's groupAppliesByTimeFilterValue):
+    // when two apply groups differ only by an overlap filter on the time
+    // ref, split into two sub-Externals — one per period. queryBasicValue
+    // Stream does this via leftJoin/fullJoin; simulation just needs each
+    // sub-query pushed so callers can assert on query count and shape.
+    const timeDecomposed = this.getJoinDecompositionShortcut();
+    if (timeDecomposed) {
+      timeDecomposed.external1.simulateValue(lastNode, simulatedQueries, externalForNext);
+      timeDecomposed.external2.simulateValue(lastNode, simulatedQueries, externalForNext);
+      const datum: Datum = {};
+      if (this.split) {
+        this.split.mapSplits((name, expression) => {
+          datum[name] = getSampleValue(Set.unwrapSetType(expression.type), expression);
+        });
+      }
+      for (const apply of this.applies || []) {
+        datum[apply.name] = getSampleValue(apply.expression.type, apply.expression);
+      }
+      return new Dataset({
+        keys: this.split ? this.split.mapSplits(name => name) : null,
+        data: [datum],
+      });
+    }
+
     simulatedQueries.push(this.getQueryAndPostTransform().query);
 
     if (mode === 'value') {
@@ -1834,6 +2470,71 @@ export abstract class External {
   }
 
   protected queryBasicValueStream(rawQueries: any[] | null): ReadableStream {
+    const crossExt = this.getCrossExternalDecomposition();
+    if (crossExt) {
+      const mainPromise = External.buildValueFromStream(
+        crossExt.mainExternal.queryBasicValueStream(rawQueries),
+      );
+      const linkedPromises = crossExt.linkedExternals.map(le =>
+        External.buildValueFromStream(le.external.queryBasicValueStream(rawQueries)),
+      );
+      return External.valuePromiseToStream(
+        Promise.all([mainPromise, ...linkedPromises]).then(([main, ...linked]) => {
+          // If main is a totals-only dataset (no split keys), its rows
+          // broadcast onto every linked row. Dataset.join's auto-dispatch
+          // only handles "other's keys ⊂ this.keys" as broadcast — for the
+          // inverse case (this.keys empty, other has keys) we must call
+          // join from the linked side so the matcher sees main as a
+          // broadcastable subset.
+          const mainIsTotals = !(main as Dataset).keys || (main as Dataset).keys.length === 0;
+          let joined: Dataset;
+          // Per-source join mode comes from the decomposition — each
+          // linked sub declared its own 'inner' | 'left' via config.
+          // Mixed modes are fine: the first linked's mode governs the
+          // main↔first join, subsequent sides apply their own mode
+          // against the accumulating joined Dataset.
+          if (mainIsTotals && linked.length > 0) {
+            joined = linked[0] as Dataset;
+            joined = joined.join(main as Dataset, crossExt.linkedExternals[0].joinMode);
+            for (let i = 1; i < linked.length; i++) {
+              joined = joined.join(linked[i] as Dataset, crossExt.linkedExternals[i].joinMode);
+            }
+          } else {
+            joined = main as Dataset;
+            for (let i = 0; i < linked.length; i++) {
+              joined = joined.join(linked[i] as Dataset, crossExt.linkedExternals[i].joinMode);
+            }
+          }
+          // Apply the post-join HAVING before sort/limit so sort ordering
+          // reflects only the surviving rows, and limit caps against the
+          // filtered result — not the pre-filter row count (which would
+          // silently under-return rows). Plywood's predicate evaluation
+          // now treats null/undefined operands as NULL (SQL semantics —
+          // any comparison with NULL is NULL, falsy in HAVING), so no
+          // defensive wrapping is needed: a left-join orphan row with
+          // undefined linked-apply columns fails the predicate naturally
+          // and gets dropped.
+          if (crossExt.postJoinHavingFilter) {
+            joined = joined.filter(crossExt.postJoinHavingFilter);
+          }
+          if (crossExt.postJoinSort) {
+            joined = joined.sort(crossExt.postJoinSort.expression, crossExt.postJoinSort.direction);
+          }
+          if (crossExt.postJoinLimit) {
+            joined = joined.limit(crossExt.postJoinLimit.value);
+          }
+          // Drop synthetic join-key columns the decomposition inserted so the
+          // caller sees only the columns the user asked for. These columns
+          // served purely as the algebraic anchor for the in-memory join and
+          // carry no user-facing meaning.
+          if (crossExt.syntheticJoinAliases && crossExt.syntheticJoinAliases.length > 0) {
+            joined = External.dropColumns(joined, crossExt.syntheticJoinAliases);
+          }
+          return joined;
+        }),
+      );
+    }
+
     const decomposed = this.getJoinDecompositionShortcut();
     if (decomposed) {
       const { waterfallFilterExpression } = decomposed;
@@ -2019,9 +2720,47 @@ export abstract class External {
       }
     }
 
-    // Register linked sources as DATASET refs so $reviews resolves in type checking
+    // Druid SQL externals declare their time column ONLY via the
+    // `timeAttribute` field — it is not duplicated into `attributes`.
+    // Surface it in the type context so `$time`-referencing expressions
+    // (the cube's own time filter, in particular) pass `definedInTypeContext`
+    // and absorb correctly into `External.filter`. Without this, a
+    // `$main.filter($time.overlap(...))` on a cube with linkedSources fails
+    // `_addFilterExpression`'s `expressionDefined` check, the filter is
+    // never absorbed, and the main sub-query reaches Druid with no time
+    // bound — which Druid rejects as "must filter on time unless the
+    // allowEternity flag is set". The first declaration wins on name
+    // collision (rawAttributes already populated above), so explicitly
+    // listing `time` in attributes — as fixtures sometimes do — keeps the
+    // explicit type and we don't override it.
+    const ta = (this as any).timeAttribute;
+    if (typeof ta === 'string' && ta.length > 0 && !(ta in myDatasetType)) {
+      myDatasetType[ta] = { type: 'TIME' };
+    }
+
+    // Flat-expose linked source attributes at main's top level so expressions
+    // like $title (a column that lives only in `reviews`) type-check against
+    // this external. Main attributes win on name collisions (the column is
+    // physically main's); shared columns (joinKeys) are already present from
+    // rawAttributes and we don't overwrite them. getCrossExternalDecomposition
+    // partitions splits/applies by source at execute time and strips linked-
+    // only keys from main's SQL path.
     for (const name in this.linkedSources) {
-      myDatasetType[name] = { type: 'DATASET', datasetType: {} };
+      const ls = this.linkedSources[name];
+      if (ls.attributes) {
+        for (const attr of ls.attributes) {
+          if (!(attr.name in myDatasetType)) {
+            myDatasetType[attr.name] = { type: <PlyTypeSimple>attr.type };
+          }
+        }
+      }
+      if (ls.derivedAttributes) {
+        for (const key in ls.derivedAttributes) {
+          if (!(key in myDatasetType)) {
+            myDatasetType[key] = { type: <PlyTypeSimple>ls.derivedAttributes[key].type };
+          }
+        }
+      }
     }
 
     return {
@@ -2053,12 +2792,8 @@ export abstract class External {
       };
     }
 
-    // Surface linked sources at the top level so $reviews resolves in applies after split
-    if (myFullType.datasetType) {
-      for (const name in this.linkedSources) {
-        myFullType.datasetType[name] = { type: 'DATASET', datasetType: {} };
-      }
-    }
+    // See the note in getRawFullType: linkedSources are NOT registered here
+    // either. Resolution is via peer externals at the enclosing datum scope.
 
     return myFullType;
   }
@@ -2249,5 +2984,623 @@ export abstract class External {
     }
 
     return null;
+  }
+
+  /**
+   * Cross-external decomposition: when a main-rooted split carries applies
+   * that reference foreign Externals (e.g. $reviews.average($rating) on a
+   * $main split), partition the applies into per-external sub-plans that
+   * can each be answered by a single datasource query. The caller joins
+   * the results on the shared split keys.
+   *
+   * Returns `null` whenever the query is either single-external or is a
+   * shape we can't decompose safely — the outer pipeline then falls through
+   * to the normal single-query path (which may itself fail at SQL time;
+   * that's expected, the pre-existing behavior, and easier to debug).
+   *
+   * Mirrors the layout of getJoinDecompositionShortcut above.
+   */
+  public getCrossExternalDecomposition(): {
+    mainExternal: External;
+    linkedExternals: {
+      name: string;
+      external: External;
+      joinKeys: string[];
+      joinMode: 'inner' | 'left';
+    }[];
+    postJoinSort?: SortExpression;
+    postJoinLimit?: LimitExpression;
+    // Aliases the decomposition itself inserted into both sides' splits so
+    // the join has something to align on (declared joinKeys from the linked
+    // source's config). These are implementation detail — the execution
+    // layer drops them from the final dataset so the caller sees only the
+    // columns they asked for.
+    syntheticJoinAliases?: string[];
+    // HAVING clauses that reference apply names or split aliases routed to
+    // a linked sub-External. They can't be pushed into the main side's
+    // Druid SQL (the column doesn't exist there) so the execution layer
+    // applies them against the joined Dataset after the in-memory join,
+    // before postJoinSort / postJoinLimit run.
+    postJoinHavingFilter?: Expression;
+  } | null {
+    if (this.mode !== 'split') return null;
+    if (!this.applies || this.applies.length === 0) return null;
+    if (!this.linkedSources || Object.keys(this.linkedSources).length === 0) return null;
+
+    // Index linkedSources by source-string so we can match foreign ExternalExpressions back
+    // to their declared linked-source name. Source is the stable identity.
+    const linkedByMaterializedSource = new Map<string, { name: string; config: any }>();
+    for (const name in this.linkedSources) {
+      linkedByMaterializedSource.set(String(this.linkedSources[name].source), {
+        name,
+        config: this.linkedSources[name],
+      });
+    }
+
+    // For each apply, collect the set of foreign linked-source names it touches.
+    // A foreign reference is any ExternalExpression whose external's source does
+    // not match ours. Zero foreign refs → main-side apply. One foreign ref →
+    // that linked side. Two+ → this apply mixes sources, we can't decompose.
+    const mainApplies: ApplyExpression[] = [];
+    const linkedAppliesByName: Record<string, ApplyExpression[]> = {};
+    // Capture the first foreign ExternalExpression instance we see per linked
+    // name — we'll reuse its (already time-filtered, schema-complete) external
+    // as the base for the sub-query. This avoids having to synthesize a fresh
+    // linked External from scratch here.
+    const foreignTemplateByName: Record<string, External> = {};
+
+    for (const apply of this.applies) {
+      // Dataset applies (e.g. .apply('reviews', $reviews.filter(F))) are
+      // scope registrations — they declare that a source is reachable at
+      // this ply level, not that it contributes a value to the output. We
+      // treat them as main-side so they're kept intact and don't trigger
+      // decomposition on their own. Only value-returning aggregates pull
+      // the query into cross-source territory.
+      if (apply.expression.type === 'DATASET') {
+        mainApplies.push(apply);
+        continue;
+      }
+
+      const foreignNames: Record<string, true> = {};
+      apply.expression.forEach(sub => {
+        if (!(sub instanceof ExternalExpression)) return;
+        if (this.equalBase(sub.external)) return;
+        const hit = linkedByMaterializedSource.get(String(sub.external.source));
+        if (!hit) return; // a foreign external that isn't a declared linkedSource — leave it
+        foreignNames[hit.name] = true;
+        if (!foreignTemplateByName[hit.name]) foreignTemplateByName[hit.name] = sub.external;
+      });
+
+      const foreignKeys = Object.keys(foreignNames);
+      if (foreignKeys.length === 0) {
+        mainApplies.push(apply);
+      } else if (foreignKeys.length === 1) {
+        (linkedAppliesByName[foreignKeys[0]] ||= []).push(apply);
+      } else {
+        return null;
+      }
+    }
+
+    // A cross-source query is triggered by either of two signals:
+    //
+    //   1. A VALUE apply whose expression aggregates from a declared linked
+    //      source (a semantic output contribution).
+    //   2. A split alias whose free refs resolve only in a linked source's
+    //      attributes (the user grouped by a column that main can't see).
+    //
+    // Signal (2) was removed at one point because, without auto-inject, it
+    // produced a misleading "no shared joinKey" error from our own layer.
+    // Now that sharedAliases.length === 0 is handled by synthesizing the
+    // joinKeys, the schema-driven trigger is safe again — and necessary:
+    // without it, a query like `.split($content)` where `content` only
+    // lives in reviews would be handed to the main side and rejected by
+    // Druid with "column not found", even though the query has a
+    // well-defined cross-source meaning.
+    const involvedLinkedNames: Record<string, true> = Object.keys(linkedAppliesByName).reduce(
+      (acc, n) => ((acc[n] = true), acc),
+      {} as Record<string, true>,
+    );
+    for (const alias of this.split.keys) {
+      const ex = this.split.splits[alias];
+      const refs = ex.getFreeReferences();
+      if (refs.length === 0) continue;
+      // Main-resolvable names: rawAttributes ∪ derivedAttributes ∪
+      // timeAttribute. Without timeAttribute here, a split on the time
+      // column would be classified as "not in main" and routed to a
+      // linkedSource — falsely triggering cross-source decomposition or
+      // throwing "dangling alias" depending on what the linked side
+      // declares.
+      const mainAttrs: Record<string, true> = {};
+      for (const a of this.rawAttributes || []) mainAttrs[a.name] = true;
+      for (const k in this.derivedAttributes) mainAttrs[k] = true;
+      const ta = (this as any).timeAttribute;
+      if (typeof ta === 'string' && ta.length > 0) mainAttrs[ta] = true;
+      const anyInMain = refs.some(r => mainAttrs[r]);
+      for (const lsName in this.linkedSources) {
+        const ls = this.linkedSources[lsName];
+        const linkedAttrs: Record<string, true> = {};
+        if (ls.attributes) for (const a of ls.attributes as any[]) linkedAttrs[a.name] = true;
+        if (ls.derivedAttributes) for (const k in ls.derivedAttributes) linkedAttrs[k] = true;
+        const allInLinked = refs.every(r => linkedAttrs[r]);
+        if (allInLinked && !anyInMain) involvedLinkedNames[lsName] = true;
+      }
+    }
+    if (Object.keys(involvedLinkedNames).length === 0) return null;
+
+    const linkedExternals: {
+      name: string;
+      external: External;
+      joinKeys: string[];
+      joinMode: 'inner' | 'left';
+    }[] = [];
+
+    // Track which aliases of `this.split` got routed to SOME
+    // classification (main/shared/linkedOnly) across any iteration.
+    // After the loop, any alias never classified anywhere is truly
+    // dangling — surfaced as a clear error below instead of silently
+    // producing an incomplete join.
+    const everClassifiedAliases: Record<string, true> = {};
+
+    // Once we commit to decomposing, any further inability to materialize
+    // sub-queries is a hard error — falling back to the single-query path
+    // would silently corrupt the result by pretending the foreign ref is
+    // a native column. Clear errors > silent wrong data.
+    for (const lsName in involvedLinkedNames) {
+      const config = this.linkedSources[lsName];
+      // A main split alias is valid on the linked side iff every free
+      // Always synthesize a fresh RAW linked external — the one captured during
+      // apply-absorption is in 'value' mode (it already absorbed an aggregate)
+      // and can't re-accept a split. Same recipe as expandLinkedSourcesInDatum.
+      // Normalize attributes/derivedAttributes: callers may have passed plain
+      // JS objects (turnilo does), so coerce to AttributeInfo[] / Expression[]
+      // unless they are already.
+      const normalizedAttributes: Attributes | undefined = config.attributes
+        ? (config.attributes as any[]).map(a =>
+            a instanceof AttributeInfo ? a : AttributeInfo.fromJS(a),
+          )
+        : undefined;
+      let normalizedDerived: Record<string, Expression> | undefined;
+      if (config.derivedAttributes) {
+        normalizedDerived = {};
+        for (const k in config.derivedAttributes) {
+          const v = (config.derivedAttributes as any)[k];
+          normalizedDerived[k] = v instanceof Expression ? v : Expression.fromJSLoose(v);
+        }
+      }
+      // Prune the inherited filter to the linked side's schema — main's
+      // filter may reference columns only in main's own rawAttributes
+      // (e.g. `reference`), and those clauses are identity on the linked
+      // side. The join on shared/synthetic joinKeys propagates main's
+      // extra narrowing into the linked rows.
+      //
+      // `timeAlignment` on the linkedSource config opts out of
+      // propagating main's __time clause:
+      //   - undefined / "bucketed" — __time stays in linkedSchemaNames;
+      //     the filter clause survives the prune and reaches the lookup.
+      //   - "eternal"              — the timeAttribute is deliberately
+      //     withheld so `pruneFilterToSchema` treats its refs as
+      //     out-of-scope and rewrites them to TRUE. Used when the
+      //     lookup is a materialised snapshot whose rows carry a
+      //     sentinel __time (e.g. 1970) and main's interval would
+      //     return zero rows.
+      const timeAttrName =
+        (typeof (this as any).getTimeAttribute === 'function'
+          ? (this as any).getTimeAttribute()
+          : undefined) || (this as any).timeAttribute;
+      const timeAlignment = (config as any).timeAlignment;
+      const linkedSchemaNames: Record<string, true> = {};
+      if (normalizedAttributes) {
+        for (const a of normalizedAttributes) {
+          if (timeAlignment === 'eternal' && a.name === timeAttrName) continue;
+          linkedSchemaNames[a.name] = true;
+        }
+      }
+      if (normalizedDerived) {
+        for (const k in normalizedDerived) {
+          if (timeAlignment === 'eternal' && k === timeAttrName) continue;
+          linkedSchemaNames[k] = true;
+        }
+      }
+      const templateFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames);
+      // When `timeAlignment: "eternal"` strips the time clause, the
+      // resulting Druid query has no __time bound and would throw
+      // "must filter on time unless the allowEternity flag is set".
+      // Force-enable allowEternity on the template: declaring the
+      // linked source eternal is declaring this permission too.
+      const templateAllowEternity =
+        timeAlignment === 'eternal' ? true : (this as any).allowEternity;
+
+      const template = External.fromValue({
+        engine: this.engine,
+        version: this.version,
+        source: config.source,
+        suppress: true,
+        rollup: this.rollup,
+        concealBuckets: this.concealBuckets,
+        requester: this.requester,
+        attributes: normalizedAttributes,
+        derivedAttributes: normalizedDerived,
+        filter: templateFilter,
+        timeAttribute: (this as any).timeAttribute,
+        customAggregations: (this as any).customAggregations,
+        customTransforms: (this as any).customTransforms,
+        allowEternity: templateAllowEternity,
+        allowSelectQueries: (this as any).allowSelectQueries,
+        exactResultsOnly: (this as any).exactResultsOnly,
+        querySelection: (this as any).querySelection,
+        context: (this as any).context,
+      });
+      // A linked attribute set for this source — names that exist in the
+      // linked external's schema (attributes + derivedAttributes) but not
+      // necessarily as joinKeys. Used to classify split aliases whose refs
+      // are linked-only (meaningful on that side but not on main).
+      const linkedAttrs: Record<string, true> = {};
+      if (config.attributes) {
+        for (const a of config.attributes as any[]) linkedAttrs[a.name] = true;
+      }
+      if (config.derivedAttributes) {
+        for (const k in config.derivedAttributes) linkedAttrs[k] = true;
+      }
+      // Main's own schema (rawAttributes + derivedAttributes + timeAttribute)
+      // — used to classify splits that are main-compatible. rawAttributes is
+      // populated from attributes via the constructor; timeAttribute is
+      // declared separately on Druid SQL externals and must be added in
+      // explicitly so a split on the time column is recognised as main-side.
+      const mainAttrs: Record<string, true> = {};
+      for (const a of this.rawAttributes || []) mainAttrs[a.name] = true;
+      for (const k in this.derivedAttributes) mainAttrs[k] = true;
+      const ta = (this as any).timeAttribute;
+      if (typeof ta === 'string' && ta.length > 0) mainAttrs[ta] = true;
+
+      // Delegate to the declarative classifier. The classifier reads
+      // `config.sharedDimensions` for dimensions that live on both sides
+      // with the same meaning, and refuses to silently infer shared-ness
+      // from schema overlap — an actionable error fires when the user's
+      // intent is ambiguous. See External.classifySplitAliases.
+      const classified = External.classifySplitAliases(
+        this.split,
+        mainAttrs,
+        linkedAttrs,
+        config,
+        lsName,
+      );
+      const sharedAliases: string[] = [...classified.shared];
+      const mainOnlyAliases: string[] = [...classified.mainOnly];
+      const linkedOnlyAliases: string[] = [...classified.linkedOnly];
+      // Record what this iteration classified. Foreign-linked aliases
+      // (classifier returned them in `foreignLinked`) are deliberately
+      // NOT recorded here — they belong to a sibling iteration. Only
+      // at the post-loop guard do we assert every alias was covered
+      // somewhere.
+      for (const a of sharedAliases) everClassifiedAliases[a] = true;
+      for (const a of mainOnlyAliases) everClassifiedAliases[a] = true;
+      for (const a of linkedOnlyAliases) everClassifiedAliases[a] = true;
+      // Zero shared splits AND main/linked contributions exist → auto-inject
+      // one split per declared joinKey onto both sides. The user didn't pick
+      // a shared dimension, but the cube's joinKeys config says "this pair of
+      // columns is the canonical identity for the join". We wire them in as
+      // synthetic splits `__join_<key>` on each side and drop them from the
+      // final projection post-join — the caller sees only the columns they
+      // asked for.
+      //
+      // Semantics note: the effective granularity of the result is the cross
+      // product of user splits × joinKey tuples. For cubes where a joinKey
+      // like `partitionId` identifies a product that maps 1:1 to the user's
+      // dimensions (ean, etc.), this is the expected "one row per product"
+      // behavior. For cubes where that's not true, the user should include
+      // an explicit shared dimension to make their intended granularity
+      // explicit.
+      const syntheticAliasesForThisSource: string[] = [];
+      const syntheticSplits: Record<string, Expression> = {};
+      const syntheticSplitsLinked: Record<string, Expression> = {};
+      if (sharedAliases.length === 0 && (config.joinKeys || []).length > 0) {
+        // Resolve the key's type per side — main and linked may store the
+        // same logical identifier with different native types (BIGINT vs
+        // VARCHAR is common when one side stores the key raw and the other
+        // derives it from a string column). We build each side's synthetic
+        // ref with its side-local type so addExpression accepts the split,
+        // and cast to STRING as the join medium so the in-memory matcher
+        // aligns the rows regardless of native storage. STRING is the
+        // common denominator — any joinKey can round-trip through it.
+        const mainTypeForKey: Record<string, PlyType> = {};
+        for (const a of this.rawAttributes || []) mainTypeForKey[a.name] = a.type;
+        for (const k in this.derivedAttributes) {
+          const dtype = (this.derivedAttributes[k] as any).type;
+          if (dtype) mainTypeForKey[k] = dtype;
+        }
+        // Include timeAttribute — when a joinKey happens to be the time
+        // column, the main-side type lookup must resolve it as TIME so the
+        // synthetic split rebuilds with the correct native type before the
+        // join cast to STRING.
+        const taKey = (this as any).timeAttribute;
+        if (typeof taKey === 'string' && taKey.length > 0) mainTypeForKey[taKey] = 'TIME';
+        const linkedTypeForKey: Record<string, PlyType> = {};
+        if (config.attributes) {
+          for (const a of config.attributes as any[]) linkedTypeForKey[a.name] = a.type;
+        }
+        if (config.derivedAttributes) {
+          // derivedAttributes may be string formulas or parsed Expressions;
+          // their concrete type is whatever their formula resolves to on
+          // the linked side's rawAttributes. For join purposes we cast to
+          // STRING, so we only need a non-null placeholder here.
+          for (const k in config.derivedAttributes) {
+            if (!linkedTypeForKey[k]) linkedTypeForKey[k] = 'STRING';
+          }
+        }
+        // Iterate exactly the subset declared as auto-injectable. The
+        // cube owns this decision via `config.autoInjectJoinKeys`: keys
+        // listed here become synthetic `__join_<key>` splits; keys
+        // omitted remain legitimate join anchors for user-chosen
+        // explicit shared splits but are never auto-added. Default:
+        // everything in joinKeys is auto-injectable.
+        const injectableKeys = External.resolveAutoInjectJoinKeys(config);
+        for (const key of injectableKeys) {
+          const alias = `__join_${key}`;
+          if (this.split.splits[alias]) continue; // collision (unlikely) — skip
+          const mainRef = $(key, mainTypeForKey[key] || 'STRING');
+          const linkedRef = $(key, linkedTypeForKey[key] || 'STRING');
+          syntheticSplits[alias] = mainRef.cast('STRING');
+          syntheticSplitsLinked[alias] = linkedRef.cast('STRING');
+          syntheticAliasesForThisSource.push(alias);
+          sharedAliases.push(alias);
+        }
+      }
+
+      // Linked side: shared splits (including synthetic) + this source's linked-only splits
+      let linkedExternal: External = template;
+      const linkedSplitMap: Record<string, Expression> = {};
+      for (const a of sharedAliases) {
+        // For synthetic joinKey splits use the linked-side variant so the
+        // ref carries this side's native type. User-picked shared splits
+        // are the same expression on both sides and reuse this.split.splits.
+        linkedSplitMap[a] = this.split.splits[a] || syntheticSplitsLinked[a] || syntheticSplits[a];
+      }
+      for (const a of linkedOnlyAliases) linkedSplitMap[a] = this.split.splits[a];
+      if (Object.keys(linkedSplitMap).length === 0) {
+        throw new Error(
+          `Cross-source query for "${lsName}" produced no usable split on the linked side`,
+        );
+      }
+      linkedExternal = linkedExternal.addExpression(this.split.changeSplits(linkedSplitMap));
+      if (!linkedExternal) {
+        throw new Error(
+          `Linked source "${lsName}" rejected its share of splits [${Object.keys(
+            linkedSplitMap,
+          ).join(', ')}] — the expressions must resolve in its schema`,
+        );
+      }
+
+      for (const apply of linkedAppliesByName[lsName] || []) {
+        const next = linkedExternal.addExpression(apply);
+        if (!next) {
+          throw new Error(
+            `Linked source "${lsName}" rejected apply "${apply.name}" — the aggregate's refs must resolve in its schema`,
+          );
+        }
+        linkedExternal = next;
+      }
+
+      // Resolve join mode per linked source. The cube MUST declare this
+      // explicitly via config.joinMode — without a default, the engine
+      // refuses to guess whether orphan main rows should survive. A
+      // missing joinMode surfaces as a clear error pointing the cube
+      // author at the required field rather than silently inner- or
+      // left-joining.
+      const resolvedJoinMode = External.resolveLinkedJoinMode(config);
+      if (!resolvedJoinMode) {
+        throw new Error(
+          `Linked source "${lsName}" must declare \`joinMode\` ('inner' | 'left') — cross-source decomposition won't guess which orphan-row semantic you want. 'inner' drops main rows without a linked match (typical for monitoring cubes); 'left' keeps them with linked columns undefined.`,
+        );
+      }
+
+      linkedExternals.push({
+        name: lsName,
+        external: linkedExternal,
+        joinKeys: sharedAliases,
+        joinMode: resolvedJoinMode,
+      });
+
+      // Stash the main-compatible split set for rebuilding main after the loop.
+      // (We recompute per linked source but the intersection of "main-keepable"
+      // aliases is the same across sources — linked-only for source A is only
+      // valid on A, so it must be dropped from main regardless of B.)
+      (this as any)._lastMainKeepableAliases = [...mainOnlyAliases, ...sharedAliases];
+      // Remember the synthetic splits so the main side's split map can pull
+      // from them (they are NOT in this.split.splits).
+      (this as any)._lastSyntheticSplits = {
+        ...((this as any)._lastSyntheticSplits || {}),
+        ...syntheticSplits,
+      };
+      // Collect synthetic aliases across all sources, deduped — the execution
+      // layer will strip these columns from the final joined dataset.
+      for (const a of syntheticAliasesForThisSource) {
+        if (!(this as any)._syntheticAliasMap) (this as any)._syntheticAliasMap = {};
+        (this as any)._syntheticAliasMap[a] = true;
+      }
+    }
+
+    // Dangling-alias guard — a split whose refs resolved in neither
+    // main nor ANY linkedSource's attributes is a real error (and
+    // would have been caught by pre-refactor classifier that threw).
+    // The new classifier skips such aliases at each iteration via
+    // `foreignLinked`; we surface the dangling case here so the error
+    // message names every unclassified alias in one go.
+    const dangling: string[] = [];
+    for (const alias of this.split.keys) {
+      if (!everClassifiedAliases[alias]) dangling.push(alias);
+    }
+    if (dangling.length > 0) {
+      throw new Error(
+        `Cross-source decomposition: split aliases [${dangling.join(
+          ', ',
+        )}] reference columns that resolve in neither main nor any declared linkedSource's attributes. Check that the linkedSource whose schema contains these refs is declared on the cube and has been introspected (attributes populated).`,
+      );
+    }
+
+    // Build the main side: keep only splits whose refs resolve in main's own
+    // schema, drop foreign applies. When no main-keepable split remains the
+    // main external becomes TOTALS mode — one row of aggregates that the
+    // linked side broadcasts across its groupings.
+    const mainKeepableAliases: string[] = (this as any)._lastMainKeepableAliases || [];
+    const syntheticSplitsAll: Record<string, Expression> = (this as any)._lastSyntheticSplits || {};
+    const mainValue = this.valueOf();
+    mainValue.applies = mainApplies;
+    if (mainKeepableAliases.length > 0) {
+      const mainSplitMap: Record<string, Expression> = {};
+      for (const a of mainKeepableAliases)
+        mainSplitMap[a] = this.split.splits[a] || syntheticSplitsAll[a];
+      mainValue.split = this.split.changeSplits(mainSplitMap);
+      // Build attributes. For synthetic splits the expression is a bare ref
+      // with no resolved type yet — look the column's type up in the main
+      // external's own schema (rawAttributes + derivedAttributes +
+      // timeAttribute). The timeAttribute entry covers splits that group
+      // by the time column directly (rare but legal — e.g. a TIME_FLOOR'd
+      // bucket); without it the synthetic split would default to STRING
+      // and lose the temporal type.
+      const mainAttrTypeByName: Record<string, PlyType> = {};
+      for (const a of this.rawAttributes || []) mainAttrTypeByName[a.name] = a.type;
+      for (const k in this.derivedAttributes) {
+        const dtype = (this.derivedAttributes[k] as any).type;
+        if (dtype) mainAttrTypeByName[k] = dtype;
+      }
+      const taType = (this as any).timeAttribute;
+      if (typeof taType === 'string' && taType.length > 0) {
+        mainAttrTypeByName[taType] = 'TIME';
+      }
+      mainValue.attributes = [
+        ...mainKeepableAliases.map(name => {
+          const ex = this.split.splits[name] || syntheticSplitsAll[name];
+          let t = Set.unwrapSetType(ex.type);
+          if (!t && ex instanceof RefExpression && mainAttrTypeByName[ex.name]) {
+            t = mainAttrTypeByName[ex.name];
+          }
+          return new AttributeInfo({ name, type: t || 'STRING' });
+        }),
+        ...mainApplies.map(a => new AttributeInfo({ name: a.name, type: a.expression.type })),
+      ];
+    } else {
+      // No main split → totals mode. rawAttributes comes back as attributes,
+      // split drops, applies stay as the aggregate list.
+      mainValue.mode = 'total';
+      mainValue.split = null;
+      mainValue.dataName = undefined;
+      mainValue.rawAttributes = this.rawAttributes;
+      mainValue.attributes = mainApplies.map(
+        a => new AttributeInfo({ name: a.name, type: a.expression.type }),
+      );
+      mainValue.sort = null;
+      mainValue.limit = null;
+    }
+
+    // Sort / limit routing. If the sort references a main-side apply or a
+    // main-keepable split alias, keep it on main (pre-join); the engine can
+    // use it for topN optimization. If the sort targets something that lives
+    // only post-join (a linked apply, for instance), strip it from main and
+    // return it as postJoinSort so the caller can apply it to the joined
+    // Dataset. The matching limit moves with the sort — applying a pre-join
+    // limit while sorting post-join would silently drop rows.
+    const mainApplyNames: Record<string, true> = {};
+    for (const a of mainApplies) mainApplyNames[a.name] = true;
+    const mainKeepableNames: Record<string, true> = {};
+    for (const a of mainKeepableAliases) mainKeepableNames[a] = true;
+
+    // Sort/limit routing: when main's row identity matches the final
+    // grid row identity, main-side sort + LIMIT is safe and enables
+    // Druid's topN optimization. When the join fans main rows out into
+    // multiple grid rows — because the user split includes a linked-
+    // only dimension — main's LIMIT would cap at main-row count, not
+    // grid-row count, and the result under/over-returns depending on
+    // cardinality.
+    //
+    // Two signals force sort+limit post-join:
+    //   1. The query has linked-only split aliases: the join expands
+    //      main rows into N per (linked-only combination), so main's
+    //      LIMIT doesn't speak to the grid-row count.
+    //   2. The sort references something main can't resolve (a linked
+    //      apply name or a linked-only split): main can't order by it.
+    //
+    // Otherwise (shared-only splits, sort on a main apply or shared
+    // split) main's sort+limit stays put — the topN per-period fan-out
+    // in timeshift decomposition and Druid's LIMIT clause remain
+    // valid and efficient.
+    const hasLinkedOnlySplit = linkedExternals.some(
+      le =>
+        le.external && (le.external as any).split?.keys?.some((k: string) => !mainKeepableNames[k]),
+    );
+    let postJoinSort: SortExpression | undefined;
+    let postJoinLimit: LimitExpression | undefined;
+    if (this.sort) {
+      const sortRef = this.sort.expression;
+      const sortOnMainSide =
+        sortRef instanceof RefExpression &&
+        (mainApplyNames[sortRef.name] || mainKeepableNames[sortRef.name]);
+      const mustMovePostJoin = !sortOnMainSide || hasLinkedOnlySplit;
+      if (mustMovePostJoin) {
+        postJoinSort = this.sort;
+        postJoinLimit = this.limit || undefined;
+        mainValue.sort = null;
+        mainValue.limit = null;
+      }
+    } else if (this.limit && hasLinkedOnlySplit) {
+      // No sort but a limit + linked-only splits: the limit has to run
+      // post-join to cap grid rows rather than main rows.
+      postJoinLimit = this.limit;
+      mainValue.limit = null;
+    }
+
+    // HAVING routing. The outer External's havingFilter was copied into
+    // mainValue by valueOf(). If it references an apply routed to a linked
+    // sub-External (e.g. `$avg_rating_linked > 0` where avg_rating_linked
+    // lives on the reviews side), pushing it into main's SQL emits a
+    // predicate over a column Druid can't resolve and the query 500s.
+    //
+    // Split per Ogievetsky's TODO in 0f9cbf3: clauses over main-resolvable
+    // names stay on main's HAVING (Druid-side, fast); clauses over post-
+    // join names (linked applies, linked-only splits) move to a post-join
+    // .filter() on the joined Dataset. AND combines both halves; OR/NOT
+    // that mix scopes are all post-join.
+    let postJoinHavingFilter: Expression | undefined;
+    if (mainValue.havingFilter && !mainValue.havingFilter.equals(Expression.TRUE)) {
+      const mainResolvable: Record<string, true> = {};
+      for (const a of mainApplies) mainResolvable[a.name] = true;
+      for (const a of mainKeepableAliases) mainResolvable[a] = true;
+      const { main: havingOnMain, post: havingOnPost } = External.splitFilterByScope(
+        mainValue.havingFilter,
+        mainResolvable,
+      );
+      mainValue.havingFilter = havingOnMain;
+      if (!havingOnPost.equals(Expression.TRUE)) {
+        postJoinHavingFilter = havingOnPost;
+      }
+
+      // If any HAVING moved post-join, main's LIMIT would starve the
+      // result: main returns N rows, HAVING drops some, we end up
+      // with fewer than N final rows. Force both sort and limit to
+      // post-join so the cap applies against the HAVING-filtered set.
+      if (postJoinHavingFilter) {
+        if (this.sort && !postJoinSort) {
+          postJoinSort = this.sort;
+          mainValue.sort = null;
+        }
+        if (this.limit && !postJoinLimit) {
+          postJoinLimit = this.limit;
+          mainValue.limit = null;
+        }
+      }
+    }
+
+    const mainExternal = External.fromValue(mainValue);
+
+    const syntheticAliasMap: Record<string, true> | undefined = (this as any)._syntheticAliasMap;
+    const syntheticJoinAliases = syntheticAliasMap ? Object.keys(syntheticAliasMap) : undefined;
+
+    return {
+      mainExternal,
+      linkedExternals,
+      postJoinSort,
+      postJoinLimit,
+      syntheticJoinAliases,
+      postJoinHavingFilter,
+    };
   }
 }

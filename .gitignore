@@ -16,3 +16,4 @@
 
 # === Auth (generated from .npmrc.example) ===
 .npmrc
+*.tgz

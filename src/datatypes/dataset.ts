@@ -988,11 +988,28 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
         if (valueExternalAlterations.length === 1) {
           externalAlterations.push(valueExternalAlterations[0]);
         } else {
-          externalAlterations.push({
-            index: i,
-            key: '',
-            external: External.uniteValueExternalsIntoTotal(valueExternalAlterations),
-          });
+          // Group value externals by base (engine + source + version + …) —
+          // each external owns its own schema, so heterogeneous sources must
+          // produce independent sub-totals instead of a single merged total.
+          // This keeps linkedSources cleanly separated: reviews' derivedAttributes
+          // resolve against reviews' rawAttributes, main's against main's.
+          const groups: DatasetExternalAlteration[][] = [];
+          for (const alt of valueExternalAlterations) {
+            const group = groups.find(g => g[0].external.equalBase(alt.external));
+            if (group) group.push(alt);
+            else groups.push([alt]);
+          }
+          for (const group of groups) {
+            if (group.length === 1) {
+              externalAlterations.push(group[0]);
+            } else {
+              externalAlterations.push({
+                index: i,
+                key: '',
+                external: External.uniteValueExternalsIntoTotal(group),
+              });
+            }
+          }
         }
       }
 
@@ -1081,16 +1098,101 @@ export class Dataset implements Instance<DatasetValue, DatasetJS> {
     return mapping;
   }
 
-  public join(other: Dataset): Dataset {
-    // Auto-dispatch: if other's keys are a strict subset of this's keys,
-    // use broadcastJoin so partial-key results expand across all matching rows.
-    if (other && this.keys && other.keys && other.keys.length < this.keys.length) {
+  public join(other: Dataset, mode: 'left' | 'inner' = 'left'): Dataset {
+    // Auto-dispatch based on the relation between key sets:
+    //   - other ⊂ this          → broadcastJoin (expand partial-key result)
+    //   - this.keys == other    → leftJoin (row-wise align on identical keys)
+    //   - keys overlap but each has exclusives → crossJoinOnSharedKeys
+    //     (cartesian on shared keys, each side contributes its own extras)
+    //
+    // `mode` is forwarded to crossJoinOnSharedKeys — 'inner' drops rows
+    // from `this` that have no match in `other`. broadcastJoin and
+    // leftJoin ignore the mode (neither produces orphan rows under their
+    // semantics).
+    if (other && this.keys && other.keys) {
       const thisKeys = this.keys;
-      if (other.keys.every(k => thisKeys.indexOf(k) !== -1)) {
+      const otherKeys = other.keys;
+      const sharedKeys = thisKeys.filter(k => otherKeys.indexOf(k) !== -1);
+      if (otherKeys.length < thisKeys.length && otherKeys.every(k => thisKeys.indexOf(k) !== -1)) {
         return this.broadcastJoin(other);
+      }
+      if (
+        sharedKeys.length > 0 &&
+        (sharedKeys.length < thisKeys.length || sharedKeys.length < otherKeys.length)
+      ) {
+        return this.crossJoinOnSharedKeys(other, sharedKeys, mode);
       }
     }
     return this.leftJoin(other);
+  }
+
+  /**
+   * Cartesian join on a subset of keys shared between this and other.
+   * For each row in this, emits one output row per matching row in other
+   * (matched by sharedKeys). Both sides contribute their own exclusive keys,
+   * producing a dataset with the union of keys. Think "SQL INNER JOIN on
+   * sharedKeys" when neither side's keys are a subset of the other.
+   *
+   * `mode`:
+   *   - 'left' (default): unmatched rows from `this` pass through with
+   *      the other side's fields undefined. Preserves row count from
+   *      `this`; use when you need every left-side row to survive.
+   *   - 'inner': unmatched rows from `this` are dropped. Use when both
+   *      sides must contribute columns to a meaningful output row —
+   *      typical for cross-source decomposition where the split
+   *      references columns only one side can produce.
+   */
+  public crossJoinOnSharedKeys(
+    other: Dataset,
+    sharedKeys: string[],
+    mode: 'left' | 'inner' = 'left',
+  ): Dataset {
+    if (!other || !other.data.length) {
+      if (mode === 'inner') {
+        return new Dataset({ keys: this.keys, attributes: this.attributes, data: [] });
+      }
+      return this;
+    }
+    const { data, keys, attributes } = this;
+    if (!data.length) return this;
+
+    const hashDatum = (d: Datum): string =>
+      sharedKeys
+        .map(k => {
+          let v: any = d[k];
+          if (v && v.start) v = v.start;
+          if (v && v.toISOString) v = v.toISOString();
+          return v;
+        })
+        .join('|');
+
+    const otherBuckets: Record<string, Datum[]> = Object.create(null);
+    for (const odatum of other.data) {
+      const h = hashDatum(odatum);
+      (otherBuckets[h] = otherBuckets[h] || []).push(odatum);
+    }
+
+    const newData: Datum[] = [];
+    for (const datum of data) {
+      const matches = otherBuckets[hashDatum(datum)] || [];
+      if (matches.length === 0) {
+        if (mode === 'left') newData.push(datum);
+        // mode === 'inner': drop unmatched row
+      } else {
+        for (const m of matches) {
+          newData.push(joinDatums(datum, m));
+        }
+      }
+    }
+
+    const mergedKeys = keys.slice();
+    for (const k of other.keys) if (mergedKeys.indexOf(k) === -1) mergedKeys.push(k);
+
+    return new Dataset({
+      keys: mergedKeys,
+      attributes: AttributeInfo.override(attributes, other.attributes),
+      data: newData,
+    });
   }
 
   public leftJoin(other: Dataset): Dataset {
