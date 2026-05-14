@@ -579,45 +579,73 @@ export abstract class SQLExternal extends External {
           .filter(Boolean);
 
         keys = [];
-        queryParts.push(
-          'SELECT',
-          applies
-            .map(apply => {
-              const modeEx = SQLExternal.extractModeExpression(apply.expression);
-              if (modeEx) {
-                // Generate scalar subquery for total mode
-                const modeFieldSQL = modeEx.expression.getSQL(dialect);
-                const modeFilter = SQLExternal.extractModeFilter(apply.expression, dialect);
-                const subWhereParts: string[] = [];
-                if (!filter.equals(Expression.TRUE)) {
-                  subWhereParts.push(filter.getSQL(dialect));
+        if (nestedGroupByResult) {
+          // Resplit aggregation owns its own SQL: selectExpressions /
+          // fromClause / groupByExpressions were already filled in by
+          // the resplit builder, and the original applies still carry
+          // the inner SplitExpression (which throws on getSQL()).
+          // Use the prebuilt parts and skip the per-apply loop.
+          if (cteDefinitions.length > 0) {
+            queryParts.unshift(`WITH\n  ${cteDefinitions.join(',\n  ')}`);
+          }
+          queryParts.push(
+            'SELECT',
+            selectExpressions.join(',\n'),
+            fromClause,
+            groupByExpressions.length > 0
+              ? `GROUP BY ${groupByExpressions.join(', ')}`
+              : dialect.emptyGroupBy(),
+          );
+        } else {
+          queryParts.push(
+            'SELECT',
+            applies
+              .map(apply => {
+                const modeEx = SQLExternal.extractModeExpression(apply.expression);
+                if (modeEx) {
+                  // Generate scalar subquery for total mode
+                  const modeFieldSQL = modeEx.expression.getSQL(dialect);
+                  const modeFilter = SQLExternal.extractModeFilter(apply.expression, dialect);
+                  const subWhereParts: string[] = [];
+                  if (!filter.equals(Expression.TRUE)) {
+                    subWhereParts.push(filter.getSQL(dialect));
+                  }
+                  subWhereParts.push(`${modeFieldSQL} IS NOT NULL`);
+                  if (modeFilter) {
+                    subWhereParts.push(modeFilter);
+                  }
+                  return `(SELECT ${modeFieldSQL} ${this.getFrom()} WHERE ${subWhereParts.join(
+                    ' AND ',
+                  )} GROUP BY ${modeFieldSQL} ORDER BY COUNT(*) DESC LIMIT 1) AS ${dialect.escapeName(
+                    apply.name,
+                  )}`;
                 }
-                subWhereParts.push(`${modeFieldSQL} IS NOT NULL`);
-                if (modeFilter) {
-                  subWhereParts.push(modeFilter);
-                }
-                return `(SELECT ${modeFieldSQL} ${this.getFrom()} WHERE ${subWhereParts.join(
-                  ' AND ',
-                )} GROUP BY ${modeFieldSQL} ORDER BY COUNT(*) DESC LIMIT 1) AS ${dialect.escapeName(
-                  apply.name,
-                )}`;
-              }
-              return apply.getSQL(dialect);
-            })
-            .join(',\n'),
-          fromClause,
-          dialect.emptyGroupBy(),
-        );
+                return apply.getSQL(dialect);
+              })
+              .join(',\n'),
+            fromClause,
+            dialect.emptyGroupBy(),
+          );
+        }
         break;
 
       case 'split': {
         const split = this.getQuerySplit();
         keys = split.mapSplits(name => name);
 
-        selectExpressions = split.getSelectSQL(dialect);
-        groupByExpressions = this.capability('shortcut-group-by')
-          ? split.getShortGroupBySQL()
-          : split.getGroupBySQL(dialect);
+        if (!nestedGroupByResult) {
+          selectExpressions = split.getSelectSQL(dialect);
+          groupByExpressions = this.capability('shortcut-group-by')
+            ? split.getShortGroupBySQL()
+            : split.getGroupBySQL(dialect);
+        }
+        // When nestedGroupByResult is present, selectExpressions /
+        // groupByExpressions / fromClause are already complete (outer
+        // split columns + CTE-referenced apply SQL). Mode CTE,
+        // PivotNestedAgg and direct apply.getSQL() handling below are
+        // orthogonal to resplit and would re-throw on the inner
+        // SplitExpression — gate them on the same guard.
+        if (!nestedGroupByResult) {
 
         // Procesar aplicaciones que utilizan PIVOT_NESTED_AGG
         const pivotNestedAggApplies: {
@@ -812,8 +840,10 @@ export abstract class SQLExternal extends External {
             fromClause += '\n' + modeJoinClauses.join('\n');
           }
         }
+        } // close `if (!nestedGroupByResult)` opened before pivot/mode/apply handling
 
-        // Construir la cláusula WITH si hay CTEs
+        // Construir la cláusula WITH si hay CTEs (común a ambas ramas:
+        // tanto pivot/mode-CTEs como las del resplit van por aquí)
         if (cteDefinitions.length > 0) {
           queryParts.unshift(`WITH\n  ${cteDefinitions.join(',\n  ')}`);
         }
