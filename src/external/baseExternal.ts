@@ -40,6 +40,7 @@ import { Set } from '../datatypes/set';
 import { StringRange } from '../datatypes/stringRange';
 import { TimeRange } from '../datatypes/timeRange';
 import { iteratorFactory, PlyBit } from '../datatypes/valueStream';
+import { SQLDialect } from '../dialect/baseDialect';
 import {
   $,
   AndExpression,
@@ -72,6 +73,139 @@ import { nonEmptyLookup, pipeWithError, safeRange } from '../helper/utils';
 import { DatasetFullType, FullType, PlyType, PlyTypeSimple } from '../types';
 
 import { CustomDruidAggregations, CustomDruidTransforms } from './utils/druidTypes';
+
+/**
+ * Render the SQL for an aggregate expression detached from its
+ * External, qualifying column refs to a given table alias. Used by
+ * the native-JOIN path which renders measure SQL without going
+ * through External.addExpression (the aggregate's operand is still
+ * a literal `$main` dataset ref, which `apply.getSQL` would try to
+ * render and fail with "unsupported type DATASET").
+ *
+ * The aggregate's `_getSQLChainableUnaryHelper` is protected. We
+ * call through a public façade: the dialect's helpers know how to
+ * render each Aggregate subclass once we hand them the right pieces:
+ *   - operandSQL: stub (any string without ' WHERE '). The aggregate
+ *     uses it only to detect per-apply filters; native-JOIN has none.
+ *   - expressionSQL: the inner ref's SQL, qualified to `tableAlias`.
+ *
+ * Returns null if the apply contains an aggregator the renderer
+ * doesn't know how to handle (in which case the gate should never
+ * have routed it here — we leave the diagnostic to the caller).
+ */
+function renderAggregateSQL(
+  applyValueExpr: Expression,
+  dialect: SQLDialect,
+  tableAlias: string,
+): string | null {
+  // The apply's expression is typically the aggregate directly
+  // (countDistinct, sum, etc.) or a binary chain (sum(a) + sum(b)).
+  // For v1 we handle the simple-aggregate case — the gate routes
+  // away non-decomposable measures before the chain rewrite would
+  // even apply.
+  const escapeQualified = (refName: string) => `${tableAlias}.${dialect.escapeName(refName)}`;
+  const renderInnerRef = (ex: Expression): string => {
+    if (ex instanceof RefExpression) return escapeQualified(ex.name);
+    // Fallback: emit via getSQL — works for non-DATASET expressions
+    // because the aggregate's inner is typically a single ref. Set
+    // table context so any nested ref qualifies correctly.
+    const prev = (dialect as any).table;
+    (dialect as any).setTable(tableAlias);
+    try {
+      return ex.getSQL(dialect);
+    } finally {
+      (dialect as any).setTable(prev);
+    }
+  };
+
+  const ex: any = applyValueExpr;
+  if (!ex || !ex.op) return null;
+  const op = ex.op;
+  // Stub operandSQL: any string lacking ' WHERE ' satisfies
+  // aggregateFilterIfNeeded's "no per-apply filter" branch.
+  const stubOperand = `${tableAlias}`;
+  switch (op) {
+    case 'count':
+      return dialect.aggregateFilterIfNeeded(stubOperand, 'COUNT(*)', '0');
+    case 'sum':
+      return `SUM(${dialect.aggregateFilterIfNeeded(
+        stubOperand,
+        renderInnerRef(ex.expression),
+        '0',
+      )})`;
+    case 'min':
+      return `MIN(${dialect.aggregateFilterIfNeeded(stubOperand, renderInnerRef(ex.expression))})`;
+    case 'max':
+      return `MAX(${dialect.aggregateFilterIfNeeded(stubOperand, renderInnerRef(ex.expression))})`;
+    case 'average':
+      return `AVG(${dialect.aggregateFilterIfNeeded(stubOperand, renderInnerRef(ex.expression))})`;
+    case 'countDistinct': {
+      const inner = renderInnerRef(ex.expression);
+      const refName =
+        ex.expression instanceof RefExpression ? (ex.expression as RefExpression).name : undefined;
+      return dialect.countDistinctExpression(
+        dialect.aggregateFilterIfNeeded(stubOperand, inner),
+        refName,
+      );
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Fail-loud exception thrown by `External.assertDatasetShape` when a
+ * dataset returned by a cross-source query path has more rows than
+ * distinct key tuples — the engine-level symptom of a missing
+ * post-join re-aggregation. The message names the duplicated tuple
+ * and the row-count delta (rows minus distinct tuples).
+ *
+ * Surfaced synchronously, never logged. See INV-1 / INV-4 in the
+ * cross-source aggregation fix spec.
+ */
+export class PlywoodCardinalityViolation extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PlywoodCardinalityViolation';
+    // Restore prototype — ES5 transpilation of Error subclasses loses it,
+    // which breaks `instanceof` checks downstream. See
+    // https://github.com/Microsoft/TypeScript-wiki/blob/master/Breaking-Changes.md#extending-built-ins-like-error-array-and-map-may-no-longer-work.
+    Object.setPrototypeOf(this, PlywoodCardinalityViolation.prototype);
+  }
+}
+
+/**
+ * Thrown by `Expression.isMeasureDecomposable` when an `Aggregate`
+ * subclass reachable from a measure expression lacks the static
+ * `decomposable: DecomposeTrait` declaration. Single source of truth
+ * (INV-3): a missing trait is never silently treated as decomposable.
+ */
+export class PlywoodTraitMissing extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PlywoodTraitMissing';
+    Object.setPrototypeOf(this, PlywoodTraitMissing.prototype);
+  }
+}
+
+/**
+ * Thrown by `External.getNativeJoinDecomposition` when the gate
+ * routes a query into the native-JOIN path but the concrete shape
+ * is not (yet) supported by the v1 SQL emitter — e.g. multi-alias
+ * linked-only split, multi-linkedSource native-JOIN, native Druid
+ * engine with no `SQLDialect`, or a split that is not a bare
+ * RefExpression. Fail-loud: the caller MUST NOT swallow this and
+ * fall back to the single-source path, because that path surfaces
+ * downstream as a cryptic "could not get attribute info for X"
+ * from the Druid inflater. F4 of the cycle-2 plan.
+ */
+export class PlywoodUnsupportedNativeJoinShape extends Error {
+  constructor(reason: string) {
+    super(`Cross-source native-JOIN cannot emit SQL: ${reason}`);
+    this.name = 'PlywoodUnsupportedNativeJoinShape';
+    Object.setPrototypeOf(this, PlywoodUnsupportedNativeJoinShape.prototype);
+  }
+}
 
 export class TotalContainer {
   public datum: Datum;
@@ -1197,6 +1331,56 @@ export abstract class External {
     });
   }
 
+  /**
+   * Transparent net (INV-1). Walks `dataset.data` building a multiset
+   * keyed by the tuple of `dataset.keys`. If any tuple appears more
+   * than once, throws `PlywoodCardinalityViolation` synchronously
+   * with the duplicate tuple plus the row-count delta in the message.
+   *
+   * Datasets with no keys (totals shapes — `mode === 'total'` on the
+   * upstream External) carry a single row of aggregates by construction;
+   * the assertion is a no-op in that case (INV-1 only constrains
+   * datasets that declare keys).
+   *
+   * Never logs. Never wraps. Failure here means the engine produced a
+   * shape the caller can't reason about: the cross-source decomposition
+   * fanned main rows past the user's split grain without re-aggregating.
+   */
+  static assertDatasetShape(dataset: Dataset): void {
+    if (!dataset) return;
+    const keys = dataset.keys || [];
+    if (keys.length === 0) return; // totals or shapeless — INV-1 doesn't apply
+    const data = dataset.data || [];
+    const seen = new Map<string, Datum>();
+    for (const row of data) {
+      // JSON.stringify on the key projection is enough: every plywood
+      // primitive (string, number, boolean, Date, null, undefined)
+      // round-trips through it deterministically. Two rows with the
+      // same key tuple stringify identically.
+      const tupleParts: any[] = [];
+      for (const k of keys) tupleParts.push(row[k]);
+      const tupleKey = JSON.stringify(tupleParts);
+      if (seen.has(tupleKey)) {
+        const distinctTuples: Record<string, true> = {};
+        for (const r of data) {
+          const tp: any[] = [];
+          for (const k of keys) tp.push(r[k]);
+          distinctTuples[JSON.stringify(tp)] = true;
+        }
+        const distinctCount = Object.keys(distinctTuples).length;
+        const delta = data.length - distinctCount;
+        const tupleDisplay = keys.map((k, i) => `${k}=${JSON.stringify(tupleParts[i])}`).join(', ');
+        throw new PlywoodCardinalityViolation(
+          `External.assertDatasetShape: duplicate key tuple [${tupleDisplay}] in dataset ` +
+            `with keys [${keys.join(', ')}]; row count ${data.length} exceeds distinct ` +
+            `tuple count ${distinctCount} (delta ${delta}). The upstream cross-source ` +
+            `decomposition fanned main rows past the user's split grain without re-aggregating.`,
+        );
+      }
+      seen.set(tupleKey, row);
+    }
+  }
+
   static jsToValue(parameters: ExternalJS, requester: PlywoodRequester<any>): ExternalValue {
     const value: ExternalValue = {
       engine: parameters.engine,
@@ -1219,7 +1403,7 @@ export abstract class External {
     if (parameters.linkedSources) {
       value.linkedSources = {};
       for (const name in parameters.linkedSources) {
-        const ls = parameters.linkedSources[name];
+        const ls = parameters.linkedSources[name] as any;
         value.linkedSources[name] = {
           source: ls.source,
           joinKeys: ls.joinKeys,
@@ -2368,6 +2552,32 @@ export abstract class External {
     // has the equivalent wiring for the async path.
     const crossExt = this.getCrossExternalDecomposition();
     if (crossExt) {
+      // Phase 4 native-JOIN path: single combined SQL replaces the
+      // main + linked pair. Push exactly one query into the simulate
+      // log; the synthesised Dataset still carries the user's split
+      // shape so downstream consumers see the post-join schema.
+      if (crossExt.kind === 'nativeJoin' && crossExt.nativeJoin) {
+        // Match the wrapping shape druidSqlExternal.sqlToQuery uses
+        // so the simulate plan looks structurally identical to a
+        // normal single-source SQL query.
+        simulatedQueries.push({
+          query: crossExt.nativeJoin.sql,
+          context: { ...((this as any).context || {}), sqlTimeZone: 'Etc/UTC' },
+        });
+        const datum: Datum = {};
+        if (this.split) {
+          this.split.mapSplits((name, expression) => {
+            datum[name] = getSampleValue(Set.unwrapSetType(expression.type), expression);
+          });
+        }
+        for (const apply of this.applies) {
+          datum[apply.name] = getSampleValue(apply.expression.type, apply.expression);
+        }
+        return new Dataset({
+          keys: this.split ? this.split.mapSplits(name => name) : null,
+          data: [datum],
+        });
+      }
       crossExt.mainExternal.simulateValue(lastNode, simulatedQueries, externalForNext);
       for (const le of crossExt.linkedExternals) {
         le.external.simulateValue(lastNode, simulatedQueries, externalForNext);
@@ -2472,6 +2682,52 @@ export abstract class External {
   protected queryBasicValueStream(rawQueries: any[] | null): ReadableStream {
     const crossExt = this.getCrossExternalDecomposition();
     if (crossExt) {
+      // Phase 4 native-JOIN path: dispatch the single combined SQL
+      // via the main external's requester. The result is the
+      // already-grouped, already-joined dataset; we just need to
+      // attach keys + inflaters and hand it back.
+      if (crossExt.kind === 'nativeJoin' && crossExt.nativeJoin) {
+        const nj = crossExt.nativeJoin;
+        return External.valuePromiseToStream(
+          new Promise<PlywoodValue>((resolve, reject) => {
+            const requester = this.requester;
+            if (!requester) {
+              reject(
+                new Error(
+                  'Cross-source native-JOIN: external has no requester to dispatch the combined SQL',
+                ),
+              );
+              return;
+            }
+            if (rawQueries) rawQueries.push({ engine: this.engine, query: nj.sql });
+            // Druid SQL: requester expects `query: { query: <sql> }`.
+            // Other engines accept the bare string. Match Druid's
+            // nesting unconditionally — non-Druid engines that take
+            // this path can override via subclass-aware wiring (out
+            // of scope for v1 — native-JOIN currently only fires on
+            // the Druid SQL transport).
+            const reqStream = requester({
+              query: { query: nj.sql } as any,
+              context: (this as any).context,
+            });
+            const rows: Datum[] = [];
+            reqStream.on('data', (r: any) => rows.push(r));
+            reqStream.on('error', (e: any) => reject(e));
+            reqStream.on('end', () => {
+              const ds = new Dataset({
+                keys: nj.keys,
+                attributes: [
+                  new AttributeInfo({ name: nj.splitAlias, type: 'STRING' }),
+                  ...nj.applyNames.map(n => new AttributeInfo({ name: n, type: 'NUMBER' })),
+                ],
+                data: rows,
+              });
+              External.assertDatasetShape(ds); // INV-1: also pin the native-JOIN result.
+              resolve(ds);
+            });
+          }),
+        );
+      }
       const mainPromise = External.buildValueFromStream(
         crossExt.mainExternal.queryBasicValueStream(rawQueries),
       );
@@ -2530,6 +2786,12 @@ export abstract class External {
           if (crossExt.syntheticJoinAliases && crossExt.syntheticJoinAliases.length > 0) {
             joined = External.dropColumns(joined, crossExt.syntheticJoinAliases);
           }
+          // INV-1 transparent net. If the cross-source decomposition lost
+          // its grain (linked-only split + non-decomposable measure fans
+          // main rows past the user's grid), the resulting dataset has
+          // more rows than distinct key tuples. Fail loud here — before
+          // the bad shape leaks into the caller's response.
+          External.assertDatasetShape(joined);
           return joined;
         }),
       );
@@ -3000,7 +3262,250 @@ export abstract class External {
    *
    * Mirrors the layout of getJoinDecompositionShortcut above.
    */
+
+  /**
+   * Phase 4 native-JOIN sibling — emits a single Druid SQL with an
+   * INNER/LEFT JOIN against the lookup. Routed to when the
+   * decomposability gate refuses the JS-join path (countDistinct,
+   * quantile, average, mode, min/max over a linked-only split).
+   *
+   * Phase 3 contract: returns null when the multi-alias case or
+   * other unsupported shape is detected; Phase 4 fills in the
+   * single-alias case.
+   *
+   * @param linkedOnlySplitAliases  the user-side split aliases whose
+   *                                 free refs resolve only in some
+   *                                 linkedSource's attributes
+   * @param mainApplies              the value-applies to project
+   * @param involvedLinkedNames      lookup-source names participating
+   */
+  public getNativeJoinDecomposition(
+    linkedOnlySplitAliases: string[],
+    mainApplies: ApplyExpression[],
+    involvedLinkedNames: Record<string, true>,
+  ): {
+    kind: 'nativeJoin';
+    nativeJoin: {
+      sql: string;
+      joinMode: 'inner' | 'left';
+      splitAlias: string;
+      mainSource: string;
+      linkedSource: string;
+      keys: string[];
+      applyNames: string[];
+    };
+    mainExternal: External;
+    linkedExternals: {
+      name: string;
+      external: External;
+      joinKeys: string[];
+      joinMode: 'inner' | 'left';
+    }[];
+    syntheticJoinAliases?: string[];
+  } {
+    // Phase 4: support single linked-only split + single linkedSource.
+    // Multi-alias and multi-source native-JOIN are post-MVP.
+    // F4 (cycle-2): every unsupported shape throws
+    // `PlywoodUnsupportedNativeJoinShape` with a site-specific reason —
+    // returning null silently let the caller fall back to a single-
+    // source path that died late with "could not get attribute info
+    // for X" from the Druid inflater.
+    if (linkedOnlySplitAliases.length !== 1) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `multi-alias linked-only split unsupported (aliases=${linkedOnlySplitAliases.join(
+          ',',
+        )}, count=${linkedOnlySplitAliases.length})`,
+      );
+    }
+    const lsNames = Object.keys(involvedLinkedNames);
+    if (lsNames.length !== 1) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `multiple linkedSources involved [${lsNames.join(
+          ',',
+        )}] — native-JOIN v1 supports exactly 1`,
+      );
+    }
+    const splitAlias = linkedOnlySplitAliases[0];
+    const lsName = lsNames[0];
+    const config = this.linkedSources[lsName];
+    if (!config) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `linkedSource "${lsName}" missing in linkedSources map`,
+      );
+    }
+    const joinMode = External.resolveLinkedJoinMode(config);
+    if (!joinMode) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `linkedSource "${lsName}" missing joinMode (resolveLinkedJoinMode undefined)`,
+      );
+    }
+    const joinKeys = config.joinKeys || [];
+    if (joinKeys.length === 0) {
+      throw new PlywoodUnsupportedNativeJoinShape(`linkedSource "${lsName}" has empty joinKeys`);
+    }
+
+    // Build the SQL. Pattern (single linkedSource, single linked-only
+    // split alias, single joinKey for v1):
+    //
+    //   SELECT lookup.<linked_attr> AS "<splitAlias>",
+    //          <main_measure_sql> AS "<measureName>"
+    //   FROM <main_source> main
+    //   <INNER|LEFT> JOIN <linked_source> lookup
+    //     ON main.<joinKey> = lookup.<joinKey>
+    //   WHERE <main filter SQL>
+    //   GROUP BY 1
+    //
+    // The split alias on the lookup side comes from the user's split
+    // expression — typically a RefExpression to a linked column.
+    const dialect = (this as any).dialect as SQLDialect;
+    if (!dialect) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `native Druid engine has no SQLDialect; native-JOIN requires SQL transport (engine="${this.engine}")`,
+      );
+    }
+    const splitExpr = this.split.splits[splitAlias];
+    if (!splitExpr) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `split alias "${splitAlias}" not found in this.split.splits`,
+      );
+    }
+    // For v1 we only support the simplest shape: split is a bare
+    // RefExpression to a column that exists on the linked side. More
+    // complex transforms (TIME_FLOOR, etc.) are out of scope.
+    const splitRef = splitExpr instanceof RefExpression ? splitExpr : null;
+    if (!splitRef) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `split expr ${splitExpr.toString()} is not a bare RefExpression (TIME_FLOOR/SUBSTR/etc unsupported)`,
+      );
+    }
+    const linkedColName = splitRef.name;
+
+    const mainSource = String(this.source);
+    const linkedSource = String(config.source);
+    const mainAlias = 'main';
+    const lookupAlias = 'lookup';
+    const escName = (n: string) => dialect.escapeName(n);
+
+    // ON clause: AND of every declared joinKey
+    const onConds = joinKeys
+      .map(k => `${mainAlias}.${escName(k)} = ${lookupAlias}.${escName(k)}`)
+      .join(' AND ');
+
+    // SELECT clause: the linked-only split column from lookup +
+    // each main apply rendered as its aggregate SQL with main-qualified
+    // references.
+    const selectParts: string[] = [
+      `${lookupAlias}.${escName(linkedColName)} AS ${escName(splitAlias)}`,
+    ];
+    const applyNames: string[] = [];
+    for (const apply of mainApplies) {
+      if (apply.expression.type === 'DATASET') continue; // skip scope-registrations
+      // The apply's tree still carries unresolved `$main` dataset refs
+      // (they would be absorbed via External.addExpression on the
+      // single-source path). For native-JOIN we don't go through
+      // addExpression, so calling `.getSQL` on the apply directly
+      // tries to render the literal dataset and throws "unsupported
+      // type: DATASET". Render the aggregate manually: walk the
+      // apply's expression, find the Aggregate node, call its
+      // helper with a stub operandSQL (the only thing operandSQL
+      // contributes to is the aggregate-filter detection — we have
+      // no per-apply filter here, so any non-WHERE string works).
+      const aggExpr = apply.expression;
+      const prevTable = (dialect as any).table;
+      (dialect as any).setTable(mainAlias);
+      try {
+        const aggSQL = renderAggregateSQL(aggExpr, dialect, mainAlias);
+        if (aggSQL == null) continue;
+        selectParts.push(`${aggSQL} AS ${escName(apply.name)}`);
+        applyNames.push(apply.name);
+      } finally {
+        (dialect as any).setTable(prevTable);
+      }
+    }
+
+    // WHERE: main's getQueryFilter SQL, qualified to main alias.
+    const filter = this.getQueryFilter();
+    let whereSQL = '';
+    if (!filter.equals(Expression.TRUE)) {
+      const prevTable = (dialect as any).table;
+      (dialect as any).setTable(mainAlias);
+      try {
+        whereSQL = 'WHERE ' + filter.getSQL(dialect);
+      } finally {
+        (dialect as any).setTable(prevTable);
+      }
+    }
+
+    const joinSql = joinMode === 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
+    const sqlParts = [
+      `SELECT ${selectParts.join(', ')}`,
+      `FROM ${escName(mainSource)} AS ${mainAlias}`,
+      `${joinSql} ${escName(linkedSource)} AS ${lookupAlias} ON ${onConds}`,
+    ];
+    if (whereSQL) sqlParts.push(whereSQL);
+    sqlParts.push('GROUP BY 1');
+
+    // Sort/limit routing: if the user's sort/limit references the
+    // split alias or any apply name, append. Otherwise omit — the
+    // post-join layer will apply them.
+    if (this.sort) {
+      sqlParts.push(this.sort.getSQL(dialect));
+    }
+    if (this.limit) {
+      sqlParts.push(this.limit.getSQL(dialect));
+    }
+
+    const sql = sqlParts.join('\n');
+
+    return {
+      kind: 'nativeJoin',
+      nativeJoin: {
+        sql,
+        joinMode,
+        splitAlias,
+        mainSource,
+        linkedSource,
+        keys: [splitAlias],
+        applyNames,
+      },
+      // The caller's main-side and linked-side externals are unused
+      // by the nativeJoin execution path — the combined SQL replaces
+      // them — but the return shape needs the fields for type parity.
+      // We attach a stub mainExternal so .equalBase() etc. don't trip.
+      mainExternal: this,
+      linkedExternals: [],
+      syntheticJoinAliases: [],
+    };
+  }
+
   public getCrossExternalDecomposition(): {
+    // Routing discriminator (INV-2). Two paths emit from this function:
+    //   - 'jsJoin'     — historic path: pre-aggregate main + linked,
+    //                    in-memory join. Safe only when every main-side
+    //                    measure declares `decomposable: 'sum'`. Default
+    //                    when omitted (back-compat with callers reading
+    //                    the legacy shape).
+    //   - 'nativeJoin' — single SQL with a Druid INNER/LEFT JOIN against
+    //                    the lookup datasource. Mandatory when a main-
+    //                    side measure is non-decomposable (countDistinct,
+    //                    quantile, average) AND the user split includes
+    //                    a linked-only alias (would fan main rows past
+    //                    the grid grain). See `nativeJoin` for the
+    //                    emit() shape filled by Phase 4.
+    kind?: 'jsJoin' | 'nativeJoin';
+    // Populated when kind === 'nativeJoin'. The combined SQL the
+    // execution layer dispatches as a single query; the joinMode,
+    // splitAlias, source identifiers, key list, and apply names
+    // travel with it for downstream shape attribution.
+    nativeJoin?: {
+      sql: string;
+      joinMode: 'inner' | 'left';
+      splitAlias: string;
+      mainSource: string;
+      linkedSource: string;
+      keys: string[];
+      applyNames: string[];
+    };
     mainExternal: External;
     linkedExternals: {
       name: string;
@@ -3027,6 +3532,24 @@ export abstract class External {
     if (!this.applies || this.applies.length === 0) return null;
     if (!this.linkedSources || Object.keys(this.linkedSources).length === 0) return null;
 
+    // Pre-gate avg-rewrite (F2). `average($x)` is mathematically
+    // `sum($x) / count()` — the identity rewrite `decomposeAverage`
+    // (baseExpression.ts:1805) already exists and is invariant-
+    // preserving. Apply it locally to every contributing apply BEFORE
+    // the decomposability gate evaluates traits: post-rewrite, every
+    // avg becomes a sum/count pair (both trait='sum'), the JS-join
+    // path stays safe, and the gate doesn't force the heavier
+    // native-JOIN route for an aggregate that decomposes cleanly.
+    //
+    // Local rewrite only: we mutate a const `rewrittenApplies` and
+    // route the rest of this method through it. `this.applies` stays
+    // untouched, so the rewrite does NOT leak to non-cross-source
+    // paths (a viz with avg + no linked-only split still emits AVG()
+    // unchanged — see avgRewriteIsolation pin).
+    const rewrittenApplies: ApplyExpression[] = this.applies.map(a =>
+      a.changeExpression(a.expression.decomposeAverage()),
+    );
+
     // Index linkedSources by source-string so we can match foreign ExternalExpressions back
     // to their declared linked-source name. Source is the stable identity.
     const linkedByMaterializedSource = new Map<string, { name: string; config: any }>();
@@ -3049,7 +3572,7 @@ export abstract class External {
     // linked External from scratch here.
     const foreignTemplateByName: Record<string, External> = {};
 
-    for (const apply of this.applies) {
+    for (const apply of rewrittenApplies) {
       // Dataset applies (e.g. .apply('reviews', $reviews.filter(F))) are
       // scope registrations — they declare that a source is reachable at
       // this ply level, not that it contributes a value to the output. We
@@ -3096,10 +3619,9 @@ export abstract class External {
     // lives in reviews would be handed to the main side and rejected by
     // Druid with "column not found", even though the query has a
     // well-defined cross-source meaning.
-    const involvedLinkedNames: Record<string, true> = Object.keys(linkedAppliesByName).reduce(
-      (acc, n) => ((acc[n] = true), acc),
-      {} as Record<string, true>,
-    );
+    const involvedLinkedNames: Record<string, true> = Object.keys(linkedAppliesByName).reduce<
+      Record<string, true>
+    >((acc, n) => ((acc[n] = true), acc), {});
     for (const alias of this.split.keys) {
       const ex = this.split.splits[alias];
       const refs = ex.getFreeReferences();
@@ -3126,6 +3648,105 @@ export abstract class External {
       }
     }
     if (Object.keys(involvedLinkedNames).length === 0) return null;
+
+    // INV-2 decomposability gate.
+    //
+    // The JS-join path pre-aggregates main per join-key tuple, joins
+    // against the linked rows in memory, then projects the result.
+    // That's only safe when every main-side measure is a 'sum'-trait
+    // aggregate: a sum of partition partials equals the global sum.
+    // For countDistinct, average, quantile, mode (trait 'none'), and
+    // for min/max (trait 'min'/'max' — pending a type-aware post-join
+    // reducer, R-4), the pre-aggregate-then-join produces wrong
+    // numbers even when the join cardinality is right.
+    //
+    // Pre-check: only fire the gate when there's at least one
+    // linked-only split alias. With shared-only or main-only splits
+    // the fan-out doesn't happen (main's pre-aggregate already
+    // matches the grid grain), so JS-join stays valid even for
+    // non-decomposable measures.
+    //
+    // Linked-only signal: any alias whose free refs all resolve in
+    // some linkedSource's attributes AND none resolve in main. This
+    // is the same test the per-source loop applies; we precompute
+    // it here so the gate decision precedes the loop.
+    let gateHasLinkedOnlySplit = false;
+    {
+      const mainAttrsForGate: Record<string, true> = {};
+      for (const a of this.rawAttributes || []) mainAttrsForGate[a.name] = true;
+      for (const k in this.derivedAttributes) mainAttrsForGate[k] = true;
+      const taForGate = (this as any).timeAttribute;
+      if (typeof taForGate === 'string' && taForGate.length > 0) {
+        mainAttrsForGate[taForGate] = true;
+      }
+      for (const alias of this.split.keys) {
+        const exAlias = this.split.splits[alias];
+        const refs = exAlias.getFreeReferences();
+        if (refs.length === 0) continue;
+        const anyInMain = refs.some(r => mainAttrsForGate[r]);
+        if (anyInMain) continue;
+        for (const lsName in this.linkedSources) {
+          const ls = this.linkedSources[lsName];
+          const linkedAttrs: Record<string, true> = {};
+          if (ls.attributes) for (const a of ls.attributes as any[]) linkedAttrs[a.name] = true;
+          if (ls.derivedAttributes) for (const k in ls.derivedAttributes) linkedAttrs[k] = true;
+          if (refs.every(r => linkedAttrs[r])) {
+            gateHasLinkedOnlySplit = true;
+            break;
+          }
+        }
+        if (gateHasLinkedOnlySplit) break;
+      }
+    }
+
+    if (gateHasLinkedOnlySplit) {
+      const undecomposable = mainApplies.find(
+        a => a.expression.type !== 'DATASET' && !Expression.isMeasureDecomposable(a),
+      );
+      if (undecomposable) {
+        // The JS-join path is unsafe. Surface a nativeJoin
+        // discriminator so the execution layer (Phase 4) emits a
+        // single Druid SQL with an in-engine JOIN.
+        //
+        // Find the single linked-only split alias driving the GROUP
+        // BY. Multi-alias native-JOIN (e.g. linked-only × shared) is
+        // post-MVP; if the user splits on more than one linked-only
+        // alias, fall through to null so the caller gets a clear
+        // single-query SQL error rather than a half-built native
+        // join.
+        const linkedOnlySplitAliases: string[] = [];
+        const mainAttrsForGate2: Record<string, true> = {};
+        for (const a of this.rawAttributes || []) mainAttrsForGate2[a.name] = true;
+        for (const k in this.derivedAttributes) mainAttrsForGate2[k] = true;
+        const taForGate2 = (this as any).timeAttribute;
+        if (typeof taForGate2 === 'string' && taForGate2.length > 0) {
+          mainAttrsForGate2[taForGate2] = true;
+        }
+        for (const alias of this.split.keys) {
+          const exAlias = this.split.splits[alias];
+          const refs = exAlias.getFreeReferences();
+          if (refs.length === 0) continue;
+          const anyInMain = refs.some(r => mainAttrsForGate2[r]);
+          if (anyInMain) continue;
+          for (const lsName in this.linkedSources) {
+            const ls = this.linkedSources[lsName];
+            const linkedAttrs: Record<string, true> = {};
+            if (ls.attributes) for (const a of ls.attributes as any[]) linkedAttrs[a.name] = true;
+            if (ls.derivedAttributes) for (const k in ls.derivedAttributes) linkedAttrs[k] = true;
+            if (refs.every(r => linkedAttrs[r])) {
+              linkedOnlySplitAliases.push(alias);
+              break;
+            }
+          }
+        }
+        const nativeJoin = this.getNativeJoinDecomposition(
+          linkedOnlySplitAliases,
+          mainApplies,
+          involvedLinkedNames,
+        );
+        return nativeJoin;
+      }
+    }
 
     const linkedExternals: {
       name: string;

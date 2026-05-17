@@ -43,7 +43,7 @@ import {
 import { Ip } from '../datatypes/ip';
 import { iteratorFactory, PlyBit } from '../datatypes/valueStream';
 import { SQLDialect } from '../dialect/baseDialect';
-import { External, ExternalJS } from '../external/baseExternal';
+import { External, ExternalJS, PlywoodTraitMissing } from '../external/baseExternal';
 import { promiseWhile } from '../helper/promiseWhile';
 import { deduplicateSort, pipeWithError, repeat, shallowCopy } from '../helper/utils';
 import { DatasetFullType, Environment, PlyType, PlyTypeSimple, PlyTypeSingleValue } from '../types';
@@ -1754,6 +1754,48 @@ export abstract class Expression implements Instance<ExpressionValue, Expression
 
   public isAggregate(): boolean {
     return false;
+  }
+
+  /**
+   * INV-2 / INV-3 / P4 — measure decomposability gate.
+   *
+   * Walks the apply's expression tree. For every Aggregate-implementing
+   * node, reads the static `decomposable` trait declared on the
+   * concrete subclass (single source of truth — never inferred from
+   * the `op` string). Returns true iff every visited aggregate
+   * declares `'sum'`. Anything else (`'min'`, `'max'`, `'none'`) is
+   * NOT JS-join-decomposable in v1: `'min'`/`'max'` need a type-aware
+   * post-join reducer (out of scope, R-4); `'none'` is structurally
+   * unrecoverable from per-partition values.
+   *
+   * Throws `PlywoodTraitMissing` synchronously when a walked aggregate
+   * class lacks the static — fail-loud (P2), never silent-true. This
+   * forces every new aggregator to declare its trait explicitly.
+   */
+  public static isMeasureDecomposable(applyExpression: ApplyExpression): boolean {
+    if (!applyExpression || !applyExpression.expression) return true; // no value-contribution
+    let allSum = true;
+    applyExpression.expression.forEach(ex => {
+      if (!ex.isAggregate()) return;
+      // Aggregate mixin overwrites prototype.constructor (Plywood's
+      // `applyMixins` copies all own-property-names including
+      // `constructor`), so `ex.constructor` returns `Aggregate`, not
+      // the concrete subclass. Resolve via the op-keyed classMap
+      // instead — `op` is the stable identity Expression registers.
+      const ctor = Expression.classMap[ex.op] as any;
+      const trait = ctor && ctor.decomposable;
+      if (trait === undefined) {
+        throw new PlywoodTraitMissing(
+          `Expression.isMeasureDecomposable: aggregate class for op='${ex.op}' ` +
+            `(resolved=${ctor && ctor.name}) has no static \`decomposable: DecomposeTrait\` ` +
+            `declaration. Every aggregator must declare its trait — 'sum' for associative ` +
+            `reducers, 'none' as the safe default for opaque or non-associative aggregates. ` +
+            `See src/expressions/mixins/aggregate.ts for the contract.`,
+        );
+      }
+      if (trait !== 'sum') allSum = false;
+    });
+    return allSum;
   }
 
   /**

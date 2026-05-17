@@ -23,10 +23,19 @@ import {
   ExpressionJS,
   ExpressionValue,
 } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 
 export class AverageExpression extends ChainableUnaryExpression implements Aggregate {
   static op = 'Average';
+  // avg(A∪B) ≠ avg(avg(A), avg(B)) unless weighted by counts. The
+  // existing `decomposeAverage` (see :54) already rewrites avg to
+  // sum/count, but that rewrite must happen BEFORE the cross-source
+  // decomposition (currently it doesn't fire on the cross-source path).
+  // Until that rewrite is moved upstream of getCrossExternalDecomposition,
+  // trait stays 'none' (R-3 + section 8 out-of-scope follow-up).
+  // TODO(plywood-cross-source): promote to 'sum' once decomposeAverage
+  // is called pre-cross-source.
+  static decomposable: DecomposeTrait = 'none';
   static fromJS(parameters: ExpressionJS): AverageExpression {
     return new AverageExpression(ChainableUnaryExpression.jsToValue(parameters));
   }

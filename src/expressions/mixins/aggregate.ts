@@ -16,6 +16,28 @@
 
 import { Expression } from '../baseExpression';
 
+/**
+ * Decomposability trait — declared as a `static` on every class
+ * implementing the Aggregate mixin (INV-3). Single source of truth
+ * for whether a measure can be re-aggregated after a pre-aggregate-
+ * then-join across sources.
+ *
+ *   'sum'  — associative + commutative across disjoint partitions:
+ *            `f(A∪B) = f(A) + f(B)`. Safe for JS-join.
+ *   'min'  — `min(A∪B) = min(min(A), min(B))`. Safe, but requires a
+ *            min-reducer (not sum) in the post-join JS step; routed
+ *            through native-JOIN until that reducer lands (R-4).
+ *   'max'  — symmetric to min.
+ *   'none' — not losslessly re-aggregatable; native-JOIN is the
+ *            only correct path. Default for safety when the trait
+ *            isn't reasoned about (e.g. caller-supplied SQL).
+ *
+ * Every aggregator class declares the trait explicitly. A missing
+ * trait is never treated as 'sum' — `Expression.isMeasureDecomposable`
+ * throws `PlywoodTraitMissing` on the omission (fail-loud, INV-3).
+ */
+export type DecomposeTrait = 'sum' | 'min' | 'max' | 'none';
+
 export class Aggregate {
   public operand: Expression;
 

@@ -18,10 +18,13 @@ import { Dataset, Datum, PlywoodValue } from '../datatypes';
 import { SQLDialect } from '../dialect/baseDialect';
 
 import { ChainableExpression, Expression, ExpressionJS, ExpressionValue } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 
 export class CountExpression extends ChainableExpression implements Aggregate {
   static op = 'Count';
+  // count(A∪B) = count(A) + count(B) when partitions are disjoint
+  // (the join key partitions main exactly once). Safe for JS-join. INV-3.
+  static decomposable: DecomposeTrait = 'sum';
   static fromJS(parameters: ExpressionJS): CountExpression {
     return new CountExpression(ChainableExpression.jsToValue(parameters));
   }

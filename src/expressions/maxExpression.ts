@@ -23,10 +23,12 @@ import {
   ExpressionJS,
   ExpressionValue,
 } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 
 export class MaxExpression extends ChainableUnaryExpression implements Aggregate {
   static op = 'Max';
+  // Symmetric to min; see MinExpression.decomposable.
+  static decomposable: DecomposeTrait = 'max';
   static fromJS(parameters: ExpressionJS): MaxExpression {
     return new MaxExpression(ChainableUnaryExpression.jsToValue(parameters));
   }

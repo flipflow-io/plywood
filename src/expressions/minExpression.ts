@@ -23,10 +23,17 @@ import {
   ExpressionJS,
   ExpressionValue,
 } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 
 export class MinExpression extends ChainableUnaryExpression implements Aggregate {
   static op = 'Min';
+  // min(A∪B) = min(min(A), min(B)). Reducer differs from sum but is
+  // still 1-pass post-join. v1 routes min through native-JOIN (R-4
+  // in the spec: type-aware post-join reducer is out of scope for
+  // the first cut). The gate at getCrossExternalDecomposition only
+  // admits 'sum'-trait measures to JS-join; 'min' falls through to
+  // native-JOIN — same path as 'none'.
+  static decomposable: DecomposeTrait = 'min';
   static fromJS(parameters: ExpressionJS): MinExpression {
     return new MinExpression(ChainableUnaryExpression.jsToValue(parameters));
   }

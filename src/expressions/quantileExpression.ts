@@ -23,11 +23,16 @@ import {
   ExpressionJS,
   ExpressionValue,
 } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 import { RefExpression } from './refExpression';
 
 export class QuantileExpression extends ChainableUnaryExpression implements Aggregate {
   static op = 'Quantile';
+  // Sketch merge requires the underlying T-Digest/HLL bytes, which the
+  // SQL emitter discards into a NUMBER. Druid's native sketches could
+  // merge across partitions but Plywood doesn't carry the sketch
+  // through. Native-JOIN is the only correct path. INV-3.
+  static decomposable: DecomposeTrait = 'none';
   static fromJS(parameters: ExpressionJS): QuantileExpression {
     const value = ChainableUnaryExpression.jsToValue(parameters);
     value.value = parameters.value || (parameters as any).quantile;
