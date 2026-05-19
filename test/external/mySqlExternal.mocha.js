@@ -92,4 +92,66 @@ describe('MySQLExternal', () => {
       });
     });
   });
+
+  describe('getFrom (source as string vs string[])', () => {
+    const attributes = [
+      { name: 'time', type: 'TIME' },
+      { name: 'page', type: 'STRING' },
+      { name: 'added', type: 'NUMBER' },
+    ];
+
+    const noopRequester = () => {
+      const stream = new PassThrough({ objectMode: true });
+      setTimeout(() => stream.end(), 1);
+      return stream;
+    };
+
+    it('emits FROM "table" AS t for a single source string', () => {
+      const ext = External.fromJS({ engine: 'mysql', source: 'foo', attributes }, noopRequester);
+      expect(ext.getFrom()).to.equal('FROM `foo` AS t');
+    });
+
+    it('emits UNION ALL subquery when source is an array of two', () => {
+      const ext = External.fromJS(
+        { engine: 'mysql', source: ['foo', 'bar'], attributes },
+        noopRequester,
+      );
+      expect(ext.getFrom()).to.equal(
+        'FROM (SELECT * FROM `foo` UNION ALL SELECT * FROM `bar`) AS t',
+      );
+    });
+
+    it('escapes identifiers with backticks inside the union', () => {
+      const ext = External.fromJS(
+        { engine: 'mysql', source: ['weird`name', 'plain'], attributes },
+        noopRequester,
+      );
+      expect(ext.getFrom()).to.equal(
+        'FROM (SELECT * FROM `weird``name` UNION ALL SELECT * FROM `plain`) AS t',
+      );
+    });
+
+    it('treats a single-element array uniformly as a subquery', () => {
+      const ext = External.fromJS({ engine: 'mysql', source: ['only'], attributes }, noopRequester);
+      expect(ext.getFrom()).to.equal('FROM (SELECT * FROM `only`) AS t');
+    });
+
+    it('throws a clear error on an empty source array', () => {
+      const ext = External.fromJS({ engine: 'mysql', source: [], attributes }, noopRequester);
+      expect(() => ext.getFrom()).to.throw('source array must not be empty');
+    });
+
+    it('withQuery takes precedence over an array source', () => {
+      const ext = External.fromJS(
+        {
+          engine: 'mysql',
+          source: ['foo', 'bar'],
+          withQuery: 'SELECT 1',
+          attributes,
+        },
+        noopRequester,
+      );
+      expect(ext.getFrom()).to.equal('FROM __with__ AS t');
+    });
+  });
 });

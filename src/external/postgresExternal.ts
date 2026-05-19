@@ -36,7 +36,7 @@ export class PostgresExternal extends SQLExternal {
   static type = 'DATASET';
 
   static fromJS(parameters: ExternalJS, requester: PlywoodRequester<any>): PostgresExternal {
-    const value: ExternalValue = External.jsToValue(parameters, requester);
+    const value: ExternalValue = SQLExternal.jsToValue(parameters, requester);
     return new PostgresExternal(value);
   }
 

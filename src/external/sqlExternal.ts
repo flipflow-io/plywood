@@ -112,7 +112,13 @@ export abstract class SQLExternal extends External {
       return `FROM __with__ AS t`;
     }
 
-    return `FROM ${dialect.escapeName(source as string)} AS t`;
+    if (Array.isArray(source)) {
+      if (!source.length) throw new Error('source array must not be empty');
+      return `FROM (${source
+        .map(s => `SELECT * FROM ${dialect.escapeName(s)}`)
+        .join(' UNION ALL ')}) AS t`;
+    }
+    return `FROM ${dialect.escapeName(source)} AS t`;
   }
 
   // -----------------
