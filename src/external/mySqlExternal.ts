@@ -35,7 +35,7 @@ export class MySQLExternal extends SQLExternal {
   static type = 'DATASET';
 
   static fromJS(parameters: ExternalJS, requester: PlywoodRequester<any>): MySQLExternal {
-    const value: ExternalValue = External.jsToValue(parameters, requester);
+    const value: ExternalValue = SQLExternal.jsToValue(parameters, requester);
     return new MySQLExternal(value);
   }
 
