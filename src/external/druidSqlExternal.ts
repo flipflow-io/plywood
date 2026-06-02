@@ -134,6 +134,21 @@ export class DruidSQLExternal extends SQLExternal {
     this.context = parameters.context;
   }
 
+  /**
+   * Override to use Druid's TABLE(APPEND(...)) for array sources instead of the
+   * standard SELECT * UNION ALL emitted by SQLExternal. APPEND is schema-lenient
+   * (columns present in one datasource but not another become NULL), matching the
+   * behaviour of the native Druid `union` datasource used by DruidExternal.
+   */
+  protected getFrom(): string {
+    const { source, withQuery, dialect } = this;
+    if (Array.isArray(source) && !withQuery) {
+      if (!source.length) throw new Error('source array must not be empty');
+      return `FROM TABLE(APPEND(${source.map(s => dialect.escapeLiteral(s)).join(', ')})) AS t`;
+    }
+    return super.getFrom();
+  }
+
   public valueOf(): ExternalValue {
     const value: ExternalValue = super.valueOf();
     value.context = this.context;
