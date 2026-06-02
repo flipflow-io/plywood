@@ -3253,7 +3253,7 @@ export abstract class External {
               if (inflaters.length > 0) {
                 for (const r of rows) for (const inf of inflaters) inf(r);
               }
-              const ds = new Dataset({
+              let ds = new Dataset({
                 keys: nj.keys,
                 attributes: [
                   ...splitAttributeInfos,
@@ -3261,6 +3261,22 @@ export abstract class External {
                 ],
                 data: rows,
               });
+              // Post-join HAVING / sort / limit (mirror of the jsJoin branch at
+              // ~3341-3349). The engine returned the JOIN+GROUP BY rows; the
+              // HAVING is applied here by alias (the Dataset is keyed by
+              // applyNames). When a HAVING is present the combined SQL stripped
+              // its inline ORDER BY / LIMIT, so sort/limit must run AFTER the
+              // filter — order filter → sort → limit — else a pre-filter cut
+              // would starve the surviving rows.
+              if (crossExt.postJoinHavingFilter) {
+                ds = ds.filter(crossExt.postJoinHavingFilter);
+              }
+              if (crossExt.postJoinSort) {
+                ds = ds.sort(crossExt.postJoinSort.expression, crossExt.postJoinSort.direction);
+              }
+              if (crossExt.postJoinLimit) {
+                ds = ds.limit(crossExt.postJoinLimit.value);
+              }
               External.assertDatasetShape(ds); // INV-1: also pin the native-JOIN result.
               resolve(ds);
             });
@@ -3880,6 +3896,20 @@ export abstract class External {
       joinMode: 'inner' | 'left';
     }[];
     syntheticJoinAliases?: string[];
+    // HAVING applied POST-JOIN against the returned Dataset (mirror of the
+    // jsJoin branch). The native-JOIN applies never pass through
+    // `External.addExpression`, so `$uniq` is not absorbed as a column and an
+    // in-SQL `HAVING COUNT(DISTINCT …)` would reference an unresolvable alias.
+    // The executor keys the Dataset by `applyNames`, so `Dataset.filter($uniq >
+    // N)` runs by alias — identical to the jsJoin path. Undefined when the
+    // outer External carries no havingFilter.
+    postJoinHavingFilter?: Expression;
+    // When a postJoinHavingFilter is present the combined SQL's inline ORDER BY
+    // / LIMIT are STRIPPED (else the engine cuts to LIMIT before the post-join
+    // filter runs and surviving rows starve) and surfaced here; the executor
+    // applies them AFTER the having filter, in order filter → sort → limit.
+    postJoinSort?: SortExpression;
+    postJoinLimit?: LimitExpression;
   } {
     // Phase 4: support single linked-only split + single linkedSource.
     // Multi-alias and multi-source native-JOIN are post-MVP.
@@ -4120,14 +4150,66 @@ export abstract class External {
     // a [Time(Day) × country] double split emits `GROUP BY 1, 2`.
     sqlParts.push(`GROUP BY ${groupByPositions.join(', ')}`);
 
-    // Sort/limit routing: if the user's sort/limit references the
-    // split alias or any apply name, append. Otherwise omit — the
-    // post-join layer will apply them.
-    if (this.sort) {
-      sqlParts.push(this.sort.getSQL(dialect));
+    // HAVING routing (mirror of the jsJoin branch, ~5006-5028). A `.filter()`
+    // on the aggregate value folded into `this.havingFilter`. The native-JOIN
+    // applies do NOT pass through `External.addExpression`, so `$uniq` is never
+    // absorbed as a column and an in-SQL `HAVING COUNT(DISTINCT …) > N` would
+    // reference an unresolvable alias. We therefore apply the HAVING POST-JOIN:
+    // the executor keys the result Dataset by `applyNames`, so
+    // `Dataset.filter($uniq > N)` runs by alias — exactly like the jsJoin path.
+    //
+    // Scope split: the projectable names are the rendered measure aliases plus
+    // every split key. A clause over a projectable name → postJoinHavingFilter.
+    // A clause over anything NOT projected can't be evaluated post-join either,
+    // so it fails loud rather than being silently dropped (the original bug).
+    let postJoinHavingFilter: Expression | undefined;
+    let postJoinSort: SortExpression | undefined;
+    let postJoinLimit: LimitExpression | undefined;
+    if (this.havingFilter && !this.havingFilter.equals(Expression.TRUE)) {
+      const projectableNames: Record<string, true> = {};
+      for (const n of applyNames) projectableNames[n] = true;
+      for (const k of orderedSplitKeyAliases) projectableNames[k] = true;
+      // `splitFilterByScope(filter, names)` returns clauses over `names` as its
+      // `main` half and clauses over names OUTSIDE the set as its `post` half.
+      // Here `names` = the projectable post-join names, so its `main` half is
+      // exactly what we can evaluate post-join and its `post` half is the
+      // UNPROJECTED remainder we must reject loudly.
+      const { main: havingProjectable, post: havingUnprojected } = External.splitFilterByScope(
+        this.havingFilter,
+        projectableNames,
+      );
+      if (!havingUnprojected.equals(Expression.TRUE)) {
+        const offending = havingUnprojected
+          .getFreeReferences()
+          .filter(r => !projectableNames[r])
+          .join(', ');
+        throw new PlywoodUnsupportedNativeJoinShape(
+          `native-JOIN HAVING references non-projected name(s) [${offending}] — ` +
+            `only the rendered measure aliases [${applyNames.join(', ')}] and split keys ` +
+            `[${orderedSplitKeyAliases.join(', ')}] are resolvable post-join`,
+        );
+      }
+      if (!havingProjectable.equals(Expression.TRUE)) {
+        postJoinHavingFilter = havingProjectable;
+      }
     }
-    if (this.limit) {
-      sqlParts.push(this.limit.getSQL(dialect));
+
+    // Sort/limit routing. When a HAVING moved post-join the inline ORDER BY /
+    // LIMIT MUST be STRIPPED from the SQL: if the engine cut to LIMIT before the
+    // post-join filter ran, surviving rows would starve (mirror of jsJoin
+    // ~5019-5028). They are surfaced as postJoinSort / postJoinLimit and the
+    // executor applies them AFTER the filter, in order filter → sort → limit.
+    // Without a HAVING the inline sort/limit stay put (Druid topN) — orthogonal.
+    if (postJoinHavingFilter) {
+      if (this.sort) postJoinSort = this.sort;
+      if (this.limit) postJoinLimit = this.limit;
+    } else {
+      if (this.sort) {
+        sqlParts.push(this.sort.getSQL(dialect));
+      }
+      if (this.limit) {
+        sqlParts.push(this.limit.getSQL(dialect));
+      }
     }
 
     const sql = sqlParts.join('\n');
@@ -4154,6 +4236,9 @@ export abstract class External {
       mainExternal: this,
       linkedExternals: [],
       syntheticJoinAliases: [],
+      postJoinHavingFilter,
+      postJoinSort,
+      postJoinLimit,
     };
   }
 
