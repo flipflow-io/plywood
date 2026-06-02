@@ -1401,6 +1401,190 @@ export abstract class External {
   }
 
   /**
+   * Post-join re-aggregation to the user's split grain (INV-1 producer).
+   *
+   * The JS-join cross-source path pre-aggregates main at the JOIN-KEY grain
+   * (e.g. one row per `brand`) and the linked side maps join-key → user-split
+   * value (e.g. `brand` → `brand_country`). The join therefore fans main's
+   * aggregate rows out: every (brand, country) pair carries the brand-level
+   * count, so a country with N brands appears in N rows. The user asked for
+   * the COUNTRY grain — those N rows must collapse to one, with each measure
+   * recombined according to its decomposability trait.
+   *
+   * This is what makes the JS-join lossless for `sum`-class measures and is
+   * MANDATORY for the cross-engine case (a Postgres staging view × main Druid
+   * cannot use the in-engine native JOIN, so JS-join is the only path).
+   *
+   * Combination is by DecomposeTrait, declared per aggregator in
+   * `mixins/aggregate.ts`:
+   *   - 'sum' → numeric sum across the fanned rows (count, sum, and
+   *             avg-rewritten sum/count all reduce this way)
+   *   - 'min' → minimum
+   *   - 'max' → maximum
+   *   - 'none' → THROW. The decomposability gate is supposed to divert
+   *             non-recombinable measures to the native-JOIN path; a 'none'
+   *             trait reaching here is a gate bug, surfaced loud rather than
+   *             silently returning a wrong number.
+   *
+   * `reAggKeys` is the user's split grain (split keys minus the synthetic
+   * join aliases). `applyTraits` maps each value-apply column to its trait.
+   * Group keys not present in a row are treated as the row's value verbatim;
+   * non-numeric apply values for sum/min/max throw (shape contract).
+   *
+   * No-op (returns the dataset unchanged) when there is no fan-out — the
+   * common case where the split grain already equals the join-key grain.
+   */
+  static reAggregateToSplitGrain(
+    dataset: Dataset,
+    reAggKeys: string[],
+    applyTraits: Record<string, 'sum' | 'min' | 'max' | 'none'>,
+  ): Dataset {
+    if (!dataset || !reAggKeys || reAggKeys.length === 0) return dataset;
+    const data = dataset.data;
+    if (!data || data.length === 0) return dataset;
+
+    // Fast path: if every reAggKey tuple is already distinct there is no
+    // fan-out to collapse — return as-is to preserve the original instance
+    // (and avoid touching non-numeric apply columns needlessly).
+    const seenTuples: Record<string, true> = {};
+    let hasFanOut = false;
+    for (const row of data) {
+      const tupleKey = reAggKeys.map(k => JSON.stringify((row as any)[k])).join('|');
+      if (seenTuples[tupleKey]) {
+        hasFanOut = true;
+        break;
+      }
+      seenTuples[tupleKey] = true;
+    }
+    if (!hasFanOut) return dataset;
+
+    const applyNames = Object.keys(applyTraits);
+    // If ANY measure is non-recombinable ('none' — notably `average`, whose
+    // single-column ratio projection cannot be summed across partitions),
+    // re-aggregation cannot produce a correct result for this dataset. Do NOT
+    // partially collapse (that would silently mix correct sum columns with a
+    // wrong avg column). Leave the dataset untouched so the downstream INV-1
+    // net (`assertDatasetShape`) fails loud on the fan-out — the documented,
+    // pre-existing limitation for avg + linked-only split (the correct fix is
+    // to route those measures to native-JOIN, tracked separately). Sum/min/max
+    // -only queries fall through and collapse normally.
+    const hasNonRecombinable = applyNames.some(n => applyTraits[n] === 'none');
+    if (hasNonRecombinable) return dataset;
+
+    const groups = new Map<string, Datum>();
+    const order: string[] = [];
+    for (const row of data) {
+      const tupleKey = reAggKeys.map(k => JSON.stringify((row as any)[k])).join('|');
+      let acc = groups.get(tupleKey);
+      if (!acc) {
+        // Seed the accumulator with the group-key columns plus any
+        // non-apply columns from the first row (carried verbatim).
+        acc = {};
+        for (const k in row) {
+          if (!hasOwnProp(row, k)) continue;
+          acc[k] = (row as any)[k];
+        }
+        groups.set(tupleKey, acc);
+        order.push(tupleKey);
+        continue;
+      }
+      for (const name of applyNames) {
+        const trait = applyTraits[name];
+        const incoming = (row as any)[name];
+        const current = (acc as any)[name];
+        if (incoming == null) continue; // left-join orphan contributes nothing
+        if (current == null) {
+          (acc as any)[name] = incoming;
+          continue;
+        }
+        if (trait === 'sum') {
+          if (typeof current !== 'number' || typeof incoming !== 'number') {
+            throw new Error(
+              `External.reAggregateToSplitGrain: apply "${name}" has trait 'sum' but a ` +
+                `non-numeric value (${JSON.stringify(current)} / ${JSON.stringify(incoming)}); ` +
+                `sum re-aggregation requires numeric measure columns.`,
+            );
+          }
+          (acc as any)[name] = current + incoming;
+        } else if (trait === 'min') {
+          (acc as any)[name] = incoming < current ? incoming : current;
+        } else if (trait === 'max') {
+          (acc as any)[name] = incoming > current ? incoming : current;
+        } else {
+          // trait === 'none' — the gate should have diverted this measure
+          // to native-JOIN. Reaching here means the gate let a
+          // non-recombinable measure into the JS-join path: fail loud.
+          throw new Error(
+            `External.reAggregateToSplitGrain: apply "${name}" has non-recombinable trait ` +
+              `'none' but reached post-join re-aggregation. The decomposability gate must ` +
+              `divert 'none'-trait measures to the native-JOIN path; this is a gate bug. ` +
+              `Re-aggregating it would silently produce a wrong value.`,
+          );
+        }
+      }
+    }
+
+    const collapsed: Datum[] = order.map(k => groups.get(k)!);
+    return new Dataset({
+      attributes: dataset.attributes,
+      keys: reAggKeys,
+      data: collapsed,
+    });
+  }
+
+  /**
+   * Resolve the single re-aggregation trait for a value-apply: the reducer
+   * the post-join step uses to collapse fan-out rows to the user's split
+   * grain.
+   *
+   * A column is post-join re-aggregatable by a SINGLE reducer only when the
+   * apply's value expression is ONE aggregate (after the avg→sum/count
+   * rewrite), and that aggregate's static `decomposable` trait
+   * (mixins/aggregate.ts, INV-3) is 'sum' | 'min' | 'max':
+   *
+   *   - count / sum  → 'sum'  (associative + commutative across partitions)
+   *   - min / max    → 'min' / 'max'
+   *
+   * Everything else resolves to 'none' — NOT post-join-reducible:
+   *
+   *   - a DERIVED root (e.g. `average` rewrites to `divide(sum, count)`):
+   *     the projected column is a RATIO already evaluated per main-row.
+   *     Summing ratios across partitions is mathematically wrong (the sum
+   *     of per-brand averages is not the tier-level average). The correct
+   *     path carries the underlying sum/count separately and divides AFTER
+   *     re-agg — which this single-column projection does not do — so it
+   *     must route to native-JOIN (one SQL computes the avg at the user's
+   *     grain) instead.
+   *   - 'none'-trait aggregates (countDistinct, quantile, mode): not
+   *     losslessly recombinable from pre-aggregated partitions.
+   *
+   * A 'none' result tells the gate to divert the measure to native-JOIN;
+   * `reAggregateToSplitGrain` throws loud if a 'none' still reaches it. A
+   * missing trait throws `PlywoodTraitMissing` via the same path as
+   * `isMeasureDecomposable` — never silently defaulted.
+   */
+  static resolveApplyDecomposeTrait(apply: ApplyExpression): 'sum' | 'min' | 'max' | 'none' {
+    if (!apply || !apply.expression) return 'sum'; // no value contribution
+    // Rewrite avg→sum/count first so the root-op check sees the canonical
+    // form (avg's root becomes `divide`, correctly classified 'none').
+    const root = apply.expression.decomposeAverage();
+    if (!root.isAggregate()) {
+      // Derived combination of aggregates (divide/add/subtract/…) — not a
+      // single post-join reducer. Forces native-JOIN via the gate.
+      return 'none';
+    }
+    const ctor = Expression.classMap[root.op] as any;
+    const trait = ctor && ctor.decomposable;
+    if (trait === undefined) {
+      // Reuse isMeasureDecomposable's fail-loud path so the error message +
+      // exception type stay identical (INV-3, PlywoodTraitMissing).
+      Expression.isMeasureDecomposable(apply);
+    }
+    if (trait === 'sum' || trait === 'min' || trait === 'max') return trait;
+    return 'none';
+  }
+
+  /**
    * Transparent net (INV-1). Walks `dataset.data` building a multiset
    * keyed by the tuple of `dataset.keys`. If any tuple appears more
    * than once, throws `PlywoodCardinalityViolation` synchronously
@@ -2848,6 +3032,26 @@ export abstract class External {
               joined = joined.join(linked[i] as Dataset, crossExt.linkedExternals[i].joinMode);
             }
           }
+          // Re-aggregate to the user's split grain BEFORE HAVING/sort/limit.
+          // The join fans main's join-key-grain rows (one per `brand`) out
+          // across the linked split values, so a country with N brands shows
+          // N rows each carrying the brand-level measure. Collapsing here is
+          // mandatory:
+          //   - Ordering vs HAVING: HAVING predicates over a measure must see
+          //     the country-grain value (sum of brands), not a per-brand value.
+          //   - Ordering vs sort/limit: a limit BEFORE collapse would cut
+          //     pre-collapse brand rows, silently dropping whole countries.
+          //   So re-agg must precede all three.
+          // For sum-class measures (count/sum/avg-rewritten) this is lossless;
+          // it is also the ONLY correct path for cross-engine linked sources,
+          // where the native in-engine JOIN is impossible.
+          if (crossExt.reAggKeys && crossExt.reAggKeys.length > 0) {
+            joined = External.reAggregateToSplitGrain(
+              joined,
+              crossExt.reAggKeys,
+              crossExt.reAggApplyTraits || {},
+            );
+          }
           // Apply the post-join HAVING before sort/limit so sort ordering
           // reflects only the surviving rows, and limit caps against the
           // filtered result — not the pre-filter row count (which would
@@ -3631,6 +3835,16 @@ export abstract class External {
     // applies them against the joined Dataset after the in-memory join,
     // before postJoinSort / postJoinLimit run.
     postJoinHavingFilter?: Expression;
+    // Post-join re-aggregation grain (INV-1). The user's split keys minus
+    // the synthetic join aliases — the grain the JS-join result must collapse
+    // to after the in-memory join fans main's join-key-grain rows out across
+    // the linked split values. Empty/undefined when there is no linked-only
+    // split (no fan-out possible).
+    reAggKeys?: string[];
+    // Per-value-apply decomposability trait, keyed by apply name. Drives the
+    // post-join re-aggregation reducer (sum/min/max). 'none' here is a gate
+    // bug (those measures must route to native-JOIN) and fails loud at re-agg.
+    reAggApplyTraits?: Record<string, 'sum' | 'min' | 'max' | 'none'>;
   } | null {
     if (this.mode !== 'split') return null;
     if (!this.applies || this.applies.length === 0) return null;
@@ -4334,6 +4548,22 @@ export abstract class External {
     const syntheticAliasMap: Record<string, true> | undefined = (this as any)._syntheticAliasMap;
     const syntheticJoinAliases = syntheticAliasMap ? Object.keys(syntheticAliasMap) : undefined;
 
+    // Post-join re-aggregation grain (INV-1). The user's split keys with the
+    // synthetic join aliases removed — the grain the JS-join must collapse to
+    // after the join fans main's join-key-grain rows across the linked split.
+    // When this equals the join-key grain (no linked-only split), there is no
+    // fan-out and the re-agg is a no-op; we still publish the keys so the
+    // executor's net is unconditional.
+    const syntheticSet = syntheticAliasMap || {};
+    const reAggKeys = (this.split ? this.split.keys : []).filter(k => !syntheticSet[k]);
+    // Trait per value-apply, driving the re-agg reducer. Built from the
+    // avg-rewritten applies so count/sum/avg all resolve to 'sum'.
+    const reAggApplyTraits: Record<string, 'sum' | 'min' | 'max' | 'none'> = {};
+    for (const a of rewrittenApplies) {
+      if (a.expression && a.expression.type === 'DATASET') continue; // nested dataset apply
+      reAggApplyTraits[a.name] = External.resolveApplyDecomposeTrait(a);
+    }
+
     return {
       mainExternal,
       linkedExternals,
@@ -4341,6 +4571,8 @@ export abstract class External {
       postJoinLimit,
       syntheticJoinAliases,
       postJoinHavingFilter,
+      reAggKeys,
+      reAggApplyTraits,
     };
   }
 }
