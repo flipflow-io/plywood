@@ -79,7 +79,9 @@ describe('Cross-source: negated cube filter prunes to identity on the linked sid
     expect(linked.length, 'lookup sub-query emitted').to.be.greaterThan(0);
     for (const q of linked) {
       expect(q, `lookup SQL must not be emptied:\n${q}`).to.not.match(/WHERE\s+FALSE/i);
-      expect(q, `main-only columns must not leak into lookup SQL:\n${q}`).to.not.match(/"url"|"price"/);
+      expect(q, `main-only columns must not leak into lookup SQL:\n${q}`).to.not.match(
+        /"url"|"price"/,
+      );
     }
   });
 

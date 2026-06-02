@@ -97,7 +97,7 @@ function renderAggregateSQL(
   applyValueExpr: Expression,
   dialect: SQLDialect,
   tableAlias: string,
-): string | null {
+): string {
   // The apply's expression is typically the aggregate directly
   // (countDistinct, sum, etc.) or a binary chain (sum(a) + sum(b)).
   // For v1 we handle the simple-aggregate case — the gate routes
@@ -119,7 +119,13 @@ function renderAggregateSQL(
   };
 
   const ex: any = applyValueExpr;
-  if (!ex || !ex.op) return null;
+  if (!ex || !ex.op) {
+    throw new PlywoodUnsupportedNativeJoinShape(
+      `renderAggregateSQL: measure expression has no op (${
+        applyValueExpr ? applyValueExpr.toString() : String(applyValueExpr)
+      }); cannot render as a native-JOIN aggregate.`,
+    );
+  }
   const op = ex.op;
   // Stub operandSQL: any string lacking ' WHERE ' satisfies
   // aggregateFilterIfNeeded's "no per-apply filter" branch.
@@ -149,7 +155,20 @@ function renderAggregateSQL(
       );
     }
     default:
-      return null;
+      // Fail-loud (P2): an unrecognised op reaching here means the caller
+      // routed a measure shape this renderer does not understand (e.g. a
+      // derived `divide`/`subtract` expression that was not decomposed into
+      // single-aggregate leaves first). Returning null previously let the
+      // caller silently drop the SELECT item while the ORDER BY / GROUP BY
+      // still referenced it, emitting malformed SQL that died at the engine.
+      // Throw so the bad query never reaches the requester.
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `renderAggregateSQL: cannot render measure expression with root op='${op}' ` +
+          `(${applyValueExpr.toString()}) as a single native-JOIN aggregate. Native-JOIN ` +
+          `expects each projected measure to be one aggregate (count/sum/min/max/average/` +
+          `countDistinct). Derived measures must be decomposed into single-aggregate leaves ` +
+          `before reaching this renderer.`,
+      );
   }
 }
 
@@ -1173,7 +1192,7 @@ export abstract class External {
     if (
       operand instanceof LiteralExpression &&
       anyOp.expression instanceof RefExpression &&
-      (anyOp.expression as any).nest === 0 &&
+      anyOp.expression.nest === 0 &&
       !schemaNames[anyOp.expression.name]
     ) {
       return Expression.TRUE;
@@ -1557,6 +1576,49 @@ export abstract class External {
   }
 
   /**
+   * Replay the scalar recombination half of the segregate-then-recombine
+   * decomposition. After `reAggregateToSplitGrain` has collapsed the
+   * homomorphic leaf aggregates (`!T_0 = sum($x)`, `!T_1 = count()`, …) to the
+   * user's split grain, this reconstructs each derived measure by evaluating
+   * its post-aggregate expression (`avg_price = $!T_0 / $!T_1`) per row, then
+   * drops the synthetic leaf columns (`!T_*`) so the caller sees only the
+   * measures they requested.
+   *
+   * Orthogonal to re-aggregation: the leaves are the only thing the join and
+   * re-agg touch; the recombination is pure per-row scalar arithmetic with no
+   * cross-row dependency, so it is correct to apply AFTER the grain has
+   * collapsed. No-op when `postAggregateApplies` is empty (every measure was a
+   * single aggregate kept under its own name).
+   *
+   * Synthetic-leaf naming: `segregationAggregateApplies` mints leaf names
+   * prefixed `!T_`. Those — and only those — are dropped; a single-aggregate
+   * measure that segregation kept under its own user-facing name (e.g.
+   * `price_min`) is never a `!T_` column and survives.
+   */
+  static applyPostAggregateRecombination(
+    dataset: Dataset,
+    postAggregateApplies: ApplyExpression[] | undefined,
+  ): Dataset {
+    if (!dataset) return dataset;
+    if (!postAggregateApplies || postAggregateApplies.length === 0) return dataset;
+    let out = dataset;
+    for (const apply of postAggregateApplies) {
+      out = out.apply(apply.name, apply.expression);
+    }
+    // Drop synthetic leaf columns (`!T_*`). Read the actual column set from the
+    // first datum rather than trusting `attributes`, since `Dataset.apply` adds
+    // derived columns to the data without necessarily refreshing attributes.
+    const sample = out.data && out.data[0] ? out.data[0] : {};
+    const syntheticLeaves: string[] = [];
+    for (const col in sample) {
+      if (!hasOwnProp(sample, col)) continue;
+      if (col.indexOf('!T_') === 0) syntheticLeaves.push(col);
+    }
+    if (syntheticLeaves.length === 0) return out;
+    return External.dropColumns(out, syntheticLeaves);
+  }
+
+  /**
    * Resolve the single re-aggregation trait for a value-apply: the reducer
    * the post-join step uses to collapse fan-out rows to the user's split
    * grain.
@@ -1844,6 +1906,101 @@ export abstract class External {
       }
     }
     if (Object.keys(schemas).length === 0) return expression;
+
+    // Per-linkedSource harvest of the linked-ONLY filter clauses.
+    //
+    // The Turnilo front stamps the full cube filter (including clauses over a
+    // column that lives ONLY in a magic-dim lookup, e.g.
+    // `$brand_country.overlap(['Francia'])`) onto BOTH the main `.filter()` and
+    // every linked-source apply. `pruneFilterToSchema` below correctly keeps
+    // such a clause only in the apply of the lookup that owns the column. But
+    // that apply is a sibling DATASET apply no output measure references — so
+    // the very next `.simplify()` in `_initialPrepare` deletes it as dead code,
+    // taking the linked-only clause with it. Decomposition then seeds the
+    // lookup sub-query's filter from `this.filter` (main's filter), which never
+    // carried the linked-only column, and the lookup query emits no WHERE →
+    // the inner join restricts nothing → the user sees EVERY value of the
+    // linked dimension instead of the one they filtered to.
+    //
+    // To survive simplify, the harvested clause must travel WITH THIS QUERY.
+    // It is an IMMUTABLE per-request derivation: we never write into the
+    // linkedSource config we received. That config object is shared by
+    // reference across every External `valueOf()`/`fromValue` derives downstream
+    // (value.linkedSources = this.linkedSources) AND — in the server — it is the
+    // long-lived settings-manager cube config reused by EVERY request. Mutating
+    // its `.filter` (the v1 approach) leaked the clause cross-request: after one
+    // Francia query, every later no-filter query on the same cube emitted the
+    // lookup with `WHERE brand_country = 'Francia'`. Instead we derive a FRESH
+    // main External with a FRESH linkedSources map whose owning-lookup config is
+    // a shallow copy carrying the harvested `filter`, and bind THAT copy into
+    // this request's datum slot (`context[k]`). The datum map is per-request, so
+    // replacing its slot touches nothing shared; the derived External (and its
+    // fresh config) rides the resolve→simplify→decomposition pipeline as `this`,
+    // where getCrossExternalDecomposition reads the harvested clause off the
+    // per-request config. See getCrossExternalDecomposition (templateFilter),
+    // the simulateDruidLinkedDimFilter Francia wire fixture, and the
+    // simulateDruidLinkedDimFilterContamination cross-request suite.
+    for (const k in context) {
+      const v = context[k];
+      if (!(v instanceof External) || !v.linkedSources) continue;
+      const mainSchema = schemas[k] || {};
+      const timeAttrName = (v as any).timeAttribute;
+      // Harvested linked-only clauses for this main, keyed by linkedSource name.
+      // Accumulated on the stack — nothing shared is touched until we mint the
+      // per-request copy below.
+      const harvested: Record<string, Expression> = {};
+      for (const lsName in v.linkedSources) {
+        const linkedSchema = schemas[lsName];
+        if (!linkedSchema) continue;
+        // Linked-ONLY names: columns the lookup has that main does NOT, minus
+        // the time attribute. Pruning a filter to this schema isolates exactly
+        // the clauses main cannot absorb (so they would otherwise be lost) and
+        // that are not the shared time bound (which the eternal/bucketed
+        // alignment logic at decomposition handles on its own — re-stashing it
+        // here would, under `timeAlignment:eternal`, filter a sentinel-time
+        // snapshot lookup down to zero rows).
+        const linkedOnly: Record<string, true> = {};
+        for (const n in linkedSchema) {
+          if (mainSchema[n]) continue;
+          if (typeof timeAttrName === 'string' && n === timeAttrName) continue;
+          linkedOnly[n] = true;
+        }
+        if (Object.keys(linkedOnly).length === 0) continue;
+        // Walk the tree for any `.filter(F)` whose operand refs this main or
+        // this lookup; harvest the linked-only clauses of F into the local map.
+        expression.forEach(e => {
+          if (!(e instanceof FilterExpression)) return;
+          const op = e.operand;
+          if (!(op instanceof RefExpression)) return;
+          if (op.name !== k && op.name !== lsName) return;
+          const residue = External.pruneFilterToSchema(e.expression, linkedOnly);
+          if (residue.equals(Expression.TRUE)) return;
+          const prev = harvested[lsName];
+          harvested[lsName] =
+            prev && !prev.equals(Expression.TRUE) ? prev.and(residue).simplify() : residue;
+        });
+      }
+      // Nothing harvested → leave the shared External untouched (the common
+      // case: no linked-only filter, the fix is fully inert).
+      if (Object.keys(harvested).length === 0) continue;
+      // Mint a per-request copy: fresh linkedSources MAP, fresh config OBJECT
+      // for each owning lookup, with the harvested clause as `config.filter`.
+      // Lookups with no harvested clause keep their original config by
+      // reference (read-only — never mutated). Then rebind this request's datum
+      // slot to the copy so resolve/decomposition see the harvested filter
+      // without ever writing to the shared config.
+      const freshLinked: Record<string, LinkedSourceConfig> = {};
+      for (const lsName in v.linkedSources) {
+        const orig = v.linkedSources[lsName];
+        const clause = harvested[lsName];
+        freshLinked[lsName] = clause
+          ? ({ ...(orig as any), filter: clause } as LinkedSourceConfig)
+          : orig;
+      }
+      const copyValue = v.valueOf();
+      copyValue.linkedSources = freshLinked;
+      context[k] = External.fromValue(copyValue);
+    }
 
     return expression.substitute(e => {
       // Target: .filter(F) whose operand is a RefExpression to a known source
@@ -3076,6 +3233,15 @@ export abstract class External {
               crossExt.reAggApplyTraits || {},
             );
           }
+          // Replay the scalar recombination (segregate-then-recombine). The
+          // leaf aggregates were just re-aggregated to the split grain; now
+          // reconstruct each derived measure (e.g. `avg_price = $!T_0/$!T_1`)
+          // over the collapsed rows, then drop the synthetic leaf columns so
+          // the caller sees only the measures they asked for. This MUST run
+          // before HAVING/sort/limit, which reference the derived measure
+          // names. For all-single-aggregate queries postAggregateApplies is
+          // empty and this is a no-op.
+          joined = External.applyPostAggregateRecombination(joined, crossExt.postAggregateApplies);
           // Apply the post-join HAVING before sort/limit so sort ordering
           // reflects only the surviving rows, and limit caps against the
           // filtered result — not the pre-filter row count (which would
@@ -3746,8 +3912,11 @@ export abstract class External {
       const prevTable = (dialect as any).table;
       (dialect as any).setTable(mainAlias);
       try {
+        // renderAggregateSQL throws (PlywoodUnsupportedNativeJoinShape) on any
+        // unrenderable op — it never returns a silent null that would drop the
+        // SELECT item while the ORDER BY still references it. So every value
+        // apply is guaranteed to contribute a SELECT column here.
         const aggSQL = renderAggregateSQL(aggExpr, dialect, mainAlias);
-        if (aggSQL == null) continue;
         selectParts.push(`${aggSQL} AS ${escName(apply.name)}`);
         applyNames.push(apply.name);
       } finally {
@@ -3865,10 +4034,18 @@ export abstract class External {
     // the linked split values. Empty/undefined when there is no linked-only
     // split (no fan-out possible).
     reAggKeys?: string[];
-    // Per-value-apply decomposability trait, keyed by apply name. Drives the
-    // post-join re-aggregation reducer (sum/min/max). 'none' here is a gate
-    // bug (those measures must route to native-JOIN) and fails loud at re-agg.
+    // Per-LEAF decomposability trait, keyed by leaf-aggregate column name.
+    // Drives the post-join re-aggregation reducer (sum/min/max). 'none' here is
+    // a gate bug (those leaves must route to native-JOIN) and fails loud at
+    // re-agg.
     reAggApplyTraits?: Record<string, 'sum' | 'min' | 'max' | 'none'>;
+    // Scalar recombination applies (Ogievetsky segregate-then-recombine). The
+    // main sub-query projects the homomorphic leaf aggregates; after the
+    // post-join re-aggregation collapses the leaves to the user's split grain,
+    // the execution layer replays these applies (e.g. `avg_price = $!T_0 /
+    // $!T_1`) to reconstruct the derived measures, then drops the leaf columns.
+    // Empty for queries whose measures are all single aggregates.
+    postAggregateApplies?: ApplyExpression[];
   } | null {
     if (this.mode !== 'split') return null;
     if (!this.applies || this.applies.length === 0) return null;
@@ -3945,6 +4122,13 @@ export abstract class External {
         return null;
       }
     }
+
+    // Split the main-side applies into scope-registration (DATASET) applies —
+    // carried verbatim — and value applies, which may be segregated into
+    // homomorphic leaf aggregates below (only when a linked-only split makes
+    // the join fan main rows out; see `mainLeafApplies` after the gate).
+    const mainDatasetApplies = mainApplies.filter(a => a.expression.type === 'DATASET');
+    const mainValueApplies = mainApplies.filter(a => a.expression.type !== 'DATASET');
 
     // A cross-source query is triggered by either of two signals:
     //
@@ -4041,11 +4225,53 @@ export abstract class External {
       }
     }
 
+    // Algebraic decomposition of main-side measures into homomorphic leaf
+    // aggregates + a scalar recombination (Ogievetsky's segregate-then-
+    // recombine, the same machinery `segregationAggregateApplies` already uses
+    // for nested-aggregate applies).
+    //
+    // ONLY when there is a linked-only split. That is the sole shape where the
+    // join fans main's join-key-grain rows out across the linked split, so the
+    // grid grain (e.g. brand_country) is coarser than main's pre-aggregate
+    // grain (brand). A measure like `average($x)` = `sum($x)/count()` is then a
+    // ratio that cannot be recombined across the fan-out (media-de-medias):
+    // summing per-brand averages is not the per-country average. We must carry
+    // the homomorphic LEAVES (`sum($x)`, `count()`) as separate columns —
+    // each re-aggregatable by its own trait — and replay the deriving scalar
+    // function (`divide`) AFTER re-aggregation at the split grain.
+    //
+    // When the split is shared/main-only there is NO fan-out: main already
+    // pre-aggregates at the grid grain, so avg/min/max are correct as native
+    // single columns and HAVING/sort run on Druid. In that case we keep the
+    // value applies WHOLE (no leaves, no post-agg) — the fix is inert outside
+    // the broken shape, which keeps it orthogonal and minimal.
+    //
+    // `segregationAggregateApplies`: `aggregateApplies` are the leaves (deduped
+    // — a shared `count()` is emitted once), `postAggregateApplies` are the
+    // originals with each leaf aggregate replaced by a ref to its leaf column.
+    // min/max leaves recombine trivially (min of mins). countDistinct/quantile
+    // leaves resolve to 'none' and divert to native-JOIN below.
+    const mainSeg = gateHasLinkedOnlySplit
+      ? External.segregationAggregateApplies(mainValueApplies)
+      : { aggregateApplies: mainValueApplies, postAggregateApplies: [] as ApplyExpression[] };
+    const mainLeafApplies: ApplyExpression[] = [...mainDatasetApplies, ...mainSeg.aggregateApplies];
+    const mainPostAggApplies: ApplyExpression[] = mainSeg.postAggregateApplies;
+
     if (gateHasLinkedOnlySplit) {
-      const undecomposable = mainApplies.find(
-        a => a.expression.type !== 'DATASET' && !Expression.isMeasureDecomposable(a),
-      );
-      if (undecomposable) {
+      // INV-2 gate, evaluated on the segregated LEAVES (post avg-rewrite +
+      // segregation). A measure is jsJoin-safe iff every one of its leaf
+      // aggregates re-aggregates by a single homomorphic reducer (trait
+      // 'sum' | 'min' | 'max'). The scalar recombination on top (divide,
+      // subtract, …) is replayed in JS after re-aggregation, so it does NOT
+      // affect decomposability — only the leaves do. A 'none' leaf
+      // (countDistinct, quantile, mode, customAggregate) cannot be recombined
+      // from partition partials and forces the native-JOIN path, where the
+      // measure is computed in a single SQL at the bucket grain.
+      const undecomposableLeaf = mainLeafApplies.find(a => {
+        if (a.expression.type === 'DATASET') return false;
+        return External.resolveApplyDecomposeTrait(a) === 'none';
+      });
+      if (undecomposableLeaf) {
         // The JS-join path is unsafe. Surface a nativeJoin
         // discriminator so the execution layer (Phase 4) emits a
         // single Druid SQL with an in-engine JOIN.
@@ -4081,9 +4307,21 @@ export abstract class External {
             }
           }
         }
+        // Native-JOIN computes every measure in a single SQL grouped at the
+        // bucket grain, so there is no fan-out and avg/min/max need no
+        // decomposition there. Pass the ORIGINAL (un-rewritten) value applies:
+        // `average($x)` renders as `AVG($x)` and `min($x)` as `MIN($x)`
+        // directly. Passing the avg-REWRITTEN `divide(sum,count)` form here was
+        // the bug — `renderAggregateSQL` has no `divide` case and silently
+        // dropped the SELECT item while the ORDER BY still referenced it,
+        // emitting malformed SQL. The original-aggregate form is what
+        // `renderAggregateSQL` understands.
+        const nativeJoinApplies = this.applies.filter(
+          a => a.expression.type === 'DATASET' || mainValueApplies.some(m => m.name === a.name),
+        );
         const nativeJoin = this.getNativeJoinDecomposition(
           linkedOnlySplitAliases,
-          mainApplies,
+          nativeJoinApplies,
           involvedLinkedNames,
         );
         return nativeJoin;
@@ -4164,7 +4402,25 @@ export abstract class External {
           linkedSchemaNames[k] = true;
         }
       }
-      const templateFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames);
+      const prunedMainFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames);
+      // AND in any linked-only filter clause that `pruneLinkedFilterRefsInTree`
+      // harvested onto this PER-REQUEST config copy (clauses over columns that
+      // live only on the lookup — e.g. `$brand_country.overlap(['Francia'])` —
+      // which `.simplify()` would otherwise discard along with the dead sibling
+      // apply that carried them). `config` here is `this.linkedSources[lsName]`,
+      // and when a linked-only clause was harvested `this` is the per-request
+      // External copy whose fresh config carries `.filter`; the shared
+      // settings-manager config is never written. Without this the lookup
+      // sub-query would emit no WHERE for the linked-only filter and the inner
+      // join would restrict nothing. The clause is already pruned to the lookup
+      // schema, so it is safe to AND directly.
+      const stashedLinkedFilter: Expression | undefined = (config as any).filter;
+      const templateFilter =
+        stashedLinkedFilter && !stashedLinkedFilter.equals(Expression.TRUE)
+          ? prunedMainFilter && !prunedMainFilter.equals(Expression.TRUE)
+            ? prunedMainFilter.and(stashedLinkedFilter).simplify()
+            : stashedLinkedFilter
+          : prunedMainFilter;
       // When `timeAlignment: "eternal"` strips the time clause, the
       // resulting Druid query has no __time bound and would throw
       // "must filter on time unless the allowEternity flag is set".
@@ -4422,7 +4678,12 @@ export abstract class External {
     const mainKeepableAliases: string[] = (this as any)._lastMainKeepableAliases || [];
     const syntheticSplitsAll: Record<string, Expression> = (this as any)._lastSyntheticSplits || {};
     const mainValue = this.valueOf();
-    mainValue.applies = mainApplies;
+    // The main sub-query projects the segregated LEAF aggregates, not the
+    // derived measures. The scalar recombination (mainPostAggApplies) runs in
+    // JS after the post-join re-aggregation. For a pure single-aggregate
+    // measure (e.g. `sum`, `min`) segregation keeps it under its own name with
+    // an empty post-aggregate, so this is identity for the simple case.
+    mainValue.applies = mainLeafApplies;
     if (mainKeepableAliases.length > 0) {
       const mainSplitMap: Record<string, Expression> = {};
       for (const a of mainKeepableAliases)
@@ -4454,7 +4715,7 @@ export abstract class External {
           }
           return new AttributeInfo({ name, type: t || 'STRING' });
         }),
-        ...mainApplies.map(a => new AttributeInfo({ name: a.name, type: a.expression.type })),
+        ...mainLeafApplies.map(a => new AttributeInfo({ name: a.name, type: a.expression.type })),
       ];
     } else {
       // No main split → totals mode. rawAttributes comes back as attributes,
@@ -4463,7 +4724,7 @@ export abstract class External {
       mainValue.split = null;
       mainValue.dataName = undefined;
       mainValue.rawAttributes = this.rawAttributes;
-      mainValue.attributes = mainApplies.map(
+      mainValue.attributes = mainLeafApplies.map(
         a => new AttributeInfo({ name: a.name, type: a.expression.type }),
       );
       mainValue.sort = null;
@@ -4477,8 +4738,12 @@ export abstract class External {
     // return it as postJoinSort so the caller can apply it to the joined
     // Dataset. The matching limit moves with the sort — applying a pre-join
     // limit while sorting post-join would silently drop rows.
+    // Main-resolvable apply names = the LEAF columns the main sub-query
+    // projects. A sort/HAVING on a derived measure (e.g. `avg_price`, which is
+    // a post-aggregate recombination of leaf columns) is NOT main-resolvable
+    // and is correctly forced post-join, where it runs after recombination.
     const mainApplyNames: Record<string, true> = {};
-    for (const a of mainApplies) mainApplyNames[a.name] = true;
+    for (const a of mainLeafApplies) mainApplyNames[a.name] = true;
     const mainKeepableNames: Record<string, true> = {};
     for (const a of mainKeepableAliases) mainKeepableNames[a] = true;
 
@@ -4540,7 +4805,7 @@ export abstract class External {
     let postJoinHavingFilter: Expression | undefined;
     if (mainValue.havingFilter && !mainValue.havingFilter.equals(Expression.TRUE)) {
       const mainResolvable: Record<string, true> = {};
-      for (const a of mainApplies) mainResolvable[a.name] = true;
+      for (const a of mainLeafApplies) mainResolvable[a.name] = true;
       for (const a of mainKeepableAliases) mainResolvable[a] = true;
       const { main: havingOnMain, post: havingOnPost } = External.splitFilterByScope(
         mainValue.havingFilter,
@@ -4580,11 +4845,18 @@ export abstract class External {
     // executor's net is unconditional.
     const syntheticSet = syntheticAliasMap || {};
     const reAggKeys = (this.split ? this.split.keys : []).filter(k => !syntheticSet[k]);
-    // Trait per value-apply, driving the re-agg reducer. Built from the
-    // avg-rewritten applies so count/sum/avg all resolve to 'sum'.
+    // Trait per LEAF aggregate, driving the post-join re-agg reducer. Keyed by
+    // the segregated leaves (the columns the main sub-query actually projects),
+    // NOT by the derived measures. This is the fix: the OLD code keyed by the
+    // avg-rewritten derived applies, where `average` resolved to the ratio
+    // `divide(sum,count)` whose root is non-aggregate → trait 'none', so
+    // re-aggregation refused to collapse the fan-out and `assertDatasetShape`
+    // 500'd. The leaves are single aggregates (sum/count/min/max) that DO
+    // recombine; the derived measure is reconstructed afterwards by replaying
+    // `postAggregateApplies` over the re-aggregated leaf columns.
     const reAggApplyTraits: Record<string, 'sum' | 'min' | 'max' | 'none'> = {};
-    for (const a of rewrittenApplies) {
-      if (a.expression && a.expression.type === 'DATASET') continue; // nested dataset apply
+    for (const a of mainLeafApplies) {
+      if (a.expression && a.expression.type === 'DATASET') continue; // scope registration
       reAggApplyTraits[a.name] = External.resolveApplyDecomposeTrait(a);
     }
 
@@ -4597,6 +4869,7 @@ export abstract class External {
       postJoinHavingFilter,
       reAggKeys,
       reAggApplyTraits,
+      postAggregateApplies: mainPostAggApplies,
     };
   }
 }

@@ -151,8 +151,15 @@ describe('External auto-decomposition — cross-source expressions', () => {
         q => (q.query || '').includes('"main_ds"') && !(q.query || '').includes('main_ds-reviews'),
       );
     expect(mainQuery, 'main query must exist').to.exist;
-    // F2: avg decomposes to sum/count before the gate (see note above).
-    expect(mainQuery.query).to.match(/\(SUM\("price"\)\*1\.0\/COUNT\(\*\)\)/);
+    // A linked-only split (review_title = $reviewContent) fans main's
+    // join-key-grain rows out across the linked split, so AvgPrice cannot be
+    // carried as a single ratio column (media-de-medias). It is decomposed into
+    // homomorphic leaf columns — SUM(price) and COUNT(*) — that re-aggregate
+    // per bucket post-join; the recombination (SUM/COUNT) is replayed in JS.
+    expect(mainQuery.query).to.match(/SUM\("price"\) AS "!T_0"/);
+    expect(mainQuery.query).to.match(/COUNT\(\*\) AS "!T_1"/);
+    // The main side must NOT carry the un-decomposed ratio column.
+    expect(mainQuery.query).to.not.match(/\(SUM\("price"\)\*1\.0\/COUNT\(\*\)\)/);
     expect(mainQuery.query).to.not.match(/reviewContent/);
     // Linked side groups by BOTH time and reviewContent
     const linkedQuery = plan.flat().find(q => (q.query || '').includes('main_ds-reviews'));
