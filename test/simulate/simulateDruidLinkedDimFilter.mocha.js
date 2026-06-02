@@ -43,7 +43,7 @@ const { PassThrough } = require('readable-stream');
 const fs = require('fs');
 
 const plywood = require('../plywood');
-const { External, Expression, $, r } = plywood;
+const { External, Expression, $, r, ply } = plywood;
 
 const WIRE = JSON.parse(fs.readFileSync('/tmp/replay-francia.json', 'utf8'));
 
@@ -240,16 +240,57 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
       expect(fr.avg_price, 'NOT the all-country avg (2)').to.not.be.closeTo(2, 1e-6);
     });
 
-    // KNOWN GAP (documented, NOT silently passing): the totals GROUP BY ()
-    // query of the wire fixture is computed as an independent sub-query that —
-    // unlike the linked-only split — has no join axis (no linked split, no
-    // linked measure) for the JS-join path to attach the synthetic `__join_brand`
-    // semijoin to. Restricting it to Francia would require a brand-set semijoin
-    // that re-aggregates to the root, a separate larger feature. The split
-    // path (the user-visible bug reproduced in the UI) IS fixed; the totals row
-    // remains all-country until the semijoin-to-root path lands. Skipped rather
-    // than asserting the wrong value, so the gap is explicit, not hidden.
-    it.skip('compute: TOTALS (datum root) restricted to Francia — needs semijoin-to-root (gap)', () => {});
+    // FIXED by COMMIT B (semijoin-to-root). The totals GROUP BY () query — no
+    // linked split, no linked measure — used to drop the Francia clause. The
+    // fix runs the lookup DISTINCT-brand sub-query first and restricts the
+    // totals main with `main.brand IN (<Francia brands>)`.
+    it('compute: TOTALS (datum root) restricted to Francia — semijoin-to-root brand IN-list', async () => {
+      // A pure totals expression on the same main external: filter on the
+      // linked-only `brand_country` clause + a main aggregate, NO split.
+      const time = $('__time').overlap({
+        start: new Date('2026-05-02T11:50:00.000Z'),
+        end: new Date('2026-06-02T11:50:00.000Z'),
+      });
+      const francia = $('brand_country').overlap(['Francia']);
+      const buildTotals = extra => {
+        const cf = extra ? time.and(extra) : time;
+        return ply()
+          .apply('main', $('main').filter(cf))
+          .apply(D01, $(D01).filter(cf))
+          .apply('avg_price', '$main.average($price)');
+      };
+
+      // ── SIMULATE: the lookup carries Francia; the totals main carries the
+      // brand restriction; no JOIN; the no-filter plan is unchanged.
+      const sqls = buildTotals(francia)
+        .simulateQueryPlan({ main: makeMain() })
+        .flat()
+        .map(q => (typeof q === 'string' ? q : q && q.query))
+        .filter(q => typeof q === 'string');
+      const lookup = sqls.find(s => s.includes('lookup_d01f07da_rev1'));
+      expect(lookup, 'lookup DISTINCT sub-query emitted').to.exist;
+      expect(lookup, 'lookup filters on Francia').to.match(/brand_country.*Francia|Francia/);
+      expect(lookup, 'lookup projects the joinKey brand').to.match(/"brand"/);
+      const totals = sqls.find(s => /AVG\("price"\)/.test(s) && /GROUP BY \(\)/.test(s));
+      expect(totals, 'totals main GROUP BY () exists').to.exist;
+      expect(totals, 'totals main restricts on brand').to.match(/"brand"/);
+      expect(totals, 'no INNER JOIN on the totals main').to.not.match(/INNER JOIN/i);
+      expect(totals, 'no brand_country leak in the totals main').to.not.match(/brand_country/i);
+
+      // ── COMPUTE: honest engine returns Francia-only when the brand restriction
+      // is present, all-country otherwise. The fix must yield the Francia value.
+      const req = promiseFnToStream(rq => {
+        const sql = (rq && rq.query && rq.query.query) || '';
+        if (sql.includes('lookup_d01f07da_rev1')) return Promise.resolve([{ brand: 'B_FR' }]);
+        if (!/AVG\("price"\)/.test(sql)) return Promise.resolve([{ __VALUE__: 0 }]);
+        if (/"brand"\s*(=|IN)/i.test(sql)) return Promise.resolve([{ __VALUE__: 7 }]); // Francia avg
+        return Promise.resolve([{ __VALUE__: 2 }]); // all-country avg
+      });
+      const result = await buildTotals(francia).compute({ main: makeMain(req) });
+      const js = result && typeof result.toJS === 'function' ? result.toJS() : result;
+      const avg = typeof js.avg_price === 'number' ? js.avg_price : js.data && js.data[0].avg_price;
+      expect(avg, 'FIX: totals restricted to Francia (7), not all-country (2)').to.equal(7);
+    });
   });
 
   describe('exclusion variant — NOT overlap over the linked-only column', () => {
@@ -281,15 +322,38 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
   });
 
   describe('main-split-only variant — linked-only filter, split on the MAIN dim (brand)', () => {
-    // A linked-only filter with a split on a MAIN dimension (and no linked
-    // split/measure) is the same shape as the totals gap: there is no
-    // linked-only split alias for the JS-join path to drive the synthetic
-    // `__join_brand` semijoin from. The decomposition returns null and the
-    // query falls through to a single main-only SQL. KNOWN GAP — documented and
-    // skipped, not silently asserting the unrestricted result. The
-    // user-observable bug (split ON the linked dim) is fixed in the SPLIT-path
-    // tests above.
-    it.skip('lookup carries Francia when split is a main dim — needs semijoin-to-root (gap)', () => {});
+    // FIXED by COMMIT B (semijoin-to-root). A linked-only filter with a split on
+    // a MAIN dimension (and no linked split/measure) is the same orphaned-clause
+    // shape as the totals gap: getCrossExternalDecomposition returns null (no
+    // foreign apply/split to seed a sub-plan). The semijoin-to-root now runs the
+    // lookup DISTINCT-brand sub-query and restricts the main split with
+    // `main.brand IN (<Francia brands>)`, so the user-observable bug (linked-only
+    // filter dropped on a main-dim split) is fixed here too.
+    it('lookup carries Francia when split is a main dim — main split gets brand IN-list', () => {
+      const ex = $('main')
+        .filter(
+          $('__time')
+            .overlap({
+              start: new Date('2026-05-02T11:50:00.000Z'),
+              end: new Date('2026-06-02T11:50:00.000Z'),
+            })
+            .and($('brand_country').overlap(['Francia'])),
+        )
+        .split({ brand: '$brand' }, 'main')
+        .apply('avg_price', '$main.average($price)');
+      const sqls = planSqls(ex);
+      const lookup = lookupSubQuery(sqls);
+      expect(lookup, 'lookup sub-query exists').to.exist;
+      expect(lookup, 'lookup carries Francia').to.match(/brand_country.*Francia|Francia/);
+      expect(lookup, 'lookup projects the joinKey brand').to.match(/"brand"/);
+      expect(lookup, 'lookup not WHERE FALSE').to.not.match(/WHERE\s+FALSE/i);
+
+      const main = sqls.find(s => /AVG\("price"\)/.test(s) && /GROUP BY 1\b/.test(s));
+      expect(main, 'main GROUP BY 1 sub-query exists').to.exist;
+      expect(main, 'main split restricts on brand').to.match(/"brand"/);
+      expect(main, 'main does not leak brand_country').to.not.match(/brand_country/);
+      expect(main, 'no INNER JOIN on the main split').to.not.match(/INNER JOIN/i);
+    });
   });
 
   describe('joinMode left — the linked-only filter must be honoured or throw clearly', () => {
@@ -314,6 +378,29 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
         expect(lookup, 'lookup sub-query exists').to.exist;
         expect(lookup, 'left-join lookup still carries Francia (not dropped)').to.match(/Francia/);
       }
+    });
+
+    it('TOTALS semijoin-to-root with joinMode:left FAILS LOUD (IN-list is inner-only)', () => {
+      // The semijoin-to-root models an INNER join as a main-side IN-list. A LEFT
+      // join keeps orphan main rows, so an IN-list would silently DISCARD rows
+      // the user asked to keep — it cannot express left semantics. The rescue
+      // must throw a clear PlywoodUnsupportedNativeJoinShape, never silently
+      // emit the all-country totals. Parity with the split left-join pin above.
+      const time = $('__time').overlap({
+        start: new Date('2026-05-02T11:50:00.000Z'),
+        end: new Date('2026-06-02T11:50:00.000Z'),
+      });
+      const cf = time.and($('brand_country').overlap(['Francia']));
+      const totals = ply()
+        .apply('main', $('main').filter(cf))
+        .apply(D01, $(D01).filter(cf))
+        .apply('avg_price', '$main.average($price)');
+      expect(() => {
+        totals
+          .simulateQueryPlan({ main: makeMain(undefined, undefined, 'left') })
+          .flat()
+          .map(q => (typeof q === 'string' ? q : q && q.query));
+      }, 'left-join totals semijoin throws clearly').to.throw(/linked|filter|join|inner/i);
     });
   });
 });

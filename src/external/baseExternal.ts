@@ -550,6 +550,23 @@ export interface LinkedSourceConfig {
   engine?: string;
   version?: string;
   requester?: PlywoodRequester<any>;
+  /**
+   * PER-REQUEST ONLY (never authored on a cube config, never serialised).
+   * `pruneLinkedFilterRefsInTree` harvests a linked-only filter clause that
+   * targets a column living only on this lookup and parks it here on a fresh
+   * per-request config copy. Consumers: the JS-join leaf path (`templateFilter`)
+   * and the native-JOIN WHERE (both in getCrossExternalDecomposition), and the
+   * totals/main-split semijoin-to-root (getSemijoinToRootDecomposition).
+   */
+  filter?: Expression;
+  /**
+   * PER-REQUEST ONLY. Set true by `pruneLinkedFilterRefsInTree` when the
+   * harvested `filter` is ORPHANED — no value apply or split references this
+   * lookup, so the established decomposition path would never materialise a
+   * sub-query to honour it. Authorises the totals/main-split semijoin-to-root
+   * rescue. False/absent when a sibling sub-query already consumes the filter.
+   */
+  semijoinToRoot?: boolean;
 }
 
 /**
@@ -2014,6 +2031,22 @@ export abstract class External {
       // Accumulated on the stack — nothing shared is touched until we mint the
       // per-request copy below.
       const harvested: Record<string, Expression> = {};
+      // Per-lookup flag: does the expression have a LIVE consumer of this
+      // linkedSource — a value-returning apply that references the lookup (its
+      // ref name or one of its linked-only columns) OR a split over a
+      // linked-only column? When yes, the established decomposition path
+      // (JS-join / cross-external) materialises a sibling sub-query that
+      // already honours the harvested filter, so the totals/main-split
+      // semijoin-to-root rescue must NOT fire (it would double-handle and, for
+      // a multi-key lookup, throw on the single-joinKey assumption). When NO
+      // live consumer exists, the clause is genuinely ORPHANED — `.simplify()`
+      // deletes the dead sibling apply and the filter would be lost — so we
+      // mark the lookup `semijoinToRoot: true` to authorise the rescue.
+      const hasLiveConsumer: Record<string, boolean> = {};
+      // Per-lookup flag: did the harvested residue reference a NON-linked-only
+      // (i.e. main) column? Such a residue cannot be pushed onto a lookup-side
+      // query, so it must not authorise the semijoin-to-root rescue.
+      const harvestResidueDirty: Record<string, boolean> = {};
       for (const lsName in v.linkedSources) {
         const linkedSchema = schemas[lsName];
         if (!linkedSchema) continue;
@@ -2033,16 +2066,46 @@ export abstract class External {
         if (Object.keys(linkedOnly).length === 0) continue;
         // Walk the tree for any `.filter(F)` whose operand refs this main or
         // this lookup; harvest the linked-only clauses of F into the local map.
+        // In the SAME walk, detect a live consumer: a non-DATASET (value) apply
+        // OR a split whose expression references the lookup name or a
+        // linked-only column.
         expression.forEach(e => {
-          if (!(e instanceof FilterExpression)) return;
-          const op = e.operand;
-          if (!(op instanceof RefExpression)) return;
-          if (op.name !== k && op.name !== lsName) return;
-          const residue = External.pruneFilterToSchema(e.expression, linkedOnly);
-          if (residue.equals(Expression.TRUE)) return;
-          const prev = harvested[lsName];
-          harvested[lsName] =
-            prev && !prev.equals(Expression.TRUE) ? prev.and(residue).simplify() : residue;
+          if (e instanceof FilterExpression) {
+            const op = e.operand;
+            if (!(op instanceof RefExpression)) return;
+            if (op.name !== k && op.name !== lsName) return;
+            const residue = External.pruneFilterToSchema(e.expression, linkedOnly);
+            if (residue.equals(Expression.TRUE)) return;
+            // The semijoin-to-root puts this residue on a LOOKUP-side query
+            // (SELECT DISTINCT joinKey WHERE <residue>), so it is only valid
+            // when EVERY free reference resolves on the lookup schema. A bare
+            // boolean main ref like `$promo` survives pruneFilterToSchema intact
+            // (the prune classifies only atomic comparison predicates) but
+            // references a MAIN column — pushing it onto the lookup query throws
+            // "could not resolve $promo". Such a residue must NOT authorise the
+            // rescue. (The pre-existing native-JOIN / JS-join consumers do their
+            // own schema handling, so the harvested `config.filter` is unchanged
+            // for them; only the semijoin authorisation is gated here.)
+            const dirty = residue.getFreeReferences().some(rn => !linkedOnly[rn]);
+            if (dirty) harvestResidueDirty[lsName] = true;
+            const prev = harvested[lsName];
+            harvested[lsName] =
+              prev && !prev.equals(Expression.TRUE) ? prev.and(residue).simplify() : residue;
+            return;
+          }
+          if (e instanceof ApplyExpression) {
+            if (e.expression.type === 'DATASET') return; // scope registration, not a value
+            const refs = e.expression.getFreeReferences();
+            if (refs.some(rn => rn === lsName || linkedOnly[rn])) hasLiveConsumer[lsName] = true;
+            return;
+          }
+          if (e instanceof SplitExpression) {
+            e.mapSplits((_n, sx) => {
+              const refs = sx.getFreeReferences();
+              if (refs.some(rn => rn === lsName || linkedOnly[rn])) hasLiveConsumer[lsName] = true;
+            });
+            return;
+          }
         });
       }
       // Nothing harvested → leave the shared External untouched (the common
@@ -2059,7 +2122,17 @@ export abstract class External {
         const orig = v.linkedSources[lsName];
         const clause = harvested[lsName];
         freshLinked[lsName] = clause
-          ? ({ ...(orig as any), filter: clause } as LinkedSourceConfig)
+          ? ({
+              ...(orig as any),
+              filter: clause,
+              // Authorise the totals/main-split semijoin-to-root ONLY when the
+              // clause is orphaned (no live linked consumer) AND the harvested
+              // residue is purely linked-only-resolvable (a dirty residue —
+              // e.g. a bare main boolean ref — cannot ride a lookup-side
+              // query). When a sibling sub-query consumes it, or the residue is
+              // dirty, this stays false and the rescue stands down.
+              semijoinToRoot: !hasLiveConsumer[lsName] && !harvestResidueDirty[lsName],
+            } as LinkedSourceConfig)
           : orig;
       }
       const copyValue = v.valueOf();
@@ -3049,6 +3122,260 @@ export abstract class External {
     return delegates[0];
   }
 
+  /**
+   * SEMIJOIN-TO-ROOT for a TOTALS query carrying a harvested linked-only
+   * filter clause.
+   *
+   * The bug (Ismael 2026-06-02): a datum-root TOTALS query
+   * (`this.mode !== 'split'`) whose filter restricts a column that lives ONLY
+   * on a linked-source lookup (e.g. `$brand_country.overlap(['Francia'])`)
+   * silently drops that restriction. `pruneLinkedFilterRefsInTree` DOES harvest
+   * the clause onto the per-request `config.filter` slot, but its ONLY consumer
+   * — `getCrossExternalDecomposition` — returns null on its first line for any
+   * non-split mode (`if (this.mode !== 'split') return null`). With no
+   * cross-external decomposition, both `simulateValue` and
+   * `queryBasicValueStream` fall through to the plain single-external path whose
+   * WHERE is `getQueryFilter()` (main's filter only). The linked-only column
+   * was pruned off main → the totals SQL carries NO predicate → the aggregate
+   * is computed over the whole period (all countries), not the filtered subset.
+   *
+   * This is PATH-INDEPENDENT: it bites EVERY measure. A non-decomposable measure
+   * (countDistinct) would route through native-JOIN on a split; a decomposable
+   * one (avg/sum) takes the flat route — but on a TOTALS query NEITHER reaches
+   * the cross-external consumer, so both leak the all-country value. Verified
+   * empirically: the `AVG("price")` totals SQL is byte-identical with and
+   * without the Francia clause.
+   *
+   * The fix: a brand-set semijoin lifted to the datum-root grain. Run the lookup
+   * side first (`SELECT DISTINCT <joinKey> FROM lookup WHERE <linked-clause>`),
+   * collect the joinKey set, then restrict the TOTALS main query with
+   * `main.<joinKey> IN (<set>)`. With `joinMode: inner` an IN-list is the exact
+   * algebraic equivalent of the inner JOIN — every main row whose joinKey maps
+   * to (e.g.) Francia survives, the rest are dropped, the aggregate is over the
+   * filtered subset. An empty set (country that maps to no brand) yields
+   * `IN ()` → no rows → total 0 (NOT the all-country leak).
+   *
+   * Returns null when this shape does not apply, in which case the caller falls
+   * through to today's exact path (orthogonality: a totals query with NO
+   * harvested linked-only clause emits byte-identical SQL to before — no lookup,
+   * no IN-list). Only fires when:
+   *   - `this.mode !== 'split'` (a split is handled by the cross-external path);
+   *   - there is exactly one linkedSource carrying a non-TRIVIAL harvested
+   *     `config.filter` (the per-request clause minted by
+   *     pruneLinkedFilterRefsInTree);
+   *   - `getCrossExternalDecomposition()` returned null (we never double-handle
+   *     a shape the split path already owns).
+   *
+   * `joinMode: 'left'` FAILS LOUD: an IN-list is inner semantics; a left join
+   * keeps orphan main rows, so an IN-list would silently change the result.
+   * Parity with the left-join pin in the native-JOIN path.
+   */
+  public getSemijoinToRootDecomposition(): {
+    joinKey: string;
+    joinKeyType: PlyType;
+    lookupExternal: External;
+    buildFilteredMain: (joinKeyValues: any[]) => External;
+  } | null {
+    // Only a NON-split (totals / value) query: a split is owned by the
+    // cross-external path. `raw` mode never carries applies/aggregates to
+    // restrict, so it is out of scope.
+    if (this.mode === 'raw') return null;
+    if (!this.linkedSources || Object.keys(this.linkedSources).length === 0) return null;
+
+    // The cross-external (split) path already owns any shape
+    // getCrossExternalDecomposition accepts — the linked-only-split native-JOIN
+    // and the JS-join. Never double-handle: when that path returns non-null this
+    // branch stands down. The shapes that reach HERE are exactly the ones it
+    // rejects:
+    //   - a TOTALS row (`this.mode === 'total'`) — the 4314 `mode !== 'split'`
+    //     gate makes getCrossExternalDecomposition return null;
+    //   - a split on a MAIN-only dimension (e.g. `brand`) with a linked-only
+    //     filter and NO linked split/measure — no foreign apply for the cross-
+    //     external partitioner to seed a sub-plan from, so it returns null too.
+    // BOTH have the same defect: the harvested linked-only clause has no
+    // consumer and is silently dropped. The semijoin-to-root IN-list fixes
+    // both: the lookup DISTINCT-joinKey set narrows `main.<joinKey> IN (…)`,
+    // and the rest of the query (the main-dim split or the bare totals) runs
+    // unchanged through the flat path.
+    if (this.getCrossExternalDecomposition()) return null;
+
+    // The semijoin-to-root ONLY rescues an ORPHANED linked-only filter — one
+    // that has NO live consumer. `pruneLinkedFilterRefsInTree` decides this at
+    // harvest time (where it can see the whole expression, before resolve peels
+    // sibling sub-externals apart) and marks the per-request config
+    // `semijoinToRoot: true` exactly when no value apply or split references the
+    // lookup. When a linked measure apply or linked-only split DOES reference it
+    // (e.g. `avg_rating = $reviews.average($rating)`), the established
+    // decomposition path materialises a sibling sub-query that already honours
+    // the harvested filter — firing here would double-handle (and, for a
+    // multi-key lookup, throw on the single-joinKey assumption). So we gate on
+    // the flag, NOT on `this`'s post-decomposition apply set (the linked apply
+    // has already been peeled onto the sibling by the time simulateValue/
+    // queryBasicValueStream reach this external).
+    //
+    // Find the single linkedSource carrying a harvested linked-only clause
+    // (config.filter present, not TRUE, AND flagged orphaned). More than one is
+    // out of scope for v1 — fail loud rather than guess which IN-list to
+    // compose.
+    const owners: string[] = [];
+    for (const lsName in this.linkedSources) {
+      const cfg = this.linkedSources[lsName] as any;
+      const f = cfg.filter as Expression | undefined;
+      if (f && !f.equals(Expression.TRUE) && cfg.semijoinToRoot === true) owners.push(lsName);
+    }
+    if (owners.length === 0) return null;
+    if (owners.length > 1) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `semijoin-to-root: ${owners.length} linkedSources [${owners.join(
+          ', ',
+        )}] carry a linked-only filter clause at once — composing multiple ` +
+          `independent IN-list semijoins on a single query is not supported`,
+      );
+    }
+
+    const lsName = owners[0];
+    const config = this.linkedSources[lsName] as any;
+
+    const joinMode = External.resolveLinkedJoinMode(config);
+    if (joinMode !== 'inner') {
+      // 'left' (or a missing/other mode) cannot be expressed as a main-side
+      // IN-list: a left join keeps orphan main rows, so an IN-list would
+      // silently DISCARD rows the user asked to keep. Refuse loudly — parity
+      // with the native-JOIN left-join pin. (linked/filter/join in the text
+      // for the pin matcher.)
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `semijoin-to-root for linkedSource "${lsName}": joinMode="${
+          joinMode || 'undefined'
+        }" cannot honour a linked-only filter via a main-side IN-list — an IN-list is ` +
+          `INNER-join semantics; a left join keeps orphan main rows and would not ` +
+          `restrict the result. Declare joinMode:'inner' or split on the linked dim.`,
+      );
+    }
+
+    const joinKeys: string[] = config.joinKeys || [];
+    if (joinKeys.length !== 1) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `semijoin-to-root for linkedSource "${lsName}": expected exactly one ` +
+          `joinKey, got [${joinKeys.join(', ')}]. A multi-key semijoin (IN-list over a ` +
+          `tuple) is not supported.`,
+      );
+    }
+    const joinKey = joinKeys[0];
+
+    // ── Build the lookup-side raw external (SELECT DISTINCT <joinKey> WHERE
+    // <clause>). Same recipe as the JS-join template (getCrossExternalDecom-
+    // position ~4727): normalize attributes/derived, prune main's filter to the
+    // lookup schema (honouring timeAlignment:'eternal'), AND in the harvested
+    // linked-only clause, resolve the engine binding.
+    const normalizedAttributes: Attributes | undefined = config.attributes
+      ? (config.attributes as any[]).map(a =>
+          a instanceof AttributeInfo ? a : AttributeInfo.fromJS(a),
+        )
+      : undefined;
+    let normalizedDerived: Record<string, Expression> | undefined;
+    if (config.derivedAttributes) {
+      normalizedDerived = {};
+      for (const k in config.derivedAttributes) {
+        const v = config.derivedAttributes[k];
+        normalizedDerived[k] = v instanceof Expression ? v : Expression.fromJSLoose(v);
+      }
+    }
+
+    const timeAttrName =
+      (typeof (this as any).getTimeAttribute === 'function'
+        ? (this as any).getTimeAttribute()
+        : undefined) || (this as any).timeAttribute;
+    const timeAlignment = config.timeAlignment;
+    const linkedSchemaNames: Record<string, true> = {};
+    if (normalizedAttributes) {
+      for (const a of normalizedAttributes) {
+        if (timeAlignment === 'eternal' && a.name === timeAttrName) continue;
+        linkedSchemaNames[a.name] = true;
+      }
+    }
+    if (normalizedDerived) {
+      for (const k in normalizedDerived) {
+        if (timeAlignment === 'eternal' && k === timeAttrName) continue;
+        linkedSchemaNames[k] = true;
+      }
+    }
+    const prunedMainFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames);
+    const stashedLinkedFilter: Expression = config.filter;
+    const templateFilter =
+      prunedMainFilter && !prunedMainFilter.equals(Expression.TRUE)
+        ? prunedMainFilter.and(stashedLinkedFilter).simplify()
+        : stashedLinkedFilter;
+    const templateAllowEternity = timeAlignment === 'eternal' ? true : (this as any).allowEternity;
+
+    const binding = External.resolveLinkedEngineBinding(
+      config,
+      lsName,
+      this.engine,
+      this.version,
+      this.requester,
+    );
+
+    // Resolve the joinKey's native type on the lookup side so the DISTINCT
+    // split rebuilds with the right type before it's collected.
+    let joinKeyType: PlyType = 'STRING';
+    if (config.attributes) {
+      for (const a of config.attributes as any[]) {
+        if (a.name === joinKey && a.type) joinKeyType = a.type;
+      }
+    }
+
+    const lookupBase = External.fromValue({
+      engine: binding.engine,
+      version: binding.version,
+      source: config.source,
+      suppress: true,
+      rollup: this.rollup,
+      concealBuckets: this.concealBuckets,
+      requester: binding.requester,
+      attributes: normalizedAttributes,
+      derivedAttributes: normalizedDerived,
+      filter: templateFilter,
+      timeAttribute: (this as any).timeAttribute,
+      customAggregations: (this as any).customAggregations,
+      customTransforms: (this as any).customTransforms,
+      allowEternity: templateAllowEternity,
+      allowSelectQueries: (this as any).allowSelectQueries,
+      exactResultsOnly: (this as any).exactResultsOnly,
+      querySelection: (this as any).querySelection,
+      context: (this as any).context,
+    });
+    // SELECT DISTINCT <joinKey> = a split on the joinKey with no measures.
+    const lookupExternal = lookupBase.addExpression(
+      Expression._.split($(joinKey, joinKeyType), joinKey, 'main'),
+    );
+    if (!lookupExternal) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `semijoin-to-root for "${lsName}": lookup rejected the DISTINCT split on ` +
+          `joinKey "${joinKey}" — the column must resolve in the lookup schema`,
+      );
+    }
+
+    // ── Build the filtered TOTALS main: today's `this`, restricted by
+    // `main.<joinKey> IN (<set>)`, with linkedSources STRIPPED so the derived
+    // external dispatches through the plain single-external path (it must NOT
+    // re-enter this branch — there is no harvested clause left to honour once
+    // it's been folded into the IN-list). Per-request derivation only; the
+    // shared External is never mutated.
+    const buildFilteredMain = (joinKeyValues: any[]): External => {
+      const inSet = Set.fromJS({
+        setType: joinKeyType === 'NUMBER' ? 'NUMBER' : 'STRING',
+        elements: joinKeyValues,
+      });
+      const inList = $(joinKey, joinKeyType).overlap(r(inSet));
+      const value = this.valueOf();
+      value.filter = this.filter.and(inList).simplify();
+      value.linkedSources = {};
+      return External.fromValue(value);
+    };
+
+    return { joinKey, joinKeyType, lookupExternal, buildFilteredMain };
+  }
+
   public simulateValue(
     lastNode: boolean,
     simulatedQueries: any[],
@@ -3132,6 +3459,22 @@ export abstract class External {
         keys: this.split ? this.split.mapSplits(name => name) : null,
         data: [datum],
       });
+    }
+
+    // Semijoin-to-root: a TOTALS query carrying a harvested linked-only filter
+    // clause. Run the lookup DISTINCT-joinKey sub-query first, then dispatch a
+    // filtered main with `main.<joinKey> IN (<set>)`. IDENTICAL logic to the
+    // async path in queryBasicValueStream so simulate and execution never
+    // diverge. In simulate there is no engine to read the joinKey set from, so
+    // we restrict main with a SAMPLE one-element set — enough to prove the
+    // IN-list semijoin shape reaches the totals SQL.
+    const semijoin = this.getSemijoinToRootDecomposition();
+    if (semijoin) {
+      semijoin.lookupExternal.simulateValue(lastNode, simulatedQueries, externalForNext);
+      const sample = [getSampleValue(Set.unwrapSetType(semijoin.joinKeyType), null)];
+      return semijoin
+        .buildFilteredMain(sample)
+        .simulateValue(lastNode, simulatedQueries, externalForNext);
     }
 
     simulatedQueries.push(this.getQueryAndPostTransform().query);
@@ -3377,6 +3720,29 @@ export abstract class External {
           // the bad shape leaks into the caller's response.
           External.assertDatasetShape(joined);
           return joined;
+        }),
+      );
+    }
+
+    // Semijoin-to-root: a TOTALS query carrying a harvested linked-only filter
+    // clause (IDENTICAL logic to the simulate path above so the two never
+    // diverge). Dispatch the lookup DISTINCT-joinKey sub-query first, collect
+    // the joinKey set, then dispatch the TOTALS main restricted by
+    // `main.<joinKey> IN (<set>)`. An empty set (a country that maps to no
+    // brand) yields `IN ()` → no rows → total 0, NOT the all-country leak.
+    const semijoin = this.getSemijoinToRootDecomposition();
+    if (semijoin) {
+      return External.valuePromiseToStream(
+        External.buildValueFromStream(
+          semijoin.lookupExternal.queryBasicValueStream(rawQueries),
+        ).then(lookupPv => {
+          const lookupDs = lookupPv as Dataset;
+          const joinKeyValues = (lookupDs.data || [])
+            .map(d => d[semijoin.joinKey])
+            .filter(v => v !== undefined && v !== null);
+          return External.buildValueFromStream(
+            semijoin.buildFilteredMain(joinKeyValues).queryBasicValueStream(rawQueries),
+          );
         }),
       );
     }
