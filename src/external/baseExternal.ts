@@ -1286,6 +1286,19 @@ export abstract class External {
    * would change aggregation granularity based on a coincidence of
    * naming. The caller MUST declare the intent via `sharedDimensions`.
    *
+   * ONE schema-overlap exception is NOT ambiguous and resolves to MAIN
+   * instead of throwing: a split whose refs are exactly the main external's
+   * `timeAttribute` (`mainTimeAttribute`) when the linked source is
+   * `timeAlignment: 'eternal'`. An eternal linked source's `__time` column
+   * is the materialisation-snapshot sentinel (e.g. 1970), NOT an event time;
+   * a Time(Day) split is therefore semantically a MAIN-side time bucket and
+   * the lookup's same-named column carries no comparable meaning. The
+   * exclusion is deliberately narrow — it fires ONLY for the main
+   * timeAttribute against an eternal linked source. A genuine business
+   * column that overlaps both schemas (or the timeAttribute against a
+   * NON-eternal linked source, where `__time` IS event time on both sides)
+   * still throws.
+   *
    * Constant-valued splits (zero free refs) are treated as shared — a
    * literal expression evaluates identically on both sides.
    */
@@ -1295,6 +1308,7 @@ export abstract class External {
     linkedSchema: Record<string, true>,
     config: LinkedSourceConfig,
     linkedSourceName: string,
+    mainTimeAttribute?: string,
   ): { shared: string[]; mainOnly: string[]; linkedOnly: string[]; foreignLinked: string[] } {
     const shared: string[] = [];
     const mainOnly: string[] = [];
@@ -1335,6 +1349,25 @@ export abstract class External {
 
       const inMain = refs.every(r => mainSchema[r]);
       const inLinked = refs.every(r => linkedSchema[r]);
+
+      // Narrow non-ambiguity exception: the main timeAttribute split against
+      // an `eternal` linked source resolves to MAIN, not "ambiguous". The
+      // lookup's `__time` is a snapshot sentinel, never an event time, so a
+      // Time(Day) bucket cannot mean the same thing on both sides. Scoped to
+      // exactly `[mainTimeAttribute]` + `timeAlignment === 'eternal'` so it
+      // never weakens the guard for genuine business-column overlaps or for
+      // the timeAttribute against a bucketed (event-time) linked source.
+      if (
+        inMain &&
+        inLinked &&
+        mainTimeAttribute &&
+        refs.length === 1 &&
+        refs[0] === mainTimeAttribute &&
+        config.timeAlignment === 'eternal'
+      ) {
+        mainOnly.push(alias);
+        continue;
+      }
 
       if (inMain && inLinked) {
         throw new Error(
@@ -4497,6 +4530,7 @@ export abstract class External {
         linkedAttrs,
         config,
         lsName,
+        typeof ta === 'string' && ta.length > 0 ? ta : undefined,
       );
       const sharedAliases: string[] = [...classified.shared];
       const mainOnlyAliases: string[] = [...classified.mainOnly];
