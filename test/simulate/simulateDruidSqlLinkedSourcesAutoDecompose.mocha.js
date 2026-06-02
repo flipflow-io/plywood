@@ -72,7 +72,10 @@ describe('External auto-decomposition — cross-source expressions', () => {
       .join('\n');
     expect(all).to.include('"main_ds"');
     expect(all).to.include('"main_ds-reviews"');
-    expect(all).to.include('AVG("price")');
+    // F2: average is decomposed to sum/count before the cross-source gate so
+    // it routes through the JS-join path. The main-side AvgPrice emits the
+    // explicit (SUM/COUNT) form, not AVG().
+    expect(all).to.include('(SUM("price")*1.0/COUNT(*))');
     expect(all).to.include('AVG("reviewsRating")');
     // Both queries group by the shared join key
     expect(all.match(/"competitor"/g).length).to.be.at.least(2);
@@ -148,7 +151,8 @@ describe('External auto-decomposition — cross-source expressions', () => {
         q => (q.query || '').includes('"main_ds"') && !(q.query || '').includes('main_ds-reviews'),
       );
     expect(mainQuery, 'main query must exist').to.exist;
-    expect(mainQuery.query).to.match(/AVG\("price"\)/);
+    // F2: avg decomposes to sum/count before the gate (see note above).
+    expect(mainQuery.query).to.match(/\(SUM\("price"\)\*1\.0\/COUNT\(\*\)\)/);
     expect(mainQuery.query).to.not.match(/reviewContent/);
     // Linked side groups by BOTH time and reviewContent
     const linkedQuery = plan.flat().find(q => (q.query || '').includes('main_ds-reviews'));
