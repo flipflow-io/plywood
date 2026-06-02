@@ -131,6 +131,38 @@ function renderAggregateSQL(
   // aggregateFilterIfNeeded's "no per-apply filter" branch.
   const stubOperand = `${tableAlias}`;
   switch (op) {
+    // Arithmetic composition (Ismael's RP/PVP-diff bug). A derived measure such as
+    // `(avg(price) - avg(pvp)) / avg(pvp)` has a root op of `divide`/`subtract`/etc,
+    // not a single aggregate — yet it is perfectly renderable on the native-JOIN
+    // path. The native JOIN is ONE GROUP BY over the already-joined rows (each main
+    // row maps to exactly one lookup row via the inner join, so no fan-out), so
+    // AVG/SUM/COUNT(DISTINCT) are computed natively at the split grain and a ratio
+    // of those aggregates is just SQL arithmetic over them. We recurse into each
+    // operand (which bottoms out in a single aggregate this switch already renders,
+    // a nested arithmetic op, or a literal) and combine via the expression's OWN
+    // `_getSQLChainableUnaryHelper` — so the SQL (and the div-by-zero behaviour, e.g.
+    // Druid's `floatDivision` num*1.0/den) is identical to what plywood emits
+    // everywhere else; we add no CASE WHEN of our own. A genuinely unrenderable leaf
+    // (quantile/sqlAggregate/custom) still hits the default-throw below during the
+    // recursion, naming THAT op — composing arithmetic never silences a bad leaf.
+    case 'divide':
+    case 'subtract':
+    case 'multiply':
+    case 'add':
+    case 'power': {
+      const chain = ex as ChainableUnaryExpression;
+      const renderOperand = (sub: Expression): string => {
+        // A literal operand (e.g. the `1` in `(avg/avg) - 1`) renders directly;
+        // it carries no aggregate and must not recurse into the aggregate switch.
+        if (sub instanceof LiteralExpression) return sub.getSQL(dialect);
+        return renderAggregateSQL(sub, dialect, tableAlias);
+      };
+      const operandSQL = renderOperand(chain.operand);
+      const expressionSQL = renderOperand(chain.expression);
+      // Reuse the expression's own SQL renderer (protected — reached via the same
+      // `as any` façade the rest of this file already uses for dialect internals).
+      return (chain as any)._getSQLChainableUnaryHelper(dialect, operandSQL, expressionSQL);
+    }
     case 'count':
       return dialect.aggregateFilterIfNeeded(stubOperand, 'COUNT(*)', '0');
     case 'sum':

@@ -273,62 +273,57 @@ describe('Compose: countDistinct(concat) × magic-dimension split (native-JOIN r
     });
   });
 
-  describe('(3) FAIL-LOUD LIMIT — derived measure + countDistinct on native-JOIN (KNOWN, loud)', () => {
-    it('RP/PVP (avg/avg, root op divide) + countDistinct THROWS PlywoodUnsupportedNativeJoinShape', () => {
-      // RP/PVP is the catalogue's ratio-of-avgs. Alone it segregates into leaves
-      // (see the orthogonality test below — it works). Forced onto native-JOIN by
-      // the sibling countDistinct, its root op `divide` is not a single aggregate
-      // → renderAggregateSQL throws. This is FAIL-LOUD, not malformed SQL: the
-      // error names the op and fires before any query reaches the engine.
-      expect(
-        () =>
-          planSql(
-            [
-              ['rp', '$main.average($price) / $main.average($pvp)'],
-              ['uniq', UNIQ],
-            ],
-            'uniq',
-          ),
-        'derived ratio + countDistinct must throw loudly',
-      ).to.throw(/Cross-source native-JOIN cannot emit SQL/);
-      // Pin the specific diagnostic (the op is named so the limit is actionable).
-      let msg = '';
-      try {
-        planSql(
-          [
-            ['rp', '$main.average($price) / $main.average($pvp)'],
-            ['uniq', UNIQ],
-          ],
-          'uniq',
-        );
-      } catch (e) {
-        msg = e.message;
-        expect(e.name, 'error class').to.equal('PlywoodUnsupportedNativeJoinShape');
-      }
-      expect(msg, "names root op 'divide'").to.match(/root op='divide'/);
-      expect(msg, 'mentions single-aggregate requirement').to.match(/single native-JOIN aggregate/);
-      // Counterfactual / regression guard: if a future change makes derived
-      // measures renderable on native-JOIN (decompose-then-recombine inside the
-      // single SQL, or split-route), this test FLIPS loudly — it must not start
-      // silently emitting a SELECT that drops the ratio while ORDER BY keeps it.
+  describe('(3) DERIVED measure + countDistinct on native-JOIN — composes as arithmetic of native aggregates', () => {
+    // PREVIOUSLY this section pinned a documented native-JOIN LIMIT: a derived
+    // measure (root op divide/subtract) forced onto native-JOIN by a sibling
+    // countDistinct threw PlywoodUnsupportedNativeJoinShape. That was Ismael's
+    // live-app bug — the panel 500'd. The limit is now LIFTED: `renderAggregateSQL`
+    // recurses the arithmetic ops and renders each operand (single aggregate or
+    // literal) inside the SAME single SQL. This is correct because native-JOIN is
+    // ONE GROUP BY over the inner-joined rows (no fan-out → AVG/SUM/COUNT(DISTINCT)
+    // are at the split grain), so a ratio-of-avgs is plain SQL arithmetic over those
+    // aggregates. These two tests FLIPPED (loudly, as the old comments predicted)
+    // from "throws" to "renders" — see simulateDruidComposeDerivedMeasureNativeJoin
+    // for the full SQL-shape + row-level-correctness pins. The genuinely
+    // unrenderable leaf (quantile/sqlAggregate) STILL throws (pinned there too).
+    it('RP/PVP (avg/avg, root op divide) + countDistinct renders as ONE native-JOIN SQL (no throw)', () => {
+      const sqls = planSql(
+        [
+          ['rp', '$main.average($price) / $main.average($pvp)'],
+          ['uniq', UNIQ],
+        ],
+        'uniq',
+      );
+      expect(sqls.length, 'derived ratio + countDistinct → one native-JOIN SQL').to.equal(1);
+      const sql = sqls[0];
+      expect(sql, 'INNER JOIN').to.match(/INNER JOIN/i);
+      // divide via floatDivision (num*1.0/den) over the two AVG aggregates, aliased.
+      expect(sql, 'ratio rendered as floatDivision of AVGs, aliased rp').to.match(
+        /\(AVG\(main\."price"\)\*1\.0\/AVG\(main\."pvp"\)\) AS "rp"/,
+      );
+      expect(sql, 'countDistinct co-present in the same SELECT').to.match(/COUNT\(DISTINCT/i);
+      expect(sql, 'ORDER BY uniq projected (no orphan)').to.include('AS "uniq"');
+      expect(sql, 'no synthetic leaf columns (native JOIN, not jsJoin)').to.not.match(/!T_\d+/);
+      // Counterfactual: pre-fix this exact shape threw root op='divide' (Ismael's
+      // 500). The composed-arithmetic SQL is the fix.
     });
 
-    it('(avg/avg) - 1 (root op subtract) + countDistinct ALSO throws loudly, naming subtract', () => {
-      let msg = '';
-      try {
-        planSql(
-          [
-            ['rp_diff', '($main.average($price) / $main.average($pvp)) - 1'],
-            ['uniq', UNIQ],
-          ],
-          'uniq',
-        );
-        expect.fail('expected a throw');
-      } catch (e) {
-        msg = e.message;
-      }
-      expect(msg, 'PlywoodUnsupportedNativeJoinShape').to.match(/native-JOIN cannot emit SQL/);
-      expect(msg, "names root op 'subtract'").to.match(/root op='subtract'/);
+    it('(avg/avg) - 1 (root op subtract) + countDistinct ALSO renders, subtract composed over the ratio', () => {
+      const sqls = planSql(
+        [
+          ['rp_diff', '($main.average($price) / $main.average($pvp)) - 1'],
+          ['uniq', UNIQ],
+        ],
+        'uniq',
+      );
+      expect(sqls.length, 'one native-JOIN SQL').to.equal(1);
+      const sql = sqls[0];
+      // subtract of (the ratio) and the literal 1: (<floatDivision>-1) AS "rp_diff".
+      expect(sql, 'subtract over the ratio and a literal, aliased rp_diff').to.match(
+        /\(\(AVG\(main\."price"\)\*1\.0\/AVG\(main\."pvp"\)\)-1\) AS "rp_diff"/,
+      );
+      expect(sql, 'countDistinct co-present').to.match(/COUNT\(DISTINCT/i);
+      expect(sql, 'no synthetic leaf columns').to.not.match(/!T_\d+/);
     });
 
     it('the SAME ratio measure ALONE (no countDistinct) composes fine via jsJoin leaves', () => {
