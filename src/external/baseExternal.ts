@@ -1131,27 +1131,51 @@ export abstract class External {
     }
 
     if (op === 'not') {
+      // A negation whose inside references out-of-schema columns is
+      // unevaluable here AS A WHOLE — it must become identity TRUE,
+      // never `NOT(TRUE) = FALSE`. Observed live (GrupoIfa dev): the
+      // cube-level filter `NOT($url.in([...])) AND 0 < $price` pruned
+      // for a lookup linkedSource emitted `WHERE FALSE`; the lookup
+      // returned zero rows, the inner join dropped every main row and
+      // the magic-dim split rendered as a single naked total.
+      // Algebra: NOT(a AND b) = NOT(a) OR NOT(b); with `a` unevaluable
+      // its negation is identity TRUE, so the whole clause is TRUE.
       const origInner: Expression = (filter as any).operand;
       const inner = External.pruneFilterToSchema(origInner, schemaNames);
       if (inner === origInner) return filter;
-      return inner.not().simplify();
+      return Expression.TRUE;
     }
 
     // Atomic predicate (overlap, is, greaterThan, contains, etc.): the
-    // semantic column the predicate targets is its `operand` — the left
-    // side of the comparison. If that's a RefExpression naming a column
-    // not in our schema, the predicate can't evaluate here and becomes
-    // TRUE (identity) for this side.
+    // semantic column the predicate targets is a RefExpression in either
+    // position — `operand` (the common `$col.is(...)` shape) or
+    // `expression` (the literal-first shape `r(0).lessThan($price)` that
+    // Turnilo emits for `0 < price`). If a CURRENT-SCOPE ref (nest 0)
+    // names a column not in our schema, the predicate can't evaluate
+    // here and becomes TRUE (identity) for this side.
     //
-    // Critically, we do NOT inspect `getFreeReferences()` because a
-    // well-formed predicate like `$color.is($col)` refers to `$col` as
-    // an outer-scope escalation — that ref resolves in the parent
-    // dataset, not in the current external's schema. Dropping the whole
-    // predicate because `$col` isn't a column here would break a
+    // Critically, we do NOT inspect `getFreeReferences()` and we skip
+    // refs with `nest > 0`: a well-formed predicate like `$color.is($^col)`
+    // escalates `$^col` to the parent dataset — that ref resolves
+    // outside the current external's schema by design. Dropping the
+    // whole predicate because it isn't a column here would break a
     // pattern that Plywood users rely on.
     const anyOp: any = filter;
     const operand: Expression | undefined = anyOp.operand;
     if (operand instanceof RefExpression && !schemaNames[operand.name]) {
+      return Expression.TRUE;
+    }
+    // Literal-first shape (`r(0).lessThan($price)`, Turnilo's `0 < price`):
+    // the semantic column sits in `expression` position. Only when the
+    // operand is a LITERAL do we inspect that side — if the operand is a
+    // ref we already handled it above, and `$col.is($var)` (operand in
+    // schema, expression resolving in an outer scope) must stay intact.
+    if (
+      operand instanceof LiteralExpression &&
+      anyOp.expression instanceof RefExpression &&
+      (anyOp.expression as any).nest === 0 &&
+      !schemaNames[anyOp.expression.name]
+    ) {
       return Expression.TRUE;
     }
     return filter;
