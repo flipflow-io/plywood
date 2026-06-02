@@ -478,6 +478,27 @@ export interface LinkedSourceConfig {
    *     timestamp (e.g. MSQ-ingested lookups at 1970).
    */
   timeAlignment?: 'bucketed' | 'eternal';
+  /**
+   * Cross-engine override. When set, plywood routes THIS linkedSource's
+   * sub-query to the named engine instead of inheriting the main
+   * external's `engine`. Used when a linkedSource lives in a different
+   * store than the main datasource — e.g. a magic-attribute staging view
+   * materialised in Postgres (`magic_staging_<attrId>_rev<N>`) joined
+   * against a main Druid datasource during the `materializing` phase.
+   *
+   *   - absent  → inherit the main external's engine/version/requester
+   *   - present → override; `requester` MUST also be supplied (a foreign
+   *               engine cannot be driven by the main external's
+   *               requester — that would dispatch the SQL to the wrong
+   *               store). Failure to supply it throws, never falls back.
+   *
+   * `requester` is intentionally NOT serialised through toJS/fromJS — it
+   * is a live host handle injected at runtime, exactly like the main
+   * external's own `requester`. `engine` and `version` DO round-trip.
+   */
+  engine?: string;
+  version?: string;
+  requester?: PlywoodRequester<any>;
 }
 
 /**
@@ -493,6 +514,10 @@ export interface LinkedSourceConfigJS {
   attributes?: AttributeJSs;
   derivedAttributes?: Record<string, ExpressionJS>;
   timeAlignment?: 'bucketed' | 'eternal';
+  // Cross-engine override — see LinkedSourceConfig.engine for the contract.
+  // `requester` is NOT part of the JS form; it is injected at runtime.
+  engine?: string;
+  version?: string;
 }
 
 export interface SpecialApplyTransform {
@@ -1313,6 +1338,50 @@ export abstract class External {
     return config.joinMode;
   }
 
+  /**
+   * Resolve the engine/version/requester binding for a linkedSource's
+   * sub-query, honouring the cross-engine override (LinkedSourceConfig.engine).
+   *
+   *   - When `config.engine` is absent → inherit the main external's
+   *     engine/version/requester verbatim (the canonical same-store case;
+   *     a lookup_x_rev1 view living in the same Druid datasource).
+   *   - When `config.engine` is present and DIFFERS from the main engine →
+   *     the sub-query must be dispatched to a different store. The override
+   *     requester is MANDATORY: silently inheriting the main requester would
+   *     send the foreign SQL (e.g. a Postgres staging view query) to the
+   *     Druid broker and either error opaquely or return wrong data. So we
+   *     throw with an actionable message instead of falling back.
+   *   - When `config.engine` is present but EQUALS the main engine → a
+   *     declared-but-same override; inherit the main requester (no foreign
+   *     dispatch risk) but honour any explicitly-supplied version/requester.
+   *
+   * `mainEngine` / `mainVersion` / `mainRequester` come from the main
+   * external. `lsName` is only used to make the error message locatable.
+   */
+  static resolveLinkedEngineBinding(
+    config: LinkedSourceConfig,
+    lsName: string,
+    mainEngine: string,
+    mainVersion: string,
+    mainRequester: PlywoodRequester<any>,
+  ): { engine: string; version: string; requester: PlywoodRequester<any> } {
+    const engine = config.engine ?? mainEngine;
+    const version = config.version ?? mainVersion;
+    if (config.engine && config.engine !== mainEngine) {
+      if (!config.requester) {
+        throw new Error(
+          `External: linkedSource "${lsName}" declares cross-engine override ` +
+            `engine="${config.engine}" (main external engine="${mainEngine}") but supplies no ` +
+            `requester. A foreign-engine sub-query cannot be driven by the main external's ` +
+            `requester — that would dispatch the SQL to the wrong store. Inject ` +
+            `\`linkedSources["${lsName}"].requester\` bound to the "${config.engine}" engine.`,
+        );
+      }
+      return { engine, version, requester: config.requester };
+    }
+    return { engine, version, requester: config.requester ?? mainRequester };
+  }
+
   static dropColumns(dataset: Dataset, drop: string[]): Dataset {
     if (!drop || drop.length === 0) return dataset;
     const dropSet: Record<string, true> = {};
@@ -1415,6 +1484,14 @@ export abstract class External {
             ? Expression.expressionLookupFromJS(ls.derivedAttributes)
             : undefined,
           timeAlignment: ls.timeAlignment,
+          // Cross-engine override fields round-trip through JS; `requester`
+          // does NOT (it is a live host handle injected at runtime — see
+          // LinkedSourceConfig.engine). Carrying engine/version here lets a
+          // deserialised External remember it must route this linkedSource
+          // elsewhere, and `resolveLinkedEngineBinding` fails loud at query
+          // time if the matching requester was never injected.
+          engine: ls.engine,
+          version: ls.version,
         };
       }
     }
@@ -1617,14 +1694,24 @@ export abstract class External {
         }
         const prunedFilter = External.pruneFilterToSchema(value.filter, linkedNames);
 
+        // Honour a per-linkedSource cross-engine override. Absent → inherit
+        // the main external's engine/version/requester (canonical case).
+        const binding = External.resolveLinkedEngineBinding(
+          ls,
+          lsName,
+          value.engine,
+          value.version,
+          value.requester,
+        );
+
         const linkedValue: ExternalValue = {
-          engine: value.engine,
-          version: value.version,
+          engine: binding.engine,
+          version: binding.version,
           source: ls.source,
           suppress: true,
           rollup: value.rollup,
           concealBuckets: value.concealBuckets,
-          requester: value.requester,
+          requester: binding.requester,
           attributes: normalizedAttrs,
           derivedAttributes: normalizedDerived,
           filter: prunedFilter,
@@ -3344,6 +3431,23 @@ export abstract class External {
       throw new PlywoodUnsupportedNativeJoinShape(`linkedSource "${lsName}" has empty joinKeys`);
     }
 
+    // A native JOIN emits ONE SQL statement that references both the main
+    // source and the linked source — it can only do so when both live in
+    // the SAME engine. If the linkedSource declares a cross-engine override
+    // (e.g. a Postgres staging view joined against a main Druid datasource),
+    // a single SQL JOIN is impossible: the two sides must each run their own
+    // query and be joined in JS. Refuse loudly here rather than emit SQL that
+    // references a table the engine cannot see. The JS-join path
+    // (getCrossExternalDecomposition) handles the cross-engine case.
+    if (config.engine && config.engine !== this.engine) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `linkedSource "${lsName}" declares cross-engine override engine="${config.engine}" ` +
+          `(main engine="${this.engine}"); a single native SQL JOIN cannot span two engines. ` +
+          `This shape must decompose to per-side queries joined in JS — do not route it through ` +
+          `getNativeJoinDecomposition.`,
+      );
+    }
+
     // Build the SQL. Pattern (single linkedSource, single linked-only
     // split alias, single joinKey for v1):
     //
@@ -3831,14 +3935,29 @@ export abstract class External {
       const templateAllowEternity =
         timeAlignment === 'eternal' ? true : (this as any).allowEternity;
 
+      // Cross-engine override. Absent → inherit main's engine/version/
+      // requester (canonical). Present + different engine → route this
+      // linkedSource's sub-query to its own store; requester is mandatory
+      // (fails loud — never silently inherits the main requester). This is
+      // the JS-join path: each side runs its own query, so cross-engine is
+      // fully supported here. The nativeJoin path (getNativeJoinDecomposition)
+      // refuses cross-engine because a single SQL JOIN cannot span engines.
+      const binding = External.resolveLinkedEngineBinding(
+        config,
+        lsName,
+        this.engine,
+        this.version,
+        this.requester,
+      );
+
       const template = External.fromValue({
-        engine: this.engine,
-        version: this.version,
+        engine: binding.engine,
+        version: binding.version,
         source: config.source,
         suppress: true,
         rollup: this.rollup,
         concealBuckets: this.concealBuckets,
-        requester: this.requester,
+        requester: binding.requester,
         attributes: normalizedAttributes,
         derivedAttributes: normalizedDerived,
         filter: templateFilter,
