@@ -4065,18 +4065,48 @@ export abstract class External {
       }
     }
 
-    // WHERE: main's getQueryFilter SQL, qualified to main alias.
+    // WHERE: main's getQueryFilter SQL, qualified to main alias, AND any
+    // harvested LINKED-ONLY filter clause qualified to the LOOKUP alias.
+    //
+    // The main-side half (`this.getQueryFilter()`) carries only the clauses over
+    // columns main owns (e.g. the __time bound). A filter over a column that
+    // lives ONLY on the lookup (`brand_country = 'Francia'`) never survives onto
+    // `this.filter`: the front stamps it on the magic linked-source apply, which
+    // `.simplify()` deletes as dead code (see pruneLinkedFilterRefsInTree). The
+    // v2 fix harvests that clause onto a PER-REQUEST copy of this External and
+    // parks it at `this.linkedSources[lsName].filter` (== `config.filter`), the
+    // SAME slot the JS-join leaf path reads as `templateFilter`
+    // (getCrossExternalDecomposition). The native-JOIN path must read it too:
+    // rendered against the `lookup` alias it becomes
+    // `lookup."brand_country" = 'Francia'`, so the INNER JOIN keeps only the main
+    // rows whose brand maps to Francia — the split shows only Francia and the
+    // non-decomposable aggregate (countDistinct) is computed over Francia rows
+    // only. Without this the clause was silently dropped: every country returned
+    // identical to the no-filter query (Ismael's reported bug). Inert when no
+    // clause was harvested (`config.filter` absent/TRUE) → a no-linked-filter
+    // panel emits exactly the same SQL as before (orthogonality preserved).
     const filter = this.getQueryFilter();
-    let whereSQL = '';
+    const whereConds: string[] = [];
     if (!filter.equals(Expression.TRUE)) {
       const prevTable = (dialect as any).table;
       (dialect as any).setTable(mainAlias);
       try {
-        whereSQL = 'WHERE ' + filter.getSQL(dialect);
+        whereConds.push(filter.getSQL(dialect));
       } finally {
         (dialect as any).setTable(prevTable);
       }
     }
+    const stashedLinkedFilter: Expression | undefined = (config as any).filter;
+    if (stashedLinkedFilter && !stashedLinkedFilter.equals(Expression.TRUE)) {
+      const prevTable = (dialect as any).table;
+      (dialect as any).setTable(lookupAlias);
+      try {
+        whereConds.push(stashedLinkedFilter.getSQL(dialect));
+      } finally {
+        (dialect as any).setTable(prevTable);
+      }
+    }
+    const whereSQL = whereConds.length ? 'WHERE ' + whereConds.join(' AND ') : '';
 
     const joinSql = joinMode === 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
     const sqlParts = [
