@@ -3199,10 +3199,32 @@ export abstract class External {
             reqStream.on('data', (r: any) => rows.push(r));
             reqStream.on('error', (e: any) => reject(e));
             reqStream.on('end', () => {
+              // Build attributes + inflaters from splitKeyAttributes when the
+              // combined SQL carries more than the linked key (e.g. a Time(Day)
+              // main-side bucket): the time column must inflate to a TimeRange
+              // (not a bare STRING) and the dataset must be keyed on EVERY split.
+              // Fall back to the single-key shape for plain linked-only splits.
+              const skAttrs =
+                nj.splitKeyAttributes && nj.splitKeyAttributes.length > 0
+                  ? nj.splitKeyAttributes
+                  : [{ name: nj.splitAlias, type: 'STRING' as PlyType, splitExpr: null as any }];
+              const splitAttributeInfos = skAttrs.map(
+                sk => new AttributeInfo({ name: sk.name, type: sk.type }),
+              );
+              const inflaters: Inflater[] = [];
+              for (const sk of skAttrs) {
+                if (sk.splitExpr) {
+                  const inf = External.getIntelligentInflater(sk.splitExpr, sk.name);
+                  if (inf) inflaters.push(inf);
+                }
+              }
+              if (inflaters.length > 0) {
+                for (const r of rows) for (const inf of inflaters) inf(r);
+              }
               const ds = new Dataset({
                 keys: nj.keys,
                 attributes: [
-                  new AttributeInfo({ name: nj.splitAlias, type: 'STRING' }),
+                  ...splitAttributeInfos,
                   ...nj.applyNames.map(n => new AttributeInfo({ name: n, type: 'NUMBER' })),
                 ],
                 data: rows,
@@ -3797,6 +3819,7 @@ export abstract class External {
     linkedOnlySplitAliases: string[],
     mainApplies: ApplyExpression[],
     involvedLinkedNames: Record<string, true>,
+    mainSideSplitAliases: string[] = [],
   ): {
     kind: 'nativeJoin';
     nativeJoin: {
@@ -3807,6 +3830,15 @@ export abstract class External {
       linkedSource: string;
       keys: string[];
       applyNames: string[];
+      // The split-key attributes carried by the combined SQL, in projection
+      // order: the main-side splits (e.g. a `$__time.timeBucket(P1D)` day
+      // bucket) followed by the single linked-only split key. The execution
+      // layer builds the result Dataset's attributes from these (so a TIME
+      // bucket inflates to a TimeRange, not a bare STRING) and keys the
+      // dataset on all of them — without this a double split [Time × country]
+      // would lose the time dimension. `splitExpr` is the original split
+      // expression, used to pick the intelligent inflater.
+      splitKeyAttributes: { name: string; type: PlyType; splitExpr: Expression }[];
     };
     mainExternal: External;
     linkedExternals: {
@@ -3922,12 +3954,56 @@ export abstract class External {
       .map(k => `${mainAlias}.${escName(k)} = ${lookupAlias}.${escName(k)}`)
       .join(' AND ');
 
-    // SELECT clause: the linked-only split column from lookup +
-    // each main apply rendered as its aggregate SQL with main-qualified
-    // references.
-    const selectParts: string[] = [
-      `${lookupAlias}.${escName(linkedColName)} AS ${escName(splitAlias)}`,
-    ];
+    // SELECT clause: the main-side split keys (e.g. a `$__time.timeBucket(P1D)`
+    // day bucket — fix B classifies the main timeAttribute main-side against an
+    // eternal lookup) rendered from `main`, then the linked-only split column
+    // from `lookup`, then each main apply as its aggregate SQL. Projecting the
+    // main-side splits FIRST gives them the leading GROUP BY positions; the
+    // linked key follows. Both must reach the GROUP BY — emitting `GROUP BY 1`
+    // (linked key only) silently DROPS every main-side split (the [Time ×
+    // country] double-split bug: the time dimension vanished and countDistinct
+    // collapsed to an all-period count).
+    const selectParts: string[] = [];
+    const groupByPositions: number[] = [];
+    // splitKeyAttributes travels back to the execution layer so it can build
+    // the result Dataset's attributes/keys/inflaters covering ALL split keys.
+    const splitKeyAttributes: { name: string; type: PlyType; splitExpr: Expression }[] = [];
+    // Order matters: main-side splits occupy positions 1..M, the linked key
+    // M+1. Collect them in this order so positions line up.
+    const orderedSplitKeyAliases: string[] = [];
+    for (const msAlias of mainSideSplitAliases) {
+      const msExpr = this.split.splits[msAlias];
+      if (!msExpr) {
+        throw new PlywoodUnsupportedNativeJoinShape(
+          `main-side split alias "${msAlias}" not found in this.split.splits`,
+        );
+      }
+      let msSQL: string;
+      const prevTable = (dialect as any).table;
+      (dialect as any).setTable(mainAlias);
+      try {
+        msSQL = msExpr.getSQL(dialect);
+      } finally {
+        (dialect as any).setTable(prevTable);
+      }
+      selectParts.push(`${msSQL} AS ${escName(msAlias)}`);
+      groupByPositions.push(selectParts.length);
+      splitKeyAttributes.push({
+        name: msAlias,
+        type: Set.unwrapSetType(msExpr.type),
+        splitExpr: msExpr,
+      });
+      orderedSplitKeyAliases.push(msAlias);
+    }
+    // The linked-only split column from the lookup side.
+    selectParts.push(`${lookupAlias}.${escName(linkedColName)} AS ${escName(splitAlias)}`);
+    groupByPositions.push(selectParts.length);
+    splitKeyAttributes.push({
+      name: splitAlias,
+      type: Set.unwrapSetType(splitExpr.type),
+      splitExpr,
+    });
+    orderedSplitKeyAliases.push(splitAlias);
     const applyNames: string[] = [];
     for (const apply of mainApplies) {
       if (apply.expression.type === 'DATASET') continue; // skip scope-registrations
@@ -3977,7 +4053,10 @@ export abstract class External {
       `${joinSql} ${escName(linkedSource)} AS ${lookupAlias} ON ${onConds}`,
     ];
     if (whereSQL) sqlParts.push(whereSQL);
-    sqlParts.push('GROUP BY 1');
+    // GROUP BY covers EVERY split-key position (main-side buckets + linked
+    // key), not just `1`. A single linked-only split still emits `GROUP BY 1`;
+    // a [Time(Day) × country] double split emits `GROUP BY 1, 2`.
+    sqlParts.push(`GROUP BY ${groupByPositions.join(', ')}`);
 
     // Sort/limit routing: if the user's sort/limit references the
     // split alias or any apply name, append. Otherwise omit — the
@@ -3999,8 +4078,12 @@ export abstract class External {
         splitAlias,
         mainSource,
         linkedSource,
-        keys: [splitAlias],
+        // ALL split keys (main-side buckets + the linked key), in projection
+        // order — so the result Dataset is keyed on every requested dimension,
+        // not just the linked one.
+        keys: orderedSplitKeyAliases.slice(),
         applyNames,
+        splitKeyAttributes,
       },
       // The caller's main-side and linked-side externals are unused
       // by the nativeJoin execution path — the combined SQL replaces
@@ -4039,6 +4122,7 @@ export abstract class External {
       linkedSource: string;
       keys: string[];
       applyNames: string[];
+      splitKeyAttributes?: { name: string; type: PlyType; splitExpr: Expression }[];
     };
     mainExternal: External;
     linkedExternals: {
@@ -4316,6 +4400,14 @@ export abstract class External {
         // single-query SQL error rather than a half-built native
         // join.
         const linkedOnlySplitAliases: string[] = [];
+        // Main-side split aliases that must ALSO be carried into the combined
+        // SQL's SELECT + GROUP BY (e.g. a `$__time.timeBucket(P1D)` day bucket).
+        // Fix B classifies the main timeAttribute main-side against an eternal
+        // lookup; before this collection the native-JOIN renderer projected ONLY
+        // the linked-only key and emitted `GROUP BY 1`, silently dropping every
+        // main-side split — so a [Time(Day) × country] double split lost the
+        // time dimension and countDistinct collapsed to an all-period count.
+        const mainSideSplitAliases: string[] = [];
         const mainAttrsForGate2: Record<string, true> = {};
         for (const a of this.rawAttributes || []) mainAttrsForGate2[a.name] = true;
         for (const k in this.derivedAttributes) mainAttrsForGate2[k] = true;
@@ -4328,7 +4420,14 @@ export abstract class External {
           const refs = exAlias.getFreeReferences();
           if (refs.length === 0) continue;
           const anyInMain = refs.some(r => mainAttrsForGate2[r]);
-          if (anyInMain) continue;
+          if (anyInMain) {
+            // A main-side group key — carried into the combined SQL alongside
+            // the linked key. (A genuinely ambiguous alias whose refs ALSO live
+            // only on the linked side never reaches here without a 'none' leaf;
+            // with one, classifying the main-resolvable side is correct — fix B.)
+            mainSideSplitAliases.push(alias);
+            continue;
+          }
           for (const lsName in this.linkedSources) {
             const ls = this.linkedSources[lsName];
             const linkedAttrs: Record<string, true> = {};
@@ -4356,6 +4455,7 @@ export abstract class External {
           linkedOnlySplitAliases,
           nativeJoinApplies,
           involvedLinkedNames,
+          mainSideSplitAliases,
         );
         return nativeJoin;
       }
