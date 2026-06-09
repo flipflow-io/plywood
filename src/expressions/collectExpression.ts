@@ -23,10 +23,18 @@ import {
   ExpressionJS,
   ExpressionValue,
 } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 
 export class CollectExpression extends ChainableUnaryExpression implements Aggregate {
   static op = 'Collect';
+  // Collect-into-set is a multiset-union semantic — union of A and B
+  // is not recoverable from per-partition collects because
+  // duplicates between partitions are dropped post-pre-aggregation
+  // (same fundamental as countDistinct). Out-of-spec discovery: the
+  // spec table at section 2 didn't list CollectExpression; declared
+  // 'none' for safety per P1 ("If you encounter an aggregator that
+  // the spec does not list, declare 'none' for safety AND report").
+  static decomposable: DecomposeTrait = 'none';
   static fromJS(parameters: ExpressionJS): CollectExpression {
     const value = ChainableUnaryExpression.jsToValue(parameters);
     if ((parameters as any).groupByKeys) {

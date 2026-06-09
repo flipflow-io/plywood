@@ -638,9 +638,12 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
         ]);
       }
       if (sql.includes('"histories-42f0bec"')) {
+        // avgPrice over a linked-only split decomposes into leaf columns.
+        // Jbl: sum 6200 / 1 row; Harman: sum 4207 / 1 row. Both → premium:
+        //   premium avgPrice = (6200 + 4207) / (1 + 1) = 10407 / 2 = 5203.5
         return Promise.resolve([
-          { __join_brand: 'Jbl', avgPrice: 6200 },
-          { __join_brand: 'Harman', avgPrice: 4207 },
+          { '__join_brand': 'Jbl', '!T_0': 6200, '!T_1': 1 },
+          { '__join_brand': 'Harman', '!T_0': 4207, '!T_1': 1 },
         ]);
       }
       return Promise.resolve([]);
@@ -741,14 +744,19 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
 
     // And the result should carry brand_tier on the SPLIT rows.
     const resultJs = result && result.toJS ? result.toJS() : result;
-    // eslint-disable-next-line no-console
-    console.log('[curl-shape result]', JSON.stringify(resultJs).slice(0, 400));
     const splitRows =
       resultJs && resultJs.data && resultJs.data[0] && resultJs.data[0].SPLIT
         ? resultJs.data[0].SPLIT.data
         : [];
     const keys = splitRows.length > 0 ? Object.keys(splitRows[0]) : [];
     expect(keys, 'SPLIT row carries brand_tier').to.include('brand_tier');
+    // Both brands collapse into the single premium bucket with a weighted avg.
+    expect(splitRows.length, 'one row per distinct brand_tier bucket').to.equal(1);
+    expect(splitRows[0].brand_tier).to.equal('premium');
+    expect(splitRows[0].avgPrice, 'weighted avg at bucket grain').to.equal(5203.5);
+    // No synthetic leaf columns leak to the caller.
+    expect(keys, 'no !T_ leaf leak').to.not.include('!T_0');
+    expect(keys, 'no !T_ leaf leak').to.not.include('!T_1');
   });
 
   // ───────────────────────────────────────────────────────────────────────
@@ -858,9 +866,17 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
         ]);
       }
       if (sql.includes('"histories-42f0bec"')) {
+        // avg($price) over a linked-only split (brand_tier) decomposes into
+        // homomorphic leaf columns: !T_0 = SUM(price), !T_1 = COUNT(*), keyed
+        // at the join-key (brand) grain. The post-join re-aggregation sums the
+        // leaves per brand_tier bucket and the recombination computes
+        // AvgPrice = !T_0 / !T_1 at the bucket grain.
+        //   Jbl:    sum 6200 over 2 rows
+        //   Harman: sum 8414 over 2 rows
+        // Premium bucket (both brands): (6200+8414) / (2+2) = 14614/4 = 3653.5
         return Promise.resolve([
-          { __join_brand: 'Jbl', AvgPrice: 6200 },
-          { __join_brand: 'Harman', AvgPrice: 4207 },
+          { '__join_brand': 'Jbl', '!T_0': 6200, '!T_1': 2 },
+          { '__join_brand': 'Harman', '!T_0': 8414, '!T_1': 2 },
         ]);
       }
       return Promise.resolve([]);
@@ -908,8 +924,18 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const rows = (resultJs && resultJs.data) || [];
     const keys = rows.length > 0 ? Object.keys(rows[0]) : [];
     expect(keys, 'compute result carries brand_tier').to.include('brand_tier');
+    // Both brands map to the SAME bucket (premium): the linked-only split must
+    // COLLAPSE them to exactly one row (one row per distinct brand_tier), not
+    // one row per brand. Returning two 'premium' rows was the media-de-medias
+    // bug (one row per productName/brand) this fix closes.
     const tiers = rows.map(r => r.brand_tier).sort();
-    expect(tiers, 'both rows enriched as premium').to.deep.equal(['premium', 'premium']);
+    expect(tiers, 'both brands collapse into one premium bucket').to.deep.equal(['premium']);
+    // The recombined avg is the weighted (count-correct) average at the bucket
+    // grain — NOT the average of per-brand averages.
+    expect(rows[0].AvgPrice, 'weighted avg at bucket grain').to.equal(3653.5);
+    // No synthetic leaf columns leak to the caller.
+    expect(keys, 'no !T_ leaf leak').to.not.include('!T_0');
+    expect(keys, 'no !T_ leaf leak').to.not.include('!T_1');
   });
 
   it('[timeAlignment=bucketed explicit] matches default compute behaviour', async () => {

@@ -72,7 +72,15 @@ describe('External auto-decomposition — cross-source expressions', () => {
       .join('\n');
     expect(all).to.include('"main_ds"');
     expect(all).to.include('"main_ds-reviews"');
-    expect(all).to.include('AVG("price")');
+    // F2: average is decomposed to sum/count before the cross-source gate so
+    // it routes through the JS-join path. The main-side AvgPrice emits the
+    // explicit SUM / NULL-aware-COUNT form, not AVG() and not SUM/COUNT(*).
+    // The denominator counts only non-null price (SQL AVG semantics, Ogievetsky
+    // BUG 1).
+    expect(all).to.include(
+      '(SUM("price")*1.0/SUM(CASE WHEN ("price" IS NULL) IS NOT TRUE THEN 1 ELSE 0 END))',
+    );
+    expect(all, 'no bare COUNT(*) avg denominator').to.not.include('(SUM("price")*1.0/COUNT(*))');
     expect(all).to.include('AVG("reviewsRating")');
     // Both queries group by the shared join key
     expect(all.match(/"competitor"/g).length).to.be.at.least(2);
@@ -148,7 +156,20 @@ describe('External auto-decomposition — cross-source expressions', () => {
         q => (q.query || '').includes('"main_ds"') && !(q.query || '').includes('main_ds-reviews'),
       );
     expect(mainQuery, 'main query must exist').to.exist;
-    expect(mainQuery.query).to.match(/AVG\("price"\)/);
+    // A linked-only split (review_title = $reviewContent) fans main's
+    // join-key-grain rows out across the linked split, so AvgPrice cannot be
+    // carried as a single ratio column (media-de-medias). It is decomposed into
+    // homomorphic leaf columns — SUM(price) and a NULL-aware count of price —
+    // that re-aggregate per bucket post-join; the recombination (SUM/COUNT) is
+    // replayed in JS. The count leaf counts only non-null price (SQL AVG
+    // semantics, Ogievetsky BUG 1), never a bare COUNT(*).
+    expect(mainQuery.query).to.match(/SUM\("price"\) AS "!T_0"/);
+    expect(mainQuery.query).to.match(
+      /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_1"/,
+    );
+    expect(mainQuery.query, 'no bare COUNT(*) leaf').to.not.match(/COUNT\(\*\) AS "!T_1"/);
+    // The main side must NOT carry the un-decomposed ratio column.
+    expect(mainQuery.query).to.not.match(/\(SUM\("price"\)\*1\.0\/COUNT/);
     expect(mainQuery.query).to.not.match(/reviewContent/);
     // Linked side groups by BOTH time and reviewContent
     const linkedQuery = plan.flat().find(q => (q.query || '').includes('main_ds-reviews'));

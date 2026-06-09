@@ -23,10 +23,14 @@ import {
   ExpressionJS,
   ExpressionValue,
 } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 
 export class ModeExpression extends ChainableUnaryExpression implements Aggregate {
   static op = 'Mode';
+  // Mode is not associative — the most-frequent value in A∪B can be a
+  // value that's neither the mode of A nor the mode of B. Native-JOIN
+  // only. INV-3.
+  static decomposable: DecomposeTrait = 'none';
   static fromJS(parameters: ExpressionJS): ModeExpression {
     return new ModeExpression(ChainableUnaryExpression.jsToValue(parameters));
   }

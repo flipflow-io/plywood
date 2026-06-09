@@ -432,17 +432,29 @@ describe('Expression', () => {
   });
 
   describe('#decomposeAverage', () => {
+    // SQL AVG(x) ignores NULL x: it is SUM(x) / COUNT(x), NOT SUM(x) / COUNT(*).
+    // decomposeAverage therefore lowers the denominator to a NULL-aware count of
+    // the AVERAGED expression — `data.filter(x IS NOT NULL).count()` — so that
+    // sub-groups whose averaged value is NULL do not inflate the denominator and
+    // understate the average (Ogievetsky BUG 1).
     it('works in simple case', () => {
       const ex1 = $('data').average('$x');
-      const ex2 = $('data').sum('$x').divide($('data').count());
+      const ex2 = $('data')
+        .sum('$x')
+        .divide($('data').filter($('x').isnt(null)).count());
       expect(ex1.decomposeAverage().toJS()).to.deep.equal(ex2.toJS());
     });
 
     it('works in more nested case', () => {
       const ex1 = $('w').add($('data').average('$x'), $('data').average('$y + $z'));
+      const yPlusZ = Expression.parse('$y + $z');
       const ex2 = $('w').add(
-        $('data').sum('$x').divide($('data').count()),
-        $('data').sum('$y + $z').divide($('data').count()),
+        $('data')
+          .sum('$x')
+          .divide($('data').filter($('x').isnt(null)).count()),
+        $('data')
+          .sum('$y + $z')
+          .divide($('data').filter(yPlusZ.isnt(null)).count()),
       );
       expect(ex1.decomposeAverage().toJS()).to.deep.equal(ex2.toJS());
     });

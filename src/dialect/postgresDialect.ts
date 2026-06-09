@@ -69,13 +69,16 @@ export class PostgresDialect extends SQLDialect {
   static CAST_TO_FUNCTION: Record<string, Record<string, string>> = {
     TIME: {
       NUMBER: 'TO_TIMESTAMP($$::double precision / 1000)',
+      _: 'CAST($$ AS TIMESTAMP)',
     },
     NUMBER: {
       TIME: 'EXTRACT(EPOCH FROM $$) * 1000',
       STRING: '$$::float',
+      _: '$$::float',
     },
     STRING: {
       NUMBER: '$$::text',
+      _: '$$::text',
     },
   };
 
@@ -113,7 +116,13 @@ export class PostgresDialect extends SQLDialect {
   }
 
   public castExpression(inputType: PlyType, operand: string, targetType: string): string {
-    const castFunction = PostgresDialect.CAST_TO_FUNCTION[targetType][inputType];
+    // Mirror DruidDialect: per-input cast when declared, `_` wildcard
+    // fallback otherwise (covers identity casts like STRING→STRING that
+    // the cross-source auto-inject joinKey path emits).
+    const castForTarget = PostgresDialect.CAST_TO_FUNCTION[targetType];
+    const castFunction = castForTarget
+      ? castForTarget[inputType || '_'] || castForTarget['_']
+      : undefined;
     if (!castFunction) {
       throw new Error(`unsupported cast from ${inputType} to ${targetType} in Postgres dialect`);
     }

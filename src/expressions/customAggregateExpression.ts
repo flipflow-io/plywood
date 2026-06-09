@@ -18,10 +18,13 @@ import { PlywoodValue } from '../datatypes';
 import { SQLDialect } from '../dialect/baseDialect';
 
 import { ChainableExpression, Expression, ExpressionJS, ExpressionValue } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 
 export class CustomAggregateExpression extends ChainableExpression {
   static op = 'CustomAggregate';
+  // Caller-supplied SQL — opaque to plywood. Default to the safe
+  // bucket: native-JOIN only. INV-3.
+  static decomposable: DecomposeTrait = 'none';
   static fromJS(parameters: ExpressionJS): CustomAggregateExpression {
     const value = ChainableExpression.jsToValue(parameters);
     value.custom = parameters.custom;

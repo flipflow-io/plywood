@@ -33,11 +33,19 @@ import {
   SplitsJS,
   SubstitutionFn,
 } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 import { SqlRefExpression } from './sqlRefExpression';
 
 export class SplitExpression extends ChainableExpression implements Aggregate {
   static op = 'Split';
+  // SplitExpression is GROUP BY itself, not a value-aggregator. It
+  // produces a dataset, not a scalar measure. The cross-source gate
+  // walks value-applies; a SplitExpression doesn't appear inside a
+  // measure ApplyExpression (it IS the apply's container). Trait
+  // declared for INV-3 structural-sweep completeness; never read by
+  // the decomposability gate. Out-of-spec discovery: spec section 2
+  // didn't list SplitExpression; declared 'none' per P1.
+  static decomposable: DecomposeTrait = 'none';
   static fromJS(parameters: ExpressionJS): SplitExpression {
     const value = ChainableExpression.jsToValue(parameters);
 

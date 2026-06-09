@@ -23,11 +23,16 @@ import {
   ExpressionJS,
   ExpressionValue,
 } from './baseExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 import { RefExpression } from './refExpression';
 
 export class CountDistinctExpression extends ChainableUnaryExpression implements Aggregate {
   static op = 'CountDistinct';
+  // Distinct-set union cannot be recovered from per-partition counts —
+  // duplicates between partitions are unobservable post-pre-aggregation.
+  // Native-JOIN is the only correct path for countDistinct over a
+  // cross-source split. INV-2 + INV-3.
+  static decomposable: DecomposeTrait = 'none';
   static fromJS(parameters: ExpressionJS): CountDistinctExpression {
     return new CountDistinctExpression(ChainableUnaryExpression.jsToValue(parameters));
   }

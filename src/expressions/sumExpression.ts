@@ -25,12 +25,14 @@ import {
   ExpressionValue,
 } from './baseExpression';
 import { LiteralExpression } from './literalExpression';
-import { Aggregate } from './mixins/aggregate';
+import { Aggregate, DecomposeTrait } from './mixins/aggregate';
 import { MultiplyExpression } from './multiplyExpression';
 import { SubtractExpression } from './subtractExpression';
 
 export class SumExpression extends ChainableUnaryExpression implements Aggregate {
   static op = 'Sum';
+  // Sum is associative + commutative across disjoint partitions. INV-3.
+  static decomposable: DecomposeTrait = 'sum';
   static fromJS(parameters: ExpressionJS): SumExpression {
     return new SumExpression(ChainableUnaryExpression.jsToValue(parameters));
   }
