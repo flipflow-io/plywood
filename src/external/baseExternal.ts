@@ -1507,6 +1507,35 @@ export abstract class External {
     return { engine, version, requester: config.requester ?? mainRequester };
   }
 
+  /**
+   * Rename ONE column (and its key/attribute entry) in place, preserving row
+   * order. Used by the per-metric split fold to relabel every leg's outer-key
+   * column to ONE canonical alias before `Dataset.fullJoin` (whose `sameKeys`
+   * precondition demands matching key names across the folded legs). No-op when
+   * the source name is absent or already equals the target.
+   */
+  static renameColumn(dataset: Dataset, from: string, to: string): Dataset {
+    if (!dataset || from === to) return dataset;
+    const nextData = (dataset.data || []).map(d => {
+      if (!hasOwnProp(d, from)) return d;
+      const out: Datum = {};
+      for (const k in d) {
+        if (!hasOwnProp(d, k)) continue;
+        out[k === from ? to : k] = d[k];
+      }
+      return out;
+    });
+    const nextAttributes = (dataset.attributes || []).map(a =>
+      a.name === from ? a.change('name', to) : a,
+    );
+    const nextKeys = (dataset.keys || []).map(k => (k === from ? to : k));
+    return new Dataset({
+      attributes: nextAttributes,
+      keys: nextKeys.length ? nextKeys : undefined,
+      data: nextData,
+    });
+  }
+
   static dropColumns(dataset: Dataset, drop: string[]): Dataset {
     if (!drop || drop.length === 0) return dataset;
     const dropSet: Record<string, true> = {};
@@ -1658,6 +1687,15 @@ export abstract class External {
   }
 
   /**
+   * @deprecated SUPERSEDED by `applyPerRowPostAggregateRecombination` (the ONE
+   * source of truth — see below). NO production caller remains: both folds
+   * (per-metric at SQLExternal sqlExternal.ts:466 and cross-source at
+   * baseExternal.ts:~3825) now route through the per-row primitive. This
+   * function is retained ONLY as the counter-example pinned by the divergence
+   * tests (simulateDruidCrossSourceAvgRecombination / Exhaustive), which assert
+   * it CORRUPTS the heterogeneous row mix the per-row fn handles. Do not wire it
+   * back into a fold; if the divergence pins are ever removed, delete this too.
+   *
    * Replay the scalar recombination half of the segregate-then-recombine
    * decomposition. After `reAggregateToSplitGrain` has collapsed the
    * homomorphic leaf aggregates (`!T_0 = sum($x)`, `!T_1 = count()`, …) to the
@@ -1666,11 +1704,11 @@ export abstract class External {
    * drops the synthetic leaf columns (`!T_*`) so the caller sees only the
    * measures they requested.
    *
-   * Orthogonal to re-aggregation: the leaves are the only thing the join and
-   * re-agg touch; the recombination is pure per-row scalar arithmetic with no
-   * cross-row dependency, so it is correct to apply AFTER the grain has
-   * collapsed. No-op when `postAggregateApplies` is empty (every measure was a
-   * single aggregate kept under its own name).
+   * WHY IT IS WRONG ON HETEROGENEOUS FOLDS: it rebuilds EVERY apply on EVERY row
+   * unconditionally (null/null → NaN, destroying a finished column) and samples
+   * data[0] to decide which `!T_*` columns to drop (an orphan at data[0] can
+   * globally drop the measure / leak scaffolding). The per-row primitive gates
+   * rebuild-vs-keep per row and drops scaffolding from the union of all rows.
    *
    * Synthetic-leaf naming: `segregationAggregateApplies` mints leaf names
    * prefixed `!T_`. Those — and only those — are dropped; a single-aggregate
@@ -1698,6 +1736,112 @@ export abstract class External {
     }
     if (syntheticLeaves.length === 0) return out;
     return External.dropColumns(out, syntheticLeaves);
+  }
+
+  /**
+   * PER-ROW post-aggregate recombination (Ogievetsky BUG 2 fix).
+   *
+   * The legacy `applyPostAggregateRecombination` rebuilt EVERY post-aggregate
+   * apply on EVERY row, and the now-retired `selectActivePostAggregates` decided
+   * whether to replay an apply at all from a SINGLE sample row
+   * (`joined.data[0]`). Both are wrong when the folded rows are heterogeneous —
+   * which they are whenever the legs cover different key domains:
+   *
+   *   - A row present only in the NON-avg leg has NULL `!T_*` channels. The
+   *     full-outer join sorts by key, so such a row can land at `data[0]` and
+   *     globally DROP the avg measure for the entire result (and leak `!T_*`).
+   *   - Even with the apply kept, dividing a row's null/null channels yields
+   *     NaN, corrupting rows that legitimately have no avg.
+   *   - A transport may return the FINISHED measure column for some keys and
+   *     the SUM/COUNT channels for others; a global rebuild overwrites the
+   *     finished value with NaN.
+   *
+   * The decision must be PER ROW:
+   *   - An apply that references `!T_*` channels (an avg rebuilt from
+   *     SUM/COUNT) is recomputed ONLY for rows where ALL its channels are
+   *     present and non-null; for every other row the EXISTING column value is
+   *     preserved (the finished column if one was returned, else left null —
+   *     never NaN, never dropped globally).
+   *   - An apply that references no `!T_*` channel (a cross-leg derived
+   *     measure, e.g. `Ratio = $Avg / $Max`) is always recomputed; channel
+   *     collapse in buildPerMetricSplitPlan rebased it onto the FINISHED
+   *     measure names, so it reads the per-row-rebuilt avg.
+   *
+   * Finally every `!T_*` scaffolding column is dropped from all rows.
+   */
+  static applyPerRowPostAggregateRecombination(
+    dataset: Dataset,
+    postAggregateApplies: ApplyExpression[] | undefined,
+  ): Dataset {
+    if (!dataset) return dataset;
+    if (!postAggregateApplies || postAggregateApplies.length === 0) return dataset;
+
+    // Pre-resolve each apply: its compute fn and the `!T_*` channels it
+    // references (empty for a cross-leg derived measure).
+    const prepared = postAggregateApplies.map(apply => {
+      const channels: string[] = [];
+      apply.expression.forEach(ex => {
+        const name = (ex as any).name;
+        if ((ex as any).op === 'ref' && typeof name === 'string' && name.indexOf('!T_') === 0) {
+          channels.push(name);
+        }
+      });
+      return {
+        name: apply.name,
+        fn: apply.expression.getFn(),
+        type: apply.expression.type,
+        channels,
+      };
+    });
+
+    const channelPresent = (datum: Datum, col: string): boolean =>
+      hasOwnProp(datum, col) && datum[col] != null;
+
+    const data = dataset.data || [];
+    const newData = new Array(data.length);
+    for (let i = 0; i < data.length; i++) {
+      const datum = data[i];
+      const out: Datum = Object.create(null);
+      for (const key in datum) out[key] = datum[key];
+      for (const p of prepared) {
+        if (p.channels.length === 0) {
+          // Cross-leg derived measure — always replay.
+          out[p.name] = p.fn(out);
+        } else if (p.channels.every(c => channelPresent(datum, c))) {
+          // Channels arrived with values on THIS row → rebuild.
+          out[p.name] = p.fn(out);
+        }
+        // else: channels absent/null on this row (finished column returned, or
+        // an avg-absent key) → keep the existing value (do NOT divide null/null
+        // into NaN, do NOT drop the measure for the whole result).
+      }
+      newData[i] = out;
+    }
+
+    let attributes = dataset.attributes;
+    for (const p of prepared) {
+      attributes = NamedArray.overrideByName(
+        attributes,
+        new AttributeInfo({ name: p.name, type: p.type }),
+      );
+    }
+    let out = new Dataset({
+      attributes,
+      keys: dataset.keys && dataset.keys.length ? dataset.keys : undefined,
+      data: newData,
+    });
+
+    // Drop every `!T_*` scaffolding column across ALL rows (read the union of
+    // keys, since a heterogeneous fold may carry channels on only some rows).
+    const syntheticLeaves: Record<string, true> = {};
+    for (const datum of newData) {
+      for (const col in datum) {
+        if (col.indexOf('!T_') === 0) syntheticLeaves[col] = true;
+      }
+    }
+    const leaves = Object.keys(syntheticLeaves);
+    if (leaves.length > 0) out = External.dropColumns(out, leaves);
+    return out;
   }
 
   /**
@@ -3687,7 +3831,24 @@ export abstract class External {
           // before HAVING/sort/limit, which reference the derived measure
           // names. For all-single-aggregate queries postAggregateApplies is
           // empty and this is a no-op.
-          joined = External.applyPostAggregateRecombination(joined, crossExt.postAggregateApplies);
+          //
+          // PER-ROW recombination is the ONE source of truth shared with the
+          // per-metric fold (sqlExternal.ts:466). The cross-source fold is
+          // heterogeneous in the same way: a left/full join can synthesise
+          // orphan rows with null `!T_*` channels, and a transport may return
+          // the FINISHED measure column for some keys and the SUM/COUNT
+          // channels for others. The global rebuild divided null/null into NaN
+          // and could globally drop the measure by sampling data[0]; the
+          // per-row primitive channel-gates each row (rebuild only when ALL its
+          // `!T_*` channels are present, else preserve the existing value) and
+          // drops scaffolding from the UNION of all rows. Homogeneous all-
+          // channels INNER folds (the live magic-dim path) recombine
+          // identically under both — so this is correctness-neutral there and
+          // strictly safer on the orphan / finished-column shapes.
+          joined = External.applyPerRowPostAggregateRecombination(
+            joined,
+            crossExt.postAggregateApplies,
+          );
           // Apply the post-join HAVING before sort/limit so sort ordering
           // reflects only the surviving rows, and limit caps against the
           // filtered result — not the pre-filter row count (which would
@@ -4695,8 +4856,15 @@ export abstract class External {
     // untouched, so the rewrite does NOT leak to non-cross-source
     // paths (a viz with avg + no linked-only split still emits AVG()
     // unchanged — see avgRewriteIsolation pin).
+    // The avg-denominator count must be NULL-aware on SQL engines (SQL AVG
+    // semantics, Ogievetsky BUG 1), but Druid-NATIVE (`engine === 'druid'`)
+    // cannot express a filter on a rolled-up/unsplitable metric, so it keeps the
+    // historical plain COUNT(*) — exactly as the Druid-native aggregation
+    // builder does. The discriminator is the engine: SQL externals (druidsql /
+    // mysql / postgres) get the null-aware count; native Druid keeps COUNT(*).
+    const nullAwareCount = this.engine !== 'druid';
     const rewrittenApplies: ApplyExpression[] = this.applies.map(a =>
-      a.changeExpression(a.expression.decomposeAverage()),
+      a.changeExpression(a.expression.decomposeAverage(undefined, nullAwareCount)),
     );
 
     // Index linkedSources by source-string so we can match foreign ExternalExpressions back

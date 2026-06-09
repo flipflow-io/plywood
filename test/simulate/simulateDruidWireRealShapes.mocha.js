@@ -192,11 +192,19 @@ describe('Wire-real cross-source shapes (Expression.fromJS of captured front req
       const sqls = planSqls(Expression.fromJS(WIRE_AVG.expression));
       const main = mainSubQuery(sqls);
       expect(main, 'main GROUP BY 1 sub-query exists').to.exist;
-      // avg_price + avg_pvp decompose to SUM leaves (price, pvp) + a shared
-      // COUNT leaf; min_price + count are kept under their own names.
+      // avg_price + avg_pvp decompose to SUM leaves (price, pvp), EACH with its
+      // OWN NULL-aware count of the averaged column (Ogievetsky BUG 1 — counts
+      // only non-null values, never a shared COUNT(*)); min_price + the user's
+      // row `count` are kept under their own names.
       expect(main, 'SUM(price) leaf').to.match(/SUM\("price"\) AS "!T_\d+"/);
       expect(main, 'SUM(pvp) leaf').to.match(/SUM\("pvp"\) AS "!T_\d+"/);
-      expect(main, 'COUNT leaf for avg recombination').to.match(/COUNT\(\*\) AS "(!T_\d+|count)"/);
+      expect(main, 'null-aware count of price').to.match(
+        /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      );
+      expect(main, 'null-aware count of pvp').to.match(
+        /SUM\(CASE WHEN \("pvp" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      );
+      expect(main, "user's row count kept as COUNT(*)").to.match(/COUNT\(\*\) AS "count"/);
       expect(main, 'min_price by name').to.match(/MIN\("price"\) AS "min_price"/);
       // The un-decomposed ratio columns (avg_price / diff_with_pvp) must NOT be
       // projected by the main SQL — they are post-aggregate recombinations.
@@ -244,12 +252,40 @@ describe('Wire-real cross-source shapes (Expression.fromJS of captured front req
           ]);
         }
         if (sql.includes('histories_507') && /GROUP BY 1\b/.test(sql)) {
-          // Column shape mirrors the simulate plan: SUM(price)=!T_0, SUM(pvp)=!T_1,
-          // COUNT shared as `count`, MIN(price)=min_price.
+          // Column shape mirrors the simulate plan: SUM(price)=!T_0,
+          // count(non-null price)=!T_1, SUM(pvp)=!T_2, count(non-null pvp)=!T_3;
+          // MIN(price)=min_price; the user's `count` is a separate row COUNT(*).
+          // Each avg carries its OWN null-aware count (Ogievetsky BUG 1) — no
+          // shared COUNT(*). Every row has both columns non-null, so the two
+          // null-aware counts equal the row count per competitor.
           return Promise.resolve([
-            { '__join_competitor': 'C1', 'min_price': 1, 'count': 100, '!T_0': 100, '!T_1': 200 },
-            { '__join_competitor': 'C2', 'min_price': 5, 'count': 1, '!T_0': 100, '!T_1': 200 },
-            { '__join_competitor': 'C3', 'min_price': 7, 'count': 10, '!T_0': 70, '!T_1': 70 },
+            {
+              '__join_competitor': 'C1',
+              'min_price': 1,
+              'count': 100,
+              '!T_0': 100,
+              '!T_1': 100,
+              '!T_2': 200,
+              '!T_3': 100,
+            },
+            {
+              '__join_competitor': 'C2',
+              'min_price': 5,
+              'count': 1,
+              '!T_0': 100,
+              '!T_1': 1,
+              '!T_2': 200,
+              '!T_3': 1,
+            },
+            {
+              '__join_competitor': 'C3',
+              'min_price': 7,
+              'count': 10,
+              '!T_0': 70,
+              '!T_1': 10,
+              '!T_2': 70,
+              '!T_3': 10,
+            },
           ]);
         }
         // totals GROUP BY () — single multi-measure row.
@@ -318,10 +354,37 @@ describe('Wire-real cross-source shapes (Expression.fromJS of captured front req
           ]);
         }
         if (sql.includes('histories_507') && /GROUP BY 1\b/.test(sql)) {
+          // !T_0=SUM(price), !T_1=count(non-null price) [avg_price divisor],
+          // !T_2=SUM(pvp), !T_3=count(non-null pvp) [avg_pvp divisor]. All rows
+          // non-null, so both null-aware counts equal the row count (5).
           return Promise.resolve([
-            { '__join_competitor': 'C1', 'min_price': 1, 'count': 5, '!T_0': 50, '!T_1': 60 },
-            { '__join_competitor': 'C2', 'min_price': 2, 'count': 5, '!T_0': 30, '!T_1': 60 },
-            { '__join_competitor': 'C3', 'min_price': 3, 'count': 5, '!T_0': 40, '!T_1': 60 },
+            {
+              '__join_competitor': 'C1',
+              'min_price': 1,
+              'count': 5,
+              '!T_0': 50,
+              '!T_1': 5,
+              '!T_2': 60,
+              '!T_3': 5,
+            },
+            {
+              '__join_competitor': 'C2',
+              'min_price': 2,
+              'count': 5,
+              '!T_0': 30,
+              '!T_1': 5,
+              '!T_2': 60,
+              '!T_3': 5,
+            },
+            {
+              '__join_competitor': 'C3',
+              'min_price': 3,
+              'count': 5,
+              '!T_0': 40,
+              '!T_1': 5,
+              '!T_2': 60,
+              '!T_3': 5,
+            },
           ]);
         }
         return Promise.resolve([
@@ -331,7 +394,7 @@ describe('Wire-real cross-source shapes (Expression.fromJS of captured front req
       const result = await Expression.fromJS(WIRE_AVG.expression).compute({ main: makeMain(req) });
       const rows = result.toJS().data[0].SPLIT.data;
       expect(rows.length, 'all 3 buckets survive limit 50').to.equal(3);
-      // avg_price = !T_0/count : ES=10, IT=8, FR=6 → sorted desc.
+      // avg_price = !T_0/!T_1 : ES=10, IT=8, FR=6 → sorted desc.
       expect(
         rows.map(r => r.competitor_country),
         'sorted desc by avg_price',

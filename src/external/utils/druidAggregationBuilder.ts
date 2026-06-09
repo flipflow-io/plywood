@@ -117,8 +117,34 @@ export class DruidAggregationBuilder {
     const { aggregateApplies, postAggregateApplies } = External.segregationAggregateApplies(
       applies.map(apply => {
         let expression = apply.expression;
+        // ==================================================================
+        // INTENTIONAL ENGINE-SEMANTICS DIFFERENCE (NOT the BUG 1 fix). Read
+        // before "fixing" this to match the SQL path.
+        //
+        // SQL engines decompose AVG(x) to a NULL-AWARE denominator —
+        // SUM(x) / COUNT(x where x IS NOT NULL) — so null-valued rows don't
+        // dilute the average (Ogievetsky BUG 1, fixed on the SQL paths:
+        // sqlExternal / cross-source / companion, nullAwareCount default true).
+        //
+        // Native Druid DELIBERATELY OPTS OUT (`nullAwareCount=false`, plain
+        // COUNT(*)): on a rolled-up/unsplitable Druid metric the source rows no
+        // longer exist, so "x IS NOT NULL" is not expressible as a Druid
+        // filter — there is nothing to re-filter. This means native-Druid AVG
+        // over a null-bearing column UNDERSTATES the result vs the SQL engines
+        // (same defect CLASS as BUG 1, but here it is a forced engine limit,
+        // not an oversight).
+        //
+        // FLAGGED DECISION FOR THE HUMAN (product decision pending): native
+        // Druid AVG and SQL AVG can disagree on null-heavy data. Closing the
+        // gap needs a Druid-side null-count strategy (e.g. a stored non-null
+        // count metric at ingest) — out of scope here. The current behaviour
+        // is PINNED as an explicit, labeled intentional choice by the
+        // "native-Druid AVG uses COUNT(*) by design" specs in
+        // simulateDruidCrossSourceAvgRecombination.mocha.js. Changing the value
+        // below must also flip that pin and is a product call, not a code call.
+        // ==================================================================
         expression = this.switchToRollupCount(
-          this.inlineDerivedAttributesInAggregate(expression).decomposeAverage(),
+          this.inlineDerivedAttributesInAggregate(expression).decomposeAverage(undefined, false),
         ).distribute();
         return apply.changeExpression(expression);
       }),

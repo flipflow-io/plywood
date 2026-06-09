@@ -162,13 +162,17 @@ describe('Time-bucket split + magic-dimension (eternal linked source)', () => {
       expect(mainSql, 'main projects a TIME_FLOOR day bucket').to.match(/TIME_FLOOR/i);
       expect(mainSql, 'main projects __join_brand').to.match(/AS "__join_brand"/);
       // avg decomposes into homomorphic leaves so the post-join re-aggregation
-      // can sum them: a SUM("price") leaf carried as `!T_n`, and a COUNT(*) as
-      // the divisor. Because the panel also asks for an explicit `count`
-      // measure, the segregator dedupes the divisor onto that COUNT(*) column
-      // (`AS "count"`) rather than minting a second `!T_` leaf — `avg_price`
-      // recombines as `!T_n / count`.
+      // can sum them: a SUM("price") leaf and the avg's OWN divisor — a NULL-aware
+      // count of price (SQL AVG semantics, Ogievetsky BUG 1), carried as a `!T_`
+      // leaf. The panel's explicit `count` measure is a ROW count (COUNT(*),
+      // projected `AS "count"`) and is NOT reused as the avg divisor: a row count
+      // and a non-null-price count differ whenever any price is null. `avg_price`
+      // recombines as `!T_sum / !T_count`, independent of the user's count.
       expect(mainSql, 'SUM leaf for avg').to.match(/SUM\("price"\) AS "!T_\d+"/);
-      expect(mainSql, 'COUNT divisor projected').to.match(/COUNT\(\*\) AS "(?:!T_\d+|count)"/);
+      expect(mainSql, 'avg divisor is a NULL-aware count leaf (not COUNT(*))').to.match(
+        /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      );
+      expect(mainSql, "user's explicit count is a row COUNT(*)").to.match(/COUNT\(\*\) AS "count"/);
       // GROUP BY must reference ≥2 positions (bucket + join key) — never mutilated.
       const gb = mainSql.match(/GROUP BY ([\d,\s]+)/);
       expect(gb, 'main has a GROUP BY').to.exist;
@@ -213,13 +217,15 @@ describe('Time-bucket split + magic-dimension (eternal linked source)', () => {
         }
         if (sql.includes('histories_main')) {
           // Leaf shape mirrors the emitted main SQL: avg_price segregates to
-          // !T_0 = SUM(price) with the panel's own `count` (COUNT(*)) reused as
-          // the divisor (no separate `!T_1`). `time` is the day bucket value.
+          // !T_0 = SUM(price) and !T_1 = NULL-aware count of price (its OWN
+          // divisor, Ogievetsky BUG 1). The panel's explicit `count` is a
+          // separate row COUNT(*). Every row here has price non-null, so the
+          // non-null-price count (!T_1) equals the row count. `time` = day bucket.
           return Promise.resolve([
-            { 'time': DAY1, '__join_brand': 'B1', '!T_0': 100, 'count': 100 },
-            { 'time': DAY1, '__join_brand': 'B2', '!T_0': 70, 'count': 10 },
-            { 'time': DAY2, '__join_brand': 'B1', '!T_0': 100, 'count': 1 },
-            { 'time': DAY2, '__join_brand': 'B2', '!T_0': 40, 'count': 5 },
+            { 'time': DAY1, '__join_brand': 'B1', '!T_0': 100, '!T_1': 100, 'count': 100 },
+            { 'time': DAY1, '__join_brand': 'B2', '!T_0': 70, '!T_1': 10, 'count': 10 },
+            { 'time': DAY2, '__join_brand': 'B1', '!T_0': 100, '!T_1': 1, 'count': 1 },
+            { 'time': DAY2, '__join_brand': 'B2', '!T_0': 40, '!T_1': 5, 'count': 5 },
           ]);
         }
         return Promise.resolve([]);
@@ -284,9 +290,11 @@ describe('Time-bucket split + magic-dimension (eternal linked source)', () => {
           ]);
         }
         if (sql.includes('histories_main')) {
+          // !T_1 = NULL-aware count of price (avg_price's own divisor); `count` is
+          // the user's row COUNT(*). All rows have price non-null here, so equal.
           return Promise.resolve([
-            { 'time': DAY1b, '__join_brand': 'B1', '!T_0': 100, 'count': 100 },
-            { 'time': DAY1b, '__join_brand': 'B2', '!T_0': 100, 'count': 1 },
+            { 'time': DAY1b, '__join_brand': 'B1', '!T_0': 100, '!T_1': 100, 'count': 100 },
+            { 'time': DAY1b, '__join_brand': 'B2', '!T_0': 100, '!T_1': 1, 'count': 1 },
           ]);
         }
         return Promise.resolve([]);

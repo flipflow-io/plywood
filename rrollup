@@ -111,6 +111,8 @@ cat \
   build/external/utils/lookupCTEBuilder.js \
   build/external/utils/splitClassifier.js \
   build/external/utils/resplitAggregationSQLBuilder.js \
+  build/external/utils/companionDecomposition.js \
+  build/external/utils/perMetricSplitDecomposition.js \
   build/external/sqlExternal.js \
   build/external/mySqlExternal.js \
   build/external/postgresExternal.js \

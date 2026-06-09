@@ -203,11 +203,15 @@ describe('More cross-source shapes — catalog S1/S4/S5', () => {
       );
       expect(main, 'main GROUP BY 1 sub-query exists').to.exist;
       expect(main, 'SUM(price) leaf for the outer avg').to.match(/SUM\("price"\) AS "!T_\d+"/);
-      expect(main, 'COUNT leaf for the outer avg').to.match(/COUNT\(\*\) AS "!T_\d+"/);
+      // NULL-aware count of price (SQL AVG semantics, Ogievetsky BUG 1), not COUNT(*).
+      expect(main, 'NULL-aware COUNT leaf for the outer avg').to.match(
+        /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      );
+      expect(main, 'no bare COUNT(*) leaf').to.not.match(/COUNT\(\*\) AS "!T_\d+"/);
       // The un-decomposed ratio column must NOT be the main projection (that was
       // the malformed shape on a stale/no-fix build).
       expect(main, 'no ratio column in main SQL').to.not.match(
-        /\(SUM\("price"\)\*1\.0\/COUNT\(\*\)\) AS "avg_price"/,
+        /\(SUM\("price"\)\*1\.0\/.*\) AS "avg_price"/,
       );
     });
   });
@@ -249,9 +253,14 @@ describe('More cross-source shapes — catalog S1/S4/S5', () => {
         s => s.includes('histories_507') && !s.includes('lookup_cc_rev1') && /GROUP BY 1\b/.test(s),
       );
       expect(main, 'main GROUP BY 1 sub-query exists').to.exist;
-      // current avg → unconditional SUM + COUNT leaves.
+      // current avg → unconditional SUM + NULL-aware count leaves (the count is
+      // a count of non-null price — SQL AVG semantics, Ogievetsky BUG 1 — not
+      // COUNT(*)).
       expect(main, 'current SUM(price) leaf').to.match(/SUM\("price"\) AS "!T_\d+"/);
-      expect(main, 'current COUNT leaf').to.match(/COUNT\(\*\) AS "!T_\d+"/);
+      expect(main, 'current NULL-aware COUNT leaf').to.match(
+        /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      );
+      expect(main, 'no bare COUNT(*) leaf').to.not.match(/COUNT\(\*\) AS "!T_\d+"/);
       // previous avg → window-conditioned SUM(CASE…) + SUM(CASE 1…) leaves —
       // both still homomorphic (SUM-reducible) so the fan-out collapses correctly.
       expect(main, 'previous SUM(CASE…) leaf').to.match(

@@ -187,11 +187,14 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
         }
         if (sql.includes('"histories"') && /GROUP BY 1\b/.test(sql)) {
           // main leaves per (brand, competitor). The simulate plan projects, in
-          // order: MIN(price)=min_price, SUM(price)=!T_0, COUNT(*)=!T_1,
-          // SUM(pvp)=!T_2 (verified against the emitted SQL).
-          //   B_FR: price sum 70 / count 10 → avg(price)=7 ; pvp sum 70 → avg=7
-          //   B_ES: price sum 100 / count 100 → avg=1 ; pvp sum 200 → avg=2
-          //   B_IT: price sum 150 / count 50 → avg=3 ; pvp sum 200 → avg=4
+          // order: MIN(price)=min_price, SUM(price)=!T_0, count(non-null
+          // price)=!T_1, SUM(pvp)=!T_2, count(non-null pvp)=!T_3. Each avg now
+          // carries its OWN NULL-aware count of the averaged column (Ogievetsky
+          // BUG 1) — no shared COUNT(*). Every row here has both columns
+          // non-null, so the pvp count equals the price count per brand.
+          //   B_FR: price sum 70 / count 10 → avg(price)=7 ; pvp sum 70 / count 10 → avg=7
+          //   B_ES: price sum 100 / count 100 → avg=1 ; pvp sum 200 / count 100 → avg=2
+          //   B_IT: price sum 150 / count 50 → avg=3 ; pvp sum 200 / count 50 → avg=4
           return Promise.resolve([
             {
               '__join_brand': 'B_FR',
@@ -200,6 +203,7 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
               '!T_0': 70,
               '!T_1': 10,
               '!T_2': 70,
+              '!T_3': 10,
             },
             {
               '__join_brand': 'B_ES',
@@ -208,6 +212,7 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
               '!T_0': 100,
               '!T_1': 100,
               '!T_2': 200,
+              '!T_3': 100,
             },
             {
               '__join_brand': 'B_IT',
@@ -216,6 +221,7 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
               '!T_0': 150,
               '!T_1': 50,
               '!T_2': 200,
+              '!T_3': 50,
             },
           ]);
         }

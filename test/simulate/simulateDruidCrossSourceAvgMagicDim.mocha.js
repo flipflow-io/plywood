@@ -125,11 +125,17 @@ describe('Cross-source AVG + magic-dimension split (segregate-then-recombine)', 
       const sqls = planSql([['avg_price', '$main.average($price)']]);
       const mainSql = sqls.find(s => s.includes('"main_ds"') && !s.includes('lookup_bc_rev1'));
       expect(mainSql, 'main sub-query exists').to.exist;
-      // Homomorphic leaves projected separately.
+      // Homomorphic leaves projected separately. The COUNT leaf is a NULL-aware
+      // count of the AVERAGED column (SQL AVG semantics, Ogievetsky BUG 1) —
+      // never a bare COUNT(*), which would inflate the denominator with
+      // null-price rows.
       expect(mainSql, 'SUM leaf').to.match(/SUM\("price"\) AS "!T_0"/);
-      expect(mainSql, 'COUNT leaf').to.match(/COUNT\(\*\) AS "!T_1"/);
+      expect(mainSql, 'NULL-aware COUNT leaf (not COUNT(*))').to.match(
+        /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_1"/,
+      );
+      expect(mainSql, 'no bare COUNT(*) denominator leaf').to.not.match(/COUNT\(\*\) AS "!T_/);
       // The un-decomposed ratio column must NOT appear (that was the bug shape).
-      expect(mainSql, 'no ratio column').to.not.match(/\(SUM\("price"\)\*1\.0\/COUNT\(\*\)\)/);
+      expect(mainSql, 'no ratio column').to.not.match(/\(SUM\("price"\)\*1\.0\/COUNT/);
       // Counterfactual: with the old code the main SQL carried the ratio column
       // and re-agg refused to collapse it (500). With the fix it carries leaves.
     });
@@ -179,9 +185,17 @@ describe('Cross-source AVG + magic-dimension split (segregate-then-recombine)', 
       ]);
       const mainSql = sqls.find(s => s.includes('"main_ds"') && !s.includes('lookup_bc_rev1'));
       expect(mainSql, 'main sub-query exists').to.exist;
-      // count() is shared between avg_price and rp/rp_diff → deduped to ONE leaf.
-      const countLeaves = (mainSql.match(/COUNT\(\*\) AS "!T_\d+"/g) || []).length;
-      expect(countLeaves, 'count() deduped to a single leaf').to.equal(1);
+      // avg(price) and avg(pvp) each carry their OWN null-aware count of the
+      // AVERAGED column (Ogievetsky BUG 1): a non-null price count for avg_price
+      // and a non-null pvp count for avg_pvp. They have DIFFERENT denominators,
+      // so they must NOT be deduped to one shared COUNT(*) — there are exactly
+      // TWO distinct null-aware count leaves, zero bare COUNT(*).
+      expect(mainSql, 'no bare COUNT(*) denominator').to.not.match(/COUNT\(\*\) AS "!T_/);
+      const priceCnt =
+        /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/;
+      const pvpCnt = /SUM\(CASE WHEN \("pvp" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/;
+      expect(mainSql, 'null-aware count of price').to.match(priceCnt);
+      expect(mainSql, 'null-aware count of pvp').to.match(pvpCnt);
       // Two distinct SUM leaves (price, pvp) + the min projected under its name.
       expect(mainSql, 'SUM(price) leaf').to.match(/SUM\("price"\) AS "!T_\d+"/);
       expect(mainSql, 'SUM(pvp) leaf').to.match(/SUM\("pvp"\) AS "!T_\d+"/);
@@ -276,10 +290,15 @@ describe('Cross-source AVG + magic-dimension split (segregate-then-recombine)', 
         }
         if (sql.includes('main_ds')) {
           // Leaf names depend on segregation order; map by the SQL aliases.
-          // avg_price → !T_0=sum(price), !T_1=count(); rp adds !T_2=sum(pvp).
+          // avg_price → !T_0=sum(price), !T_1=count(non-null price);
+          // avg(pvp) (inside rp) → !T_2=sum(pvp), !T_3=count(non-null pvp).
+          // Each avg carries its OWN null-aware count of the AVERAGED column
+          // (Ogievetsky BUG 1) — they are NOT a single shared COUNT(*). Here
+          // every row has both columns non-null, so the pvp count equals the
+          // price count per brand.
           return Promise.resolve([
-            { '__join_brand': 'B1', '!T_0': 100, '!T_1': 100, '!T_2': 200 },
-            { '__join_brand': 'B2', '!T_0': 100, '!T_1': 1, '!T_2': 200 },
+            { '__join_brand': 'B1', '!T_0': 100, '!T_1': 100, '!T_2': 200, '!T_3': 100 },
+            { '__join_brand': 'B2', '!T_0': 100, '!T_1': 1, '!T_2': 200, '!T_3': 1 },
           ]);
         }
         return Promise.resolve([]);

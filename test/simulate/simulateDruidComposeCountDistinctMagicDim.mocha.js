@@ -330,14 +330,22 @@ describe('Compose: countDistinct(concat) × magic-dimension split (native-JOIN r
       // Orthogonality proof: the throw above is caused by the COMPOSITION
       // (derived measure forced onto native-JOIN by countDistinct), NOT by the
       // ratio being intrinsically broken. Alone, the linked-only split segregates
-      // avg/avg into SUM(price)/COUNT(*)/SUM(pvp) leaves across two sub-queries.
+      // avg/avg into SUM(price) + null-aware count(price) + SUM(pvp) + null-aware
+      // count(pvp) leaves across two sub-queries (each avg's denominator is a
+      // NULL-aware count of its averaged column, Ogievetsky BUG 1 — not COUNT(*)).
       const sqls = planSql([['rp', '$main.average($price) / $main.average($pvp)']]);
       expect(sqls.length, 'jsJoin emits main + lookup sub-queries').to.equal(2);
       const mainSql = sqls.find(s => s.includes('"main_ds"') && !s.includes('lookup_bc_rev1'));
       expect(mainSql, 'main sub-query exists').to.exist;
       expect(mainSql, 'SUM(price) leaf').to.match(/SUM\("price"\) AS "!T_\d+"/);
-      expect(mainSql, 'COUNT(*) leaf').to.match(/COUNT\(\*\) AS "!T_\d+"/);
+      expect(mainSql, 'no bare COUNT(*) leaf').to.not.match(/COUNT\(\*\) AS "!T_\d+"/);
+      expect(mainSql, 'null-aware count of price').to.match(
+        /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      );
       expect(mainSql, 'SUM(pvp) leaf').to.match(/SUM\("pvp"\) AS "!T_\d+"/);
+      expect(mainSql, 'null-aware count of pvp').to.match(
+        /SUM\(CASE WHEN \("pvp" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      );
       // No INNER JOIN here — this is the JS-join path, not native-JOIN.
       expect(mainSql, 'jsJoin main is not a native JOIN').to.not.match(/INNER JOIN/i);
     });

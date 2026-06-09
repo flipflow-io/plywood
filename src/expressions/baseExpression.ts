@@ -1801,11 +1801,17 @@ export abstract class Expression implements Instance<ExpressionValue, Expression
   /**
    * Decompose instances of $data.average($x) into $data.sum($x) / $data.count()
    * @param countEx and optional expression to use in a sum instead of a count
+   * @param nullAwareCount when true (default) the denominator counts only
+   *   non-null x (`filter(x IS NOT NULL).count()`), matching SQL AVG semantics
+   *   (Ogievetsky BUG 1). Set false ONLY where a non-null filter is not
+   *   expressible — the Druid-native aggregation builder, which cannot filter a
+   *   rolled-up/unsplitable metric — so it keeps the plain row count it always
+   *   used. SQL / cross-source / resplit / companion paths use the default.
    */
-  public decomposeAverage(countEx?: Expression): Expression {
+  public decomposeAverage(countEx?: Expression, nullAwareCount = true): Expression {
     return this.substitute(ex => {
       if (ex instanceof AverageExpression) {
-        return ex.decomposeAverage(countEx);
+        return ex.decomposeAverage(countEx, nullAwareCount);
       }
       return null;
     });

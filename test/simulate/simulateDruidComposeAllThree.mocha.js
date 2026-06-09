@@ -184,15 +184,22 @@ describe('Compose all three magic-dim fixes in one panel (time × brand_country,
       expect(mainSql, 'main projects __join_brand').to.match(/AS "__join_brand"/);
 
       // ── Fix A: avg + ratio segregate into homomorphic leaves on the main SQL.
-      // avg_price → SUM(price)/COUNT(*) ; rp_pvp adds SUM(pvp); COUNT shared/deduped.
+      // Each averaged column carries SUM + its OWN NULL-aware count (SQL AVG
+      // semantics, Ogievetsky BUG 1): avg(price) → SUM(price) + count(non-null
+      // price); avg(pvp) (inside rp_pvp) → SUM(pvp) + count(non-null pvp). The
+      // price channels are shared between avg_price and rp_pvp (deduped); the
+      // pvp channels are distinct. NO bare COUNT(*) denominator anywhere.
       expect(mainSql, 'SUM(price) leaf').to.match(/SUM\("price"\) AS "!T_\d+"/);
       expect(mainSql, 'SUM(pvp) leaf').to.match(/SUM\("pvp"\) AS "!T_\d+"/);
-      const countLeaves = (mainSql.match(/COUNT\(\*\) AS "!T_\d+"/g) || []).length;
-      expect(countLeaves, 'count() shared between avg_price and rp_pvp → ONE leaf').to.equal(1);
-      // No un-decomposed ratio column (the pre-fix bug shape).
-      expect(mainSql, 'no ratio column on main SQL').to.not.match(
-        /\(SUM\("price"\)\*1\.0\/COUNT\(\*\)\)/,
+      expect(mainSql, 'no bare COUNT(*) denominator').to.not.match(/COUNT\(\*\) AS "!T_\d+"/);
+      expect(mainSql, 'null-aware count of price').to.match(
+        /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
       );
+      expect(mainSql, 'null-aware count of pvp').to.match(
+        /SUM\(CASE WHEN \("pvp" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      );
+      // No un-decomposed ratio column (the pre-fix bug shape).
+      expect(mainSql, 'no ratio column on main SQL').to.not.match(/\(SUM\("price"\)\*1\.0\/COUNT/);
       // The derived sort is post-aggregate, not a main-SQL ORDER BY.
       expect(mainSql, 'no ORDER BY on the derived measure in main SQL').to.not.match(/ORDER BY/);
 
@@ -242,7 +249,8 @@ describe('Compose all three magic-dim fixes in one panel (time × brand_country,
     //   Day2 Francia: B_FR1 only — price sum=40 cnt=5 (avg 8) ; pvp sum=80 cnt=5 (avg 16)
     //                 → rp_pvp = (8 - 16)/16 = -0.5
     // Leaf order verified against the emitted MAIN SQL: !T_0=SUM(price),
-    // !T_1=COUNT(*), !T_2=SUM(pvp); `time` = the P1D day bucket value.
+    // !T_1=count(non-null price), !T_2=SUM(pvp), !T_3=count(non-null pvp);
+    // `time` = the P1D day bucket value.
     function reqFrancia() {
       return promiseFnToStream(rq => {
         const sql = (rq && rq.query && rq.query.query) || '';
@@ -254,10 +262,28 @@ describe('Compose all three magic-dim fixes in one panel (time × brand_country,
           ]);
         }
         if (sql.includes('histories_main')) {
+          // Leaf order verified against the emitted MAIN SQL: !T_0=SUM(price),
+          // !T_1=count(non-null price), !T_2=SUM(pvp), !T_3=count(non-null pvp).
+          // Each avg carries its OWN null-aware count (Ogievetsky BUG 1); here
+          // every row has both columns non-null, so the pvp count = price count.
           return Promise.resolve([
-            { 'time': DAY1, '__join_brand': 'B_FR1', '!T_0': 100, '!T_1': 100, '!T_2': 200 },
-            { 'time': DAY1, '__join_brand': 'B_FR2', '!T_0': 100, '!T_1': 1, '!T_2': 200 },
-            { 'time': DAY2, '__join_brand': 'B_FR1', '!T_0': 40, '!T_1': 5, '!T_2': 80 },
+            {
+              'time': DAY1,
+              '__join_brand': 'B_FR1',
+              '!T_0': 100,
+              '!T_1': 100,
+              '!T_2': 200,
+              '!T_3': 100,
+            },
+            {
+              'time': DAY1,
+              '__join_brand': 'B_FR2',
+              '!T_0': 100,
+              '!T_1': 1,
+              '!T_2': 200,
+              '!T_3': 1,
+            },
+            { 'time': DAY2, '__join_brand': 'B_FR1', '!T_0': 40, '!T_1': 5, '!T_2': 80, '!T_3': 5 },
           ]);
         }
         return Promise.resolve([]);
@@ -329,10 +355,32 @@ describe('Compose all three magic-dim fixes in one panel (time × brand_country,
           ]);
         }
         if (sql.includes('histories_main')) {
+          // !T_3 = count(non-null pvp); every row here has both columns non-null.
           return Promise.resolve([
-            { 'time': DAY1, '__join_brand': 'B_FR1', '!T_0': 70, '!T_1': 10, '!T_2': 70 },
-            { 'time': DAY1, '__join_brand': 'B_ES', '!T_0': 100, '!T_1': 100, '!T_2': 200 },
-            { 'time': DAY1, '__join_brand': 'B_IT', '!T_0': 150, '!T_1': 50, '!T_2': 200 },
+            {
+              'time': DAY1,
+              '__join_brand': 'B_FR1',
+              '!T_0': 70,
+              '!T_1': 10,
+              '!T_2': 70,
+              '!T_3': 10,
+            },
+            {
+              'time': DAY1,
+              '__join_brand': 'B_ES',
+              '!T_0': 100,
+              '!T_1': 100,
+              '!T_2': 200,
+              '!T_3': 100,
+            },
+            {
+              'time': DAY1,
+              '__join_brand': 'B_IT',
+              '!T_0': 150,
+              '!T_1': 50,
+              '!T_2': 200,
+              '!T_3': 50,
+            },
           ]);
         }
         return Promise.resolve([]);

@@ -152,16 +152,18 @@ describe('Compose: FILTERED avg ($main.filter(promo).average) + magic-dim split'
       expect(mainSql, 'filtered SUM leaf').to.match(
         /SUM\(CASE WHEN \("promo"=TRUE\) THEN "price" ELSE 0 END\) AS "!T_\d+"/,
       );
-      // The conditional DENOMINATOR leaf: COUNT only over promo rows — NOT a
-      // bare COUNT(*). If the filter were lost, this would be COUNT(*) and the
-      // average would be wrong (numerator over promo rows / count over all rows).
-      expect(mainSql, 'filtered COUNT leaf').to.match(
-        /SUM\(CASE WHEN \("promo"=TRUE\) THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      // The conditional DENOMINATOR leaf: count only over promo rows whose
+      // price is non-null — the measure filter AND the NULL-aware count of the
+      // averaged column (SQL AVG semantics, Ogievetsky BUG 1) combined into ONE
+      // predicate. NOT a bare COUNT(*); NOT promo-only (that would still count
+      // null-price promo rows and understate the average).
+      expect(mainSql, 'filtered NULL-aware COUNT leaf').to.match(
+        /SUM\(CASE WHEN \(\("promo"=TRUE\) AND \("price" IS NULL\) IS NOT TRUE\) THEN 1 ELSE 0 END\) AS "!T_\d+"/,
       );
       // The filter MUST be in the leaves, never silently dropped to a plain
       // SUM("price")/COUNT(*) pair.
       expect(mainSql, 'no unconditional SUM leaf').to.not.match(/SUM\("price"\) AS "!T_\d+"/);
-      expect(mainSql, 'no unconditional COUNT leaf').to.not.match(/COUNT\(\*\) AS "!T_\d+"/);
+      expect(mainSql, 'no bare COUNT(*) leaf').to.not.match(/COUNT\(\*\) AS "!T_\d+"/);
 
       // The un-decomposed ratio column must NOT appear (that was the avg-500 shape).
       expect(mainSql, 'no ratio column on main SQL').to.not.match(/\(SUM\([^)]*\)\*1\.0\/COUNT/);
@@ -210,14 +212,15 @@ describe('Compose: FILTERED avg ($main.filter(promo).average) + magic-dim split'
       expect(mainSql, 'conditional SUM leaf').to.match(
         /SUM\(CASE WHEN \("promo"=TRUE\) THEN "price" ELSE 0 END\) AS "!T_\d+"/,
       );
-      expect(mainSql, 'conditional COUNT leaf').to.match(
-        /SUM\(CASE WHEN \("promo"=TRUE\) THEN 1 ELSE 0 END\) AS "!T_\d+"/,
+      expect(mainSql, 'conditional NULL-aware COUNT leaf').to.match(
+        /SUM\(CASE WHEN \(\("promo"=TRUE\) AND \("price" IS NULL\) IS NOT TRUE\) THEN 1 ELSE 0 END\) AS "!T_\d+"/,
       );
       expect(mainSql, 'unconditional SUM leaf for the all-rows avg').to.match(
         /SUM\("price"\) AS "!T_\d+"/,
       );
-      expect(mainSql, 'unconditional COUNT leaf for the all-rows avg').to.match(
-        /COUNT\(\*\) AS "!T_\d+"/,
+      // The all-rows avg denominator is a NULL-aware count of price (not COUNT(*)).
+      expect(mainSql, 'unconditional NULL-aware COUNT leaf for the all-rows avg').to.match(
+        /SUM\(CASE WHEN \("price" IS NULL\) IS NOT TRUE THEN 1 ELSE 0 END\) AS "!T_\d+"/,
       );
     });
   });
@@ -389,12 +392,14 @@ describe('Compose: FILTERED avg ($main.filter(promo).average) + magic-dim split'
         .map(q => q.query);
       const mainSql = sqls.find(s => s.includes('"main_ds"') && !s.includes('lookup_bc_rev1'));
       expect(mainSql, 'main sub-query exists').to.exist;
-      // No fan-out → the fix is inert: avg stays the pre-existing F2 rewrite (a
-      // single ratio column), still carrying its CASE-WHEN filter in BOTH the
-      // numerator and the denominator; no synthetic leaf columns minted.
+      // No fan-out → no leaf segregation: avg stays the F2 rewrite (a single
+      // ratio column). The numerator sums price over promo rows; the denominator
+      // is the NULL-aware count of price over promo rows (promo AND price IS NOT
+      // NULL) — SQL AVG semantics (Ogievetsky BUG 1), not a promo-only count.
+      // No synthetic leaf columns minted.
       expect(mainSql, 'no synthetic leaf columns').to.not.match(/!T_\d+/);
       expect(mainSql, 'conditional avg rendered as a single native ratio column').to.match(
-        /\(SUM\(CASE WHEN \("promo"=TRUE\) THEN "price" ELSE 0 END\)\*1\.0\/SUM\(CASE WHEN \("promo"=TRUE\) THEN 1 ELSE 0 END\)\) AS "avg_promo_price"/,
+        /\(SUM\(CASE WHEN \("promo"=TRUE\) THEN "price" ELSE 0 END\)\*1\.0\/SUM\(CASE WHEN \(\("promo"=TRUE\) AND \("price" IS NULL\) IS NOT TRUE\) THEN 1 ELSE 0 END\)\) AS "avg_promo_price"/,
       );
     });
   });
