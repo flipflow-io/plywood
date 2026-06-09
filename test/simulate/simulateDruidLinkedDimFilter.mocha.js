@@ -45,7 +45,7 @@ const fs = require('fs');
 const plywood = require('../plywood');
 const { External, Expression, $, r, ply } = plywood;
 
-const WIRE = JSON.parse(fs.readFileSync('/tmp/replay-francia.json', 'utf8'));
+const WIRE = JSON.parse(fs.readFileSync(require('path').join(__dirname, 'fixtures', 'replay-francia.json'), 'utf8'));
 
 // The two magic linked-source apply names in the wire fixture.
 const D01 = 'magic_d01f07da-6a6f-41bc-9bf0-13ddb3bdc422'; // owns brand_country, joinKey brand
