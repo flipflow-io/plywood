@@ -52,8 +52,12 @@ const fs = require('fs');
 const plywood = require('../plywood');
 const { External, Expression, $, r } = plywood;
 
-const WIRE_AVG = JSON.parse(fs.readFileSync(require('path').join(__dirname, 'fixtures', 'wire-avg-request.json'), 'utf8'));
-const WIRE_COUNT = JSON.parse(fs.readFileSync(require('path').join(__dirname, 'fixtures', 'wire-count-request.json'), 'utf8'));
+const WIRE_AVG = JSON.parse(
+  fs.readFileSync(require('path').join(__dirname, 'fixtures', 'wire-avg-request.json'), 'utf8'),
+);
+const WIRE_COUNT = JSON.parse(
+  fs.readFileSync(require('path').join(__dirname, 'fixtures', 'wire-count-request.json'), 'utf8'),
+);
 
 // The linked-source apply name in the wire fixtures (hyphenated UUID).
 const MAGIC = 'magic_4584fb7a-8804-4805-8217-1cfa9ca431f5';
