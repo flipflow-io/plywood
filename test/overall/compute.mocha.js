@@ -1334,6 +1334,31 @@ describe('compute native', () => {
     });
   });
 
+  it('works with mode over a resplit (mode of a per-key average)', () => {
+    // per-product average price: a -> 15, b -> 15, c -> 30 => mode is 15
+    const resplitData = [
+      { product: 'a', price: 10 },
+      { product: 'a', price: 20 },
+      { product: 'b', price: 15 },
+      { product: 'c', price: 30 },
+    ];
+
+    const ex = ply()
+      .apply('d', Dataset.fromJS(resplitData).hide())
+      .apply(
+        'modeAvgPrice',
+        $('d').split('$product', 'p').apply('B', $('d').average('$price')).mode('$B'),
+      );
+
+    return ex.compute().then(v => {
+      expect(v.toJS().data).to.deep.equal([
+        {
+          modeAvgPrice: 15,
+        },
+      ]);
+    });
+  });
+
   it('works with a basic select', () => {
     const ds = Dataset.fromJS(data);
 
