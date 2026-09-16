@@ -1,6 +1,6 @@
 {
   "name": "@flipflow/plywood",
-  "version": "0.51.6",
+  "version": "0.51.7",
   "description": "A query planner and executor",
   "keywords": [
     "split",
