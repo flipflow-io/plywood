@@ -51,7 +51,34 @@ import {
 } from './baseExternal';
 import { decomposeCompanionAggregate } from './utils/companionDecomposition';
 import { buildPerMetricSplitPlan } from './utils/perMetricSplitDecomposition';
-import { buildResplitAggregationSQL } from './utils/resplitAggregationSQLBuilder';
+import {
+  buildResplitAggregationSQL,
+  OuterApplyRenderContext,
+} from './utils/resplitAggregationSQLBuilder';
+
+/**
+ * Splits a resplit split-expression into the part computed inside cte_subsplit
+ * (inner) and the part the outer query applies on the intermediate column (outer).
+ */
+function divvyUpNestedSplitExpression(
+  splitExpression: Expression,
+  intermediateName: string,
+): { inner: Expression; outer: Expression } {
+  if (
+    splitExpression instanceof TimeBucketExpression ||
+    splitExpression instanceof NumberBucketExpression
+  ) {
+    return {
+      inner: splitExpression,
+      outer: splitExpression.changeOperand($(intermediateName)),
+    };
+  } else {
+    return {
+      inner: splitExpression,
+      outer: $(intermediateName),
+    };
+  }
+}
 
 function getSplitInflaters(split: SplitExpression): Inflater[] {
   return split.mapSplits((label, splitExpression) => {
@@ -201,6 +228,56 @@ export abstract class SQLExternal extends External {
     const splitKeyEscaped = splitKeyNames.map(name => dialect.escapeName(name));
 
     const modeQueries = modeApplyInfos.map(({ apply, modeExpression }) => {
+      // Outer query: reference aliased key names from inner subquery
+      const outerSelect = [...splitKeyEscaped, `"__val" AS ${dialect.escapeName(apply.name)}`].join(
+        ',\n',
+      );
+
+      // MODE over a RESPLIT measure: `split($k).apply('B', agg).mode($B)`. The mode
+      // field is an inner-split aggregate that only exists inside cte_subsplit, so
+      // the ROW_NUMBER pattern must read FROM the CTE (outer dims rebased on the
+      // CTE columns, mode field = the inner alias B_main_k) — never the base table.
+      // The external filter and the resplit's inner filter already scope the CTE,
+      // so the inner WHERE only needs the NOT NULL guard (+ the mode's own filter).
+      if (SQLExternal.parseResplitAgg(apply.expression)) {
+        const lowered = this.lowerResplitApplies([apply], false);
+        const rebased =
+          lowered && lowered.outerApplies.length === 1 ? lowered.outerApplies[0] : null;
+        const rebasedMode = rebased ? SQLExternal.extractModeExpression(rebased.expression) : null;
+        if (!lowered || !rebasedMode) {
+          throw new Error(`could not lower MODE over resplit for apply '${apply.name}'`);
+        }
+        const cteFieldSQL = rebasedMode.expression.getSQL(dialect);
+        const cteWhereParts = [`${cteFieldSQL} IS NOT NULL`];
+        const cteModeFilter = SQLExternal.extractModeFilter(rebased.expression, dialect);
+        if (cteModeFilter) cteWhereParts.push(cteModeFilter);
+
+        const cteInnerSelect = [
+          ...lowered.selectExpressions,
+          `${cteFieldSQL} AS "__val"`,
+          `ROW_NUMBER() OVER (PARTITION BY ${lowered.groupByExpressions.join(
+            ',',
+          )} ORDER BY COUNT(*) DESC) AS "__rn"`,
+        ].join(',\n');
+        const cteInnerGroupBy = [...lowered.groupByExpressions, cteFieldSQL].join(',');
+
+        const sql = [
+          `WITH\n  ${lowered.cteDefinitions.join(',\n  ')}`,
+          'SELECT',
+          outerSelect,
+          `FROM (SELECT ${cteInnerSelect} ${lowered.fromClause} WHERE ${cteWhereParts.join(
+            ' AND ',
+          )} GROUP BY ${cteInnerGroupBy})`,
+          'WHERE "__rn" = 1',
+        ].join('\n');
+
+        return {
+          name: apply.name,
+          sql,
+          type: modeExpression.type,
+        };
+      }
+
       const modeFieldSQL = modeExpression.expression.getSQL(dialect);
       const modeFilter = SQLExternal.extractModeFilter(apply.expression, dialect);
 
@@ -225,11 +302,6 @@ export abstract class SQLExternal extends External {
 
       const innerGroupBy = [...splitDimSQLs, modeFieldSQL].join(',');
       const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
-
-      // Outer query: reference aliased key names from inner subquery
-      const outerSelect = [...splitKeyEscaped, `"__val" AS ${dialect.escapeName(apply.name)}`].join(
-        ',\n',
-      );
 
       const sql = [
         'SELECT',
@@ -1244,31 +1316,35 @@ export abstract class SQLExternal extends External {
     fromClause: string;
     groupByExpressions: string[];
   } | null {
-    const divvyUpNestedSplitExpression = (
-      splitExpression: Expression,
-      intermediateName: string,
-    ): { inner: Expression; outer: Expression } => {
-      if (
-        splitExpression instanceof TimeBucketExpression ||
-        splitExpression instanceof NumberBucketExpression
-      ) {
-        return {
-          inner: splitExpression,
-          outer: splitExpression.changeOperand($(intermediateName)),
-        };
-      } else {
-        return {
-          inner: splitExpression,
-          outer: $(intermediateName),
-        };
-      }
-    };
-
-    const { applies, split, dialect } = this;
+    const { applies } = this;
     if (!applies && !this.valueExpression) return null;
     const effectiveApplies = applies
       ? applies
       : [Expression._.apply('__VALUE__', this.valueExpression)];
+    return this.lowerResplitApplies(effectiveApplies, true);
+  }
+
+  /**
+   * Lowers resplit applies into cte_subsplit + the outer query parts.
+   *
+   * With renderOuterApplies=true (nestedGroupByIfNeeded) the outer applies are
+   * rendered into selectExpressions reading from the CTE. With false, only the
+   * outer split dimensions are rendered and the outer applies are returned
+   * rebased on the CTE columns (e.g. `_.mode($B_main_0)`), so the caller can build
+   * its own outer shape — buildModeDecomposition uses this to run the ROW_NUMBER
+   * mode query FROM cte_subsplit.
+   */
+  protected lowerResplitApplies(
+    effectiveApplies: ApplyExpression[],
+    renderOuterApplies: boolean,
+  ): {
+    cteDefinitions: string[];
+    selectExpressions: string[];
+    fromClause: string;
+    groupByExpressions: string[];
+    outerApplies: ApplyExpression[];
+  } | null {
+    const { split, dialect } = this;
 
     // Check for early exit condition - if there are no applies with splits in them then there is nothing to do.
     if (
@@ -1415,7 +1491,7 @@ export abstract class SQLExternal extends External {
       globalResplitSplit,
       split,
       innerApplies,
-      outerApplies,
+      renderOuterApplies ? outerApplies : [],
       () => this.getFrom(),
       whereClause,
       dialect,
@@ -1423,6 +1499,8 @@ export abstract class SQLExternal extends External {
       (sql: string, cteColumnNames: string[], _dialect: SQLDialect) => {
         return this._wrapCTEReferencesWithAnyValue(sql, cteColumnNames, _dialect);
       },
+      (apply: ApplyExpression, ctx: OuterApplyRenderContext) =>
+        this.renderResplitOuterApply(apply, ctx),
     );
 
     // Update outerAttributes (needed for post-transform)
@@ -1434,7 +1512,41 @@ export abstract class SQLExternal extends External {
       selectExpressions: result.selectExpressions,
       fromClause: result.fromClause,
       groupByExpressions: result.groupByExpressions,
+      outerApplies,
     };
+  }
+
+  /**
+   * Custom rendering of an outer resplit apply that reads FROM cte_subsplit.
+   *
+   * MODE has no inline aggregate function in Druid and is not re-aggregable
+   * (INV-3), so `mode($B)` over a resplit measure cannot be `MODE(...)` in the
+   * outer SELECT. In value/total mode it is rendered as an uncorrelated scalar
+   * subquery against the CTE — the exact shape the plain MODE already uses in
+   * value/total mode, with the base table replaced by cte_subsplit and the mode
+   * field being the inner alias (B_main_k). Under a split, MODE is handled by
+   * buildModeDecomposition (ROW_NUMBER), so a grouped call here is a bug.
+   * Returns null for any non-MODE apply (default rendering applies).
+   */
+  protected renderResplitOuterApply(
+    apply: ApplyExpression,
+    ctx: OuterApplyRenderContext,
+  ): string | null {
+    if (!(apply.expression instanceof ModeExpression)) return null;
+    if (ctx.groupByExpressions.length > 0) {
+      throw new Error(
+        `MODE over a resplit measure under a split must be lowered by buildModeDecomposition ('${apply.name}')`,
+      );
+    }
+    const { dialect } = this;
+    const modeEx = apply.expression;
+    const modeFieldSQL = modeEx.expression.getSQL(dialect);
+    const whereParts = [`${modeFieldSQL} IS NOT NULL`];
+    const modeFilter = SQLExternal.extractModeFilter(modeEx, dialect);
+    if (modeFilter) whereParts.push(modeFilter);
+    return `(SELECT ${modeFieldSQL} FROM ${ctx.cteName} WHERE ${whereParts.join(
+      ' AND ',
+    )} GROUP BY ${modeFieldSQL} ORDER BY COUNT(*) DESC LIMIT 1)`;
   }
 
   protected _getAnyValueFunction(): string {
