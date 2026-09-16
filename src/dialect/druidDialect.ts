@@ -287,10 +287,15 @@ export class DruidDialect extends SQLDialect {
     return `IP_STRINGIFY(${operand})`;
   }
 
-  public modeExpression(expressionSQL: string, _operandSQL: string): string {
-    // For inline usage (should not be reached in normal query generation,
-    // as mode is handled at the sqlExternal level via CTE/subquery)
-    return `MODE_INLINE(${expressionSQL})`;
+  public modeExpression(_expressionSQL: string, _operandSQL: string): string {
+    // MODE has no inline aggregate function in Druid SQL and is not re-aggregable
+    // (INV-3). Every legitimate path lowers it at the SQLExternal level (ROW_NUMBER
+    // decomposition in split mode, scalar subquery in value/total mode), so reaching
+    // this means a ModeExpression leaked into plain SQL rendering. Fail loud rather
+    // than emit a placeholder Druid rejects at runtime.
+    throw new Error(
+      'MODE has no inline SQL form in Druid; it must be lowered by SQLExternal (ROW_NUMBER decomposition or scalar subquery)',
+    );
   }
 
   public collectExpression(expressionSQL: string): string {
