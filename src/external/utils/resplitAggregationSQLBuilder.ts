@@ -24,6 +24,14 @@ import { detectInnerDerivation } from './innerDerivationDetector';
 import { buildLookupCTE, LookupCTEResult } from './lookupCTEBuilder';
 import { classifySplits, DivvyResult } from './splitClassifier';
 
+/** What a custom outer-apply renderer sees (see renderOuterApply below). */
+export interface OuterApplyRenderContext {
+  /** Name of the inner CTE the outer query reads from (cte_subsplit). */
+  cteName: string;
+  /** Outer GROUP BY expressions (empty in value/total mode). */
+  groupByExpressions: string[];
+}
+
 export interface ResplitAggregationSQLResult {
   cteDefinitions: string[];
   selectExpressions: string[];
@@ -53,6 +61,9 @@ export interface ResplitAggregationSQLResult {
  * @param dialect - SQL dialect for generating SQL
  * @param divvyUpNestedSplitExpression - Function to split expressions into inner/outer
  * @param wrapCTEReferencesWithAnyValue - Function to wrap CTE references with ANY_VALUE
+ * @param renderOuterApply - Optional hook to render an outer apply that has no plain
+ *   aggregate form over the CTE (e.g. MODE). Returns the SQL without alias, or null to
+ *   fall back to the default apply.getSQL + ANY_VALUE wrapping.
  * @returns Complete SQL structure for resplit aggregation
  */
 export function buildResplitAggregationSQL(
@@ -69,6 +80,7 @@ export function buildResplitAggregationSQL(
     cteColumnNames: string[],
     dialect: SQLDialect,
   ) => string,
+  renderOuterApply?: (apply: ApplyExpression, ctx: OuterApplyRenderContext) => string | null,
 ): ResplitAggregationSQLResult {
   // Step 1: Detect inner derivation
   const hasInnerDerivation = detectInnerDerivation(innerApplies);
@@ -199,6 +211,13 @@ export function buildResplitAggregationSQL(
   });
 
   outerApplies.forEach(apply => {
+    const custom = renderOuterApply
+      ? renderOuterApply(apply, { cteName, groupByExpressions })
+      : null;
+    if (custom != null) {
+      selectExpressions.push(`${custom} AS ${dialect.escapeName(apply.name)}`);
+      return;
+    }
     const sqlWithoutAlias = apply.getSQL(dialect).replace(/\s+AS\s+.*$/i, '');
     if (groupByExpressions.length > 0) {
       const processedSql = wrapCTEReferencesWithAnyValue(sqlWithoutAlias, cteColumnNames, dialect);
