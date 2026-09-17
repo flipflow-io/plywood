@@ -1175,8 +1175,26 @@ export abstract class External {
    * The traversal stops at AND/OR/NOT boundaries: those are combinators,
    * not predicates. We recurse into their operands and re-combine the
    * pruned halves. Everything else is treated as an atomic predicate.
+   *
+   * `rawSqlIsForeign`: a predicate built on a raw-SQL leaf (`SqlRefExpression`,
+   * the `s${ … }` fragment a custom dimension compiles to) names no column
+   * plywood can see, so the ref-based check below cannot classify it. Raw SQL
+   * is authored against the PRIMARY table (its columns are the main
+   * datasource's), never against a lookup, so when the target schema is a
+   * LINKED source's the predicate is unevaluable there and must become TRUE.
+   * Callers pruning for the primary's own schema leave the flag off and keep
+   * it. Seen live (Flipflow rc, 2026-09-17): a research panel filtering on a
+   * custom dimension `CASE WHEN LOWER("competitor") … END` made
+   * `pruneLinkedFilterRefsInTree` harvest the clause as linked-only for every
+   * one of ten lookups and the semijoin-to-root rescue threw
+   * "Cross-source native-JOIN cannot emit SQL: semijoin-to-root: 10
+   * linkedSources … carry a linked-only filter clause at once".
    */
-  static pruneFilterToSchema(filter: Expression, schemaNames: Record<string, true>): Expression {
+  static pruneFilterToSchema(
+    filter: Expression,
+    schemaNames: Record<string, true>,
+    rawSqlIsForeign = false,
+  ): Expression {
     if (!filter) return filter;
     if (filter.equals(Expression.TRUE) || filter.equals(Expression.FALSE)) return filter;
 
@@ -1191,8 +1209,8 @@ export abstract class External {
     if (op === 'and' || op === 'or') {
       const origLeft: Expression = (filter as any).operand;
       const origRight: Expression = (filter as any).expression;
-      const left = External.pruneFilterToSchema(origLeft, schemaNames);
-      const right = External.pruneFilterToSchema(origRight, schemaNames);
+      const left = External.pruneFilterToSchema(origLeft, schemaNames, rawSqlIsForeign);
+      const right = External.pruneFilterToSchema(origRight, schemaNames, rawSqlIsForeign);
       if (left === origLeft && right === origRight) return filter;
       if (op === 'and') return left.and(right).simplify();
       return left.or(right).simplify();
@@ -1209,8 +1227,14 @@ export abstract class External {
       // Algebra: NOT(a AND b) = NOT(a) OR NOT(b); with `a` unevaluable
       // its negation is identity TRUE, so the whole clause is TRUE.
       const origInner: Expression = (filter as any).operand;
-      const inner = External.pruneFilterToSchema(origInner, schemaNames);
+      const inner = External.pruneFilterToSchema(origInner, schemaNames, rawSqlIsForeign);
       if (inner === origInner) return filter;
+      return Expression.TRUE;
+    }
+
+    // Raw-SQL predicate on a schema that is not the primary's: unevaluable
+    // there as a whole (see `rawSqlIsForeign` above), identity TRUE.
+    if (rawSqlIsForeign && External.containsRawSql(filter)) {
       return Expression.TRUE;
     }
 
@@ -1273,6 +1297,11 @@ export abstract class External {
    * that commit dropped external2's havingFilter pragmatically; here we do
    * the full split.
    */
+  /** True when the expression carries a raw-SQL leaf (`SqlRefExpression`) anywhere in its tree. */
+  static containsRawSql(expression: Expression): boolean {
+    return expression.some(ex => (ex instanceof SqlRefExpression ? true : null));
+  }
+
   static splitFilterByScope(
     filter: Expression,
     mainNames: Record<string, true>,
@@ -2103,6 +2132,9 @@ export abstract class External {
     // have is identity there (the join on shared/synthetic joinKeys
     // propagates main's narrowing to the linked rows, and vice-versa).
     const schemas: Record<string, Record<string, true>> = {};
+    // Names bound to a LINKED source (as opposed to a primary): a raw-SQL
+    // predicate is pruned from their `.filter(F)` and kept on the primary's.
+    const linkedSchemaOwners: Record<string, true> = {};
     for (const k in context) {
       const v = context[k];
       if (!(v instanceof External)) continue;
@@ -2129,6 +2161,7 @@ export abstract class External {
         if (ls.attributes) for (const a of ls.attributes as any[]) schema[a.name] = true;
         if (ls.derivedAttributes) for (const kk in ls.derivedAttributes) schema[kk] = true;
         schemas[lsName] = schema;
+        linkedSchemaOwners[lsName] = true;
       }
     }
     if (Object.keys(schemas).length === 0) return expression;
@@ -2218,7 +2251,8 @@ export abstract class External {
             const op = e.operand;
             if (!(op instanceof RefExpression)) return;
             if (op.name !== k && op.name !== lsName) return;
-            const residue = External.pruneFilterToSchema(e.expression, linkedOnly);
+            // Raw-SQL predicates belong to the primary: never linked-only.
+            const residue = External.pruneFilterToSchema(e.expression, linkedOnly, true);
             if (residue.equals(Expression.TRUE)) return;
             // The semijoin-to-root puts this residue on a LOOKUP-side query
             // (SELECT DISTINCT joinKey WHERE <residue>), so it is only valid
@@ -2292,7 +2326,11 @@ export abstract class External {
       const schema = schemas[op.name];
       if (!schema) return null;
       const originalFilter = e.expression;
-      const pruned = External.pruneFilterToSchema(originalFilter, schema);
+      const pruned = External.pruneFilterToSchema(
+        originalFilter,
+        schema,
+        linkedSchemaOwners[op.name] === true,
+      );
       if (pruned === originalFilter) return null;
       return op.filter(pruned);
     });
@@ -2339,7 +2377,7 @@ export abstract class External {
         if (normalizedDerived) {
           for (const k in normalizedDerived) linkedNames[k] = true;
         }
-        const prunedFilter = External.pruneFilterToSchema(value.filter, linkedNames);
+        const prunedFilter = External.pruneFilterToSchema(value.filter, linkedNames, true);
 
         // Honour a per-linkedSource cross-engine override. Absent → inherit
         // the main external's engine/version/requester (canonical case).
@@ -3443,7 +3481,7 @@ export abstract class External {
         linkedSchemaNames[k] = true;
       }
     }
-    const prunedMainFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames);
+    const prunedMainFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames, true);
     const stashedLinkedFilter: Expression = config.filter;
     const templateFilter =
       prunedMainFilter && !prunedMainFilter.equals(Expression.TRUE)
@@ -5216,7 +5254,7 @@ export abstract class External {
           linkedSchemaNames[k] = true;
         }
       }
-      const prunedMainFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames);
+      const prunedMainFilter = External.pruneFilterToSchema(this.filter, linkedSchemaNames, true);
       // AND in any linked-only filter clause that `pruneLinkedFilterRefsInTree`
       // harvested onto this PER-REQUEST config copy (clauses over columns that
       // live only on the lookup — e.g. `$brand_country.overlap(['Francia'])` —
