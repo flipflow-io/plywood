@@ -323,13 +323,18 @@ describe('LEFT-joined mapping dimension: filter on the linked-only column', () =
   });
 
   describe('no linked filter — inert', () => {
-    it('the left join keeps orphan rows and the mapping view is scanned without WHERE', async () => {
+    it('the left join keeps orphan rows and the mapping view is fetched for the result keys only', async () => {
       const ex = query(TIME, {
         productName: $('productName'),
         generated_image: $('generated_image'),
       });
       const sqls = planSqls(ex);
-      expect(mappingSql(sqls)).to.not.match(/WHERE/);
+      // Enrichment by result keys (0.51.10): the mapped column is only
+      // displayed, so main runs first and the Postgres view is asked for the
+      // result's image URLs — `WHERE "imageUrl" IN (…)` — not scanned whole.
+      // No linked clause reaches the view and the totals stay unrestricted.
+      expect(mappingSql(sqls)).to.match(/WHERE \("imageUrl" (IN \(|IS NOT DISTINCT FROM )/);
+      expect(mappingSql(sqls)).to.not.match(/"generated_image"\s*(=|IN |IS NOT DISTINCT)/);
       expect(totalsSql(sqls)).to.not.match(/"imageUrl"/);
       const druid = promiseFnToStream(rq => {
         const sql = sqlOf(rq);

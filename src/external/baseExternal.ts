@@ -511,6 +511,27 @@ function findApplyByExpression(
  *                             contributes optional enrichment).
  *                         No default — every cube declares which.
  */
+/**
+ * How ONE linked side of a JS-join is keyed against main, resolved by the
+ * decomposition so the executor can dispatch the two sides SEQUENTIALLY and
+ * narrow the second by the first's keys:
+ *   - `alias`   the split alias that carries the key on both result sets
+ *               (the synthetic `__join_<key>`, or the user's own shared split)
+ *   - main/linked key column names and native types on each side
+ *   - `stringValues`  the alias column holds STRING-cast values (synthetic
+ *               splits cast the key to STRING as the join medium)
+ * Absent when the join rides on more than one key or on an expression the
+ * executor cannot turn back into a column predicate — dispatch stays parallel.
+ */
+export interface CrossSourceKeyBinding {
+  alias: string;
+  mainKey: string;
+  mainType: PlyType;
+  linkedKey: string;
+  linkedType: PlyType;
+  stringValues: boolean;
+}
+
 export interface LinkedSourceConfig {
   source: string;
   joinKeys: string[];
@@ -3466,6 +3487,84 @@ export abstract class External {
    * keeps orphan main rows, so an IN-list would silently change the result.
    * Parity with the left-join pin in the native-JOIN path.
    */
+  /**
+   * Largest key set the cross-source executor folds into an IN predicate on
+   * the other side. Above it both sides run unrestricted (still correct: the
+   * in-memory join does the matching) — a literal list of that size costs
+   * more to ship and parse than the scan it saves, and the Druid router drops
+   * multi-megabyte statements.
+   */
+  static CROSS_SOURCE_KEY_LIST_MAX = 20000;
+
+  /**
+   * Decide how the executor dispatches a JS-join (cross-engine) decomposition:
+   *   'linkedFirst' — the single linked side carries a harvested filter and
+   *                   joins inner: its keys narrow main (`main.key IN (…)`),
+   *                   so main groups only the rows that can survive the join;
+   *   'mainFirst'   — the linked column is only displayed (or the join is
+   *                   left): main runs, the linked side is fetched for the
+   *                   result's keys only (`lookup.key IN (…)`) instead of a
+   *                   full scan — enrichment by result keys;
+   *   'parallel'    — anything else (several linked sides, no key binding).
+   * Both sequential orders return exactly the rows the parallel plan does.
+   */
+  static planCrossSourceDispatch(crossExt: {
+    linkedExternals: { keyBinding?: CrossSourceKeyBinding; restrictsMain?: boolean }[];
+  }): 'parallel' | 'linkedFirst' | 'mainFirst' {
+    const les = crossExt.linkedExternals || [];
+    if (les.length !== 1 || !les[0].keyBinding) return 'parallel';
+    return les[0].restrictsMain ? 'linkedFirst' : 'mainFirst';
+  }
+
+  /**
+   * Distinct non-null values of `alias` in a Dataset, or null when the column
+   * is absent or holds something other than strings/numbers.
+   */
+  static collectKeyValues(ds: PlywoodValue, alias: string): (string | number)[] | null {
+    if (!(ds instanceof Dataset) || !ds.data) return null;
+    const seen: Record<string, true> = {};
+    const out: (string | number)[] = [];
+    for (const d of ds.data) {
+      const v = d[alias];
+      if (v === null || v === undefined) continue;
+      if (typeof v !== 'string' && typeof v !== 'number') return null;
+      const k = typeof v + ':' + String(v);
+      if (seen[k]) continue;
+      seen[k] = true;
+      out.push(v);
+    }
+    return out;
+  }
+
+  /**
+   * `ext` with `<key> IN (<values>)` AND-ed into its filter. `values` come
+   * from the OTHER side's result: STRING-cast when they rode a synthetic
+   * split, native otherwise; they are coerced to the target column's type
+   * (NUMBER keys parse back). Returns `ext` unchanged when the key type is
+   * neither STRING nor NUMBER or a value does not coerce.
+   */
+  static restrictExternalByKeys(
+    ext: External,
+    key: string,
+    keyType: PlyType,
+    values: (string | number)[],
+  ): External {
+    let elements: (string | number)[];
+    if (keyType === 'STRING') {
+      elements = values.map(v => String(v));
+    } else if (keyType === 'NUMBER') {
+      elements = values.map(v => (typeof v === 'number' ? v : Number(v)));
+      if (elements.some(n => typeof n !== 'number' || isNaN(n))) return ext;
+    } else {
+      return ext;
+    }
+    const inSet = Set.fromJS({ setType: keyType, elements });
+    const inList = $(key, keyType).overlap(r(inSet));
+    const value = ext.valueOf();
+    value.filter = (ext.filter || Expression.TRUE).and(inList).simplify();
+    return External.fromValue(value);
+  }
+
   public getSemijoinToRootDecomposition(): {
     joinKey: string;
     joinKeyType: PlyType;
@@ -3777,9 +3876,30 @@ export abstract class External {
           data: [datum],
         });
       }
-      crossExt.mainExternal.simulateValue(lastNode, simulatedQueries, externalForNext);
-      for (const le of crossExt.linkedExternals) {
+      // Mirror the executor's dispatch order (planCrossSourceDispatch). In
+      // simulate there is no engine to read keys from, so the narrowed side
+      // is restricted by a one-element SAMPLE set — enough to prove the IN
+      // predicate reaches the right SQL.
+      const dispatch = External.planCrossSourceDispatch(crossExt);
+      if (dispatch === 'mainFirst') {
+        const le = crossExt.linkedExternals[0];
+        const kb = le.keyBinding;
+        crossExt.mainExternal.simulateValue(lastNode, simulatedQueries, externalForNext);
+        External.restrictExternalByKeys(le.external, kb.linkedKey, kb.linkedType, [
+          getSampleValue(kb.linkedType, null) as any,
+        ]).simulateValue(lastNode, simulatedQueries, externalForNext);
+      } else if (dispatch === 'linkedFirst') {
+        const le = crossExt.linkedExternals[0];
+        const kb = le.keyBinding;
         le.external.simulateValue(lastNode, simulatedQueries, externalForNext);
+        External.restrictExternalByKeys(crossExt.mainExternal, kb.mainKey, kb.mainType, [
+          getSampleValue(kb.mainType, null) as any,
+        ]).simulateValue(lastNode, simulatedQueries, externalForNext);
+      } else {
+        crossExt.mainExternal.simulateValue(lastNode, simulatedQueries, externalForNext);
+        for (const le of crossExt.linkedExternals) {
+          le.external.simulateValue(lastNode, simulatedQueries, externalForNext);
+        }
       }
       // Synthesize a representative Dataset: split keys + all applies (main + linked)
       const datum: Datum = {};
@@ -3993,12 +4113,59 @@ export abstract class External {
           }),
         );
       }
-      const mainPromise = External.buildValueFromStream(
-        crossExt.mainExternal.queryBasicValueStream(rawQueries),
-      );
-      const linkedPromises = crossExt.linkedExternals.map(le =>
-        External.buildValueFromStream(le.external.queryBasicValueStream(rawQueries)),
-      );
+      // Dispatch order (see planCrossSourceDispatch). Sequential orders narrow
+      // the second query by the first's keys; the join below is unchanged.
+      const dispatch = External.planCrossSourceDispatch(crossExt);
+      const KEY_MAX = External.CROSS_SOURCE_KEY_LIST_MAX;
+      let mainPromise: Promise<PlywoodValue>;
+      let linkedPromises: Promise<PlywoodValue>[];
+      if (dispatch === 'mainFirst') {
+        const le = crossExt.linkedExternals[0];
+        const kb = le.keyBinding;
+        mainPromise = External.buildValueFromStream(
+          crossExt.mainExternal.queryBasicValueStream(rawQueries),
+        );
+        linkedPromises = [
+          mainPromise.then(mainDs => {
+            const keys = External.collectKeyValues(mainDs, kb.alias);
+            const ext =
+              keys && keys.length > 0 && keys.length <= KEY_MAX
+                ? External.restrictExternalByKeys(le.external, kb.linkedKey, kb.linkedType, keys)
+                : le.external;
+            return External.buildValueFromStream(ext.queryBasicValueStream(rawQueries));
+          }),
+        ];
+      } else if (dispatch === 'linkedFirst') {
+        const le = crossExt.linkedExternals[0];
+        const kb = le.keyBinding;
+        const linkedPromise = External.buildValueFromStream(
+          le.external.queryBasicValueStream(rawQueries),
+        );
+        linkedPromises = [linkedPromise];
+        mainPromise = linkedPromise.then(linkedDs => {
+          const keys = External.collectKeyValues(linkedDs, kb.alias);
+          // An empty key set is a legitimate answer (nothing maps to the
+          // filter value): the inner join yields no rows, so main is asked
+          // for none — `IN ()` — rather than for everything.
+          const ext =
+            keys && keys.length <= KEY_MAX
+              ? External.restrictExternalByKeys(
+                  crossExt.mainExternal,
+                  kb.mainKey,
+                  kb.mainType,
+                  keys,
+                )
+              : crossExt.mainExternal;
+          return External.buildValueFromStream(ext.queryBasicValueStream(rawQueries));
+        });
+      } else {
+        mainPromise = External.buildValueFromStream(
+          crossExt.mainExternal.queryBasicValueStream(rawQueries),
+        );
+        linkedPromises = crossExt.linkedExternals.map(le =>
+          External.buildValueFromStream(le.external.queryBasicValueStream(rawQueries)),
+        );
+      }
       return External.valuePromiseToStream(
         Promise.all([mainPromise, ...linkedPromises]).then(([main, ...linked]) => {
           // If main is a totals-only dataset (no split keys), its rows
@@ -4653,6 +4820,8 @@ export abstract class External {
       external: External;
       joinKeys: string[];
       joinMode: 'inner' | 'left';
+      keyBinding?: CrossSourceKeyBinding;
+      restrictsMain?: boolean;
     }[];
     syntheticJoinAliases?: string[];
     // HAVING applied POST-JOIN against the returned Dataset (mirror of the
@@ -5045,6 +5214,8 @@ export abstract class External {
       external: External;
       joinKeys: string[];
       joinMode: 'inner' | 'left';
+      keyBinding?: CrossSourceKeyBinding;
+      restrictsMain?: boolean;
     }[];
     postJoinSort?: SortExpression;
     postJoinLimit?: LimitExpression;
@@ -5426,6 +5597,8 @@ export abstract class External {
       external: External;
       joinKeys: string[];
       joinMode: 'inner' | 'left';
+      keyBinding?: CrossSourceKeyBinding;
+      restrictsMain?: boolean;
     }[] = [];
 
     // Track which aliases of `this.split` got routed to SOME
@@ -5621,6 +5794,9 @@ export abstract class External {
       const syntheticAliasesForThisSource: string[] = [];
       const syntheticSplits: Record<string, Expression> = {};
       const syntheticSplitsLinked: Record<string, Expression> = {};
+      const syntheticKeyBindings: CrossSourceKeyBinding[] = [];
+      let mainTypeForKeyOut: Record<string, PlyType> = {};
+      let linkedTypeForKeyOut: Record<string, PlyType> = {};
       if (sharedAliases.length === 0 && (config.joinKeys || []).length > 0) {
         // Resolve the key's type per side — main and linked may store the
         // same logical identifier with different native types (BIGINT vs
@@ -5671,7 +5847,17 @@ export abstract class External {
           syntheticSplitsLinked[alias] = linkedRef.cast('STRING');
           syntheticAliasesForThisSource.push(alias);
           sharedAliases.push(alias);
+          syntheticKeyBindings.push({
+            alias,
+            mainKey: key,
+            mainType: mainTypeForKey[key] || 'STRING',
+            linkedKey: key,
+            linkedType: linkedTypeForKey[key] || 'STRING',
+            stringValues: true,
+          });
         }
+        mainTypeForKeyOut = mainTypeForKey;
+        linkedTypeForKeyOut = linkedTypeForKey;
       }
 
       // Linked side: shared splits (including synthetic) + this source's linked-only splits
@@ -5736,11 +5922,52 @@ export abstract class External {
           ? 'inner'
           : resolvedJoinMode;
 
+      // Key binding for the executor's sequential dispatch. Exactly one shared
+      // alias: the synthetic `__join_<key>` (recorded above) or a user split
+      // that is a bare ref to a declared joinKey (values in native type).
+      let keyBinding: CrossSourceKeyBinding | undefined;
+      if (sharedAliases.length === 1) {
+        const alias = sharedAliases[0];
+        const synthetic = syntheticKeyBindings.find(b => b.alias === alias);
+        if (synthetic) {
+          keyBinding = synthetic;
+        } else {
+          const ex = this.split.splits[alias];
+          if (ex instanceof RefExpression && (config.joinKeys || []).indexOf(ex.name) >= 0) {
+            const mainT: Record<string, PlyType> = { ...mainTypeForKeyOut };
+            for (const a of this.rawAttributes || []) if (!mainT[a.name]) mainT[a.name] = a.type;
+            const linkedT: Record<string, PlyType> = { ...linkedTypeForKeyOut };
+            if (config.attributes) {
+              for (const a of config.attributes as any[]) {
+                if (!linkedT[a.name]) linkedT[a.name] = a.type;
+              }
+            }
+            keyBinding = {
+              alias,
+              mainKey: ex.name,
+              mainType: mainT[ex.name] || 'STRING',
+              linkedKey: ex.name,
+              linkedType: linkedT[ex.name] || 'STRING',
+              stringValues: false,
+            };
+          }
+        }
+      }
+      // An inner join whose linked side carries a harvested clause narrows
+      // main: the executor may run the linked side first and restrict main to
+      // its keys (the split-level counterpart of the semijoin-to-root).
+      const restrictsMain =
+        effectiveJoinMode === 'inner' &&
+        !!harvestedFilter &&
+        !harvestedFilter.equals(Expression.TRUE);
+
       linkedExternals.push({
         name: lsName,
         external: linkedExternal,
         joinKeys: sharedAliases,
         joinMode: effectiveJoinMode,
+        keyBinding,
+        restrictsMain,
       });
 
       // Stash the main-compatible split set for rebuilding main after the loop.
