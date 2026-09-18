@@ -567,6 +567,30 @@ export interface LinkedSourceConfig {
    * rescue. False/absent when a sibling sub-query already consumes the filter.
    */
   semijoinToRoot?: boolean;
+  /**
+   * PER-REQUEST ONLY. Set by `pruneLinkedFilterRefsInTree` when the harvested
+   * `filter` can never hold for a main row that has NO linked match (an
+   * orphan): every branch of it compares a linked-only column against non-null
+   * literals (`is`, `in`/`overlap`, `contains`, `match`, range comparisons),
+   * so an orphan — whose linked columns are all null — fails it. For such a
+   * filter `joinMode: 'left'` and `'inner'` yield the same rows, which lets a
+   * left-joined lookup (a mapping dimension, an optional enrichment) honour
+   * the filter through the inner-only machinery: the semijoin-to-root IN-list
+   * and an inner in-memory/native join. Negations and null tests
+   * (`not`, `is null`) keep the orphans, so they leave this false and the left
+   * semantics stand.
+   */
+  filterRejectsOrphans?: boolean;
+  /**
+   * PER-REQUEST ONLY. True when a value apply or a split references this
+   * lookup (its name or one of its linked-only columns): the established
+   * decomposition path materialises a sibling sub-query that honours the
+   * harvested `filter` on the linked side. The semijoin-to-root uses it only
+   * to keep the pre-existing behaviour for a clause it cannot fold into an
+   * IN-list (a left join with a filter that keeps orphans): stand down
+   * silently instead of refusing.
+   */
+  semijoinHasLiveConsumer?: boolean;
 }
 
 /**
@@ -1190,6 +1214,69 @@ export abstract class External {
    * "Cross-source native-JOIN cannot emit SQL: semijoin-to-root: 10
    * linkedSources … carry a linked-only filter clause at once".
    */
+  /**
+   * Does `filter` reject every main row that has NO linked match? An orphan
+   * carries null in every linked-only column, so a predicate that compares a
+   * linked-only column against non-null literals is false for it. Used to
+   * decide when a `joinMode: 'left'` lookup may be joined as inner for one
+   * request without changing the result (see LinkedSourceConfig.filterRejectsOrphans).
+   *
+   *   - `and`: rejects if EITHER side rejects (an orphan fails the whole AND).
+   *   - `or`:  rejects only if BOTH sides reject.
+   *   - `not`, `is null`, sets containing null, refs to non-linked columns,
+   *     anything else: conservative false.
+   */
+  static linkedFilterRejectsOrphans(filter: Expression, linkedOnly: Record<string, true>): boolean {
+    if (!filter || filter.equals(Expression.TRUE) || filter.equals(Expression.FALSE)) return false;
+    const anyOp: any = filter;
+    const op: string = anyOp.op;
+    if (op === 'and') {
+      return (
+        External.linkedFilterRejectsOrphans(anyOp.operand, linkedOnly) ||
+        External.linkedFilterRejectsOrphans(anyOp.expression, linkedOnly)
+      );
+    }
+    if (op === 'or') {
+      return (
+        External.linkedFilterRejectsOrphans(anyOp.operand, linkedOnly) &&
+        External.linkedFilterRejectsOrphans(anyOp.expression, linkedOnly)
+      );
+    }
+    const NULL_REJECTING_OPS: Record<string, true> = {
+      is: true,
+      in: true,
+      overlap: true,
+      contains: true,
+      match: true,
+      greaterThan: true,
+      greaterThanOrEqual: true,
+      lessThan: true,
+      lessThanOrEqual: true,
+    };
+    if (!NULL_REJECTING_OPS[op]) return false;
+    const operand: Expression | undefined = anyOp.operand;
+    const expression: Expression | undefined = anyOp.expression;
+    // One side is the linked-only column (current scope), the other a literal.
+    let col: RefExpression | null = null;
+    let lit: Expression | undefined;
+    if (operand instanceof RefExpression && expression instanceof LiteralExpression) {
+      col = operand;
+      lit = expression;
+    } else if (expression instanceof RefExpression && operand instanceof LiteralExpression) {
+      col = expression;
+      lit = operand;
+    }
+    if (!col || !lit || col.nest !== 0 || !linkedOnly[col.name]) return false;
+    const value = (lit as LiteralExpression).value;
+    if (value === null || value === undefined) return false;
+    if (value instanceof Set) {
+      const elements: any[] = value.elements || [];
+      if (elements.length === 0) return false;
+      return elements.every(e => e !== null && e !== undefined);
+    }
+    return true;
+  }
+
   static pruneFilterToSchema(
     filter: Expression,
     schemaNames: Record<string, true>,
@@ -2220,6 +2307,9 @@ export abstract class External {
       // deletes the dead sibling apply and the filter would be lost — so we
       // mark the lookup `semijoinToRoot: true` to authorise the rescue.
       const hasLiveConsumer: Record<string, boolean> = {};
+      // Per-lookup: the linked-only names, kept for the orphan-rejection test
+      // on the fully harvested clause below.
+      const linkedOnlyByLs: Record<string, Record<string, true>> = {};
       // Per-lookup flag: did the harvested residue reference a NON-linked-only
       // (i.e. main) column? Such a residue cannot be pushed onto a lookup-side
       // query, so it must not authorise the semijoin-to-root rescue.
@@ -2241,6 +2331,7 @@ export abstract class External {
           linkedOnly[n] = true;
         }
         if (Object.keys(linkedOnly).length === 0) continue;
+        linkedOnlyByLs[lsName] = linkedOnly;
         // Walk the tree for any `.filter(F)` whose operand refs this main or
         // this lookup; harvest the linked-only clauses of F into the local map.
         // In the SAME walk, detect a live consumer: a non-DATASET (value) apply
@@ -2303,13 +2394,25 @@ export abstract class External {
           ? ({
               ...(orig as any),
               filter: clause,
-              // Authorise the totals/main-split semijoin-to-root ONLY when the
-              // clause is orphaned (no live linked consumer) AND the harvested
-              // residue is purely linked-only-resolvable (a dirty residue —
-              // e.g. a bare main boolean ref — cannot ride a lookup-side
-              // query). When a sibling sub-query consumes it, or the residue is
-              // dirty, this stays false and the rescue stands down.
-              semijoinToRoot: !hasLiveConsumer[lsName] && !harvestResidueDirty[lsName],
+              // Authorise the semijoin-to-root whenever the harvested residue
+              // is purely linked-only-resolvable (a dirty residue — e.g. a bare
+              // main boolean ref — cannot ride a lookup-side query). A live
+              // linked consumer no longer stands it down: the external that
+              // owns the consumer decomposes (getCrossExternalDecomposition)
+              // and the gate in getSemijoinToRootDecomposition returns null
+              // for it, while the sibling TOTALS external — which never
+              // decomposes — still needs the IN-list. Before this, filtering
+              // by a linked dim while ALSO splitting on it left the totals
+              // unfiltered (seen on rc, 18 Sep 2026: totals = full range while
+              // the split honoured the filter). The main sub-external minted
+              // by the cross decomposition resets this flag so it does not
+              // double-handle the clause.
+              semijoinToRoot: !harvestResidueDirty[lsName],
+              semijoinHasLiveConsumer: hasLiveConsumer[lsName] === true,
+              filterRejectsOrphans: External.linkedFilterRejectsOrphans(
+                clause,
+                linkedOnlyByLs[lsName] || {},
+              ),
             } as LinkedSourceConfig)
           : orig;
       }
@@ -3399,11 +3502,47 @@ export abstract class External {
     // (config.filter present, not TRUE, AND flagged orphaned). More than one is
     // out of scope for v1 — fail loud rather than guess which IN-list to
     // compose.
+    // An owner can ride the IN-list when its join is inner, or left with a
+    // clause no orphan can satisfy (left and inner agree, see
+    // LinkedSourceConfig.filterRejectsOrphans). A left owner whose clause keeps
+    // orphans cannot: with a live consumer the sibling sub-query already
+    // honours the clause on the linked side and this external stands down as
+    // it always did (the totals stay unrestricted — an anti-join is out of
+    // scope); without one the clause would be lost, so refuse loudly.
     const owners: string[] = [];
     for (const lsName in this.linkedSources) {
       const cfg = this.linkedSources[lsName] as any;
       const f = cfg.filter as Expression | undefined;
-      if (f && !f.equals(Expression.TRUE) && cfg.semijoinToRoot === true) owners.push(lsName);
+      if (!f || f.equals(Expression.TRUE) || cfg.semijoinToRoot !== true) continue;
+      const mode = External.resolveLinkedJoinMode(cfg);
+      const singleKey = Array.isArray(cfg.joinKeys) && cfg.joinKeys.length === 1;
+      const foldable =
+        singleKey && (mode === 'inner' || (mode === 'left' && cfg.filterRejectsOrphans === true));
+      if (!foldable) {
+        if (cfg.semijoinHasLiveConsumer === true) continue;
+        if (!singleKey) {
+          throw new PlywoodUnsupportedNativeJoinShape(
+            `semijoin-to-root for linkedSource "${lsName}": expected exactly one ` +
+              `joinKey, got [${(cfg.joinKeys || []).join(
+                ', ',
+              )}]. A multi-key semijoin (IN-list over a ` +
+              `tuple) is not supported.`,
+          );
+        }
+        // 'left' (or a missing/other mode) cannot be expressed as a main-side
+        // IN-list: a left join keeps orphan main rows, so an IN-list would
+        // silently DISCARD rows the user asked to keep. Refuse loudly — parity
+        // with the native-JOIN left-join pin. (linked/filter/join in the text
+        // for the pin matcher.)
+        throw new PlywoodUnsupportedNativeJoinShape(
+          `semijoin-to-root for linkedSource "${lsName}": joinMode="${
+            mode || 'undefined'
+          }" cannot honour a linked-only filter via a main-side IN-list — an IN-list is ` +
+            `INNER-join semantics; a left join keeps orphan main rows and would not ` +
+            `restrict the result. Declare joinMode:'inner' or split on the linked dim.`,
+        );
+      }
+      owners.push(lsName);
     }
     if (owners.length === 0) return null;
     if (owners.length > 1) {
@@ -3417,22 +3556,6 @@ export abstract class External {
 
     const lsName = owners[0];
     const config = this.linkedSources[lsName] as any;
-
-    const joinMode = External.resolveLinkedJoinMode(config);
-    if (joinMode !== 'inner') {
-      // 'left' (or a missing/other mode) cannot be expressed as a main-side
-      // IN-list: a left join keeps orphan main rows, so an IN-list would
-      // silently DISCARD rows the user asked to keep. Refuse loudly — parity
-      // with the native-JOIN left-join pin. (linked/filter/join in the text
-      // for the pin matcher.)
-      throw new PlywoodUnsupportedNativeJoinShape(
-        `semijoin-to-root for linkedSource "${lsName}": joinMode="${
-          joinMode || 'undefined'
-        }" cannot honour a linked-only filter via a main-side IN-list — an IN-list is ` +
-          `INNER-join semantics; a left join keeps orphan main rows and would not ` +
-          `restrict the result. Declare joinMode:'inner' or split on the linked dim.`,
-      );
-    }
 
     const joinKeys: string[] = config.joinKeys || [];
     if (joinKeys.length !== 1) {
@@ -3652,7 +3775,12 @@ export abstract class External {
     // IN-list semijoin shape reaches the totals SQL.
     const semijoin = this.getSemijoinToRootDecomposition();
     if (semijoin) {
-      semijoin.lookupExternal.simulateValue(lastNode, simulatedQueries, externalForNext);
+      // The lookup DISTINCT-joinKey query is a leaf: it has no nested
+      // expression to attach, so it is simulated as a last node with no
+      // next-external. Handing it the caller's `externalForNext` (a TOTALS
+      // external when the root carries applies plus a nested SPLIT) tripped
+      // "must be in split mode to addNextExternalToDatum".
+      semijoin.lookupExternal.simulateValue(true, simulatedQueries, null);
       const sample = [getSampleValue(Set.unwrapSetType(semijoin.joinKeyType), null)];
       return semijoin
         .buildFilteredMain(sample)
@@ -4703,7 +4831,16 @@ export abstract class External {
     }
     const whereSQL = whereConds.length ? 'WHERE ' + whereConds.join(' AND ') : '';
 
-    const joinSql = joinMode === 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
+    // Same rule as the in-memory join: a harvested clause that rejects orphans
+    // makes LEFT and INNER agree, and INNER lets the planner prune.
+    const nativeEffectiveJoinMode =
+      joinMode === 'left' &&
+      stashedLinkedFilter &&
+      !stashedLinkedFilter.equals(Expression.TRUE) &&
+      (config as any).filterRejectsOrphans === true
+        ? 'inner'
+        : joinMode;
+    const joinSql = nativeEffectiveJoinMode === 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
     const sqlParts = [
       `SELECT ${selectParts.join(', ')}`,
       `FROM ${escName(mainSource)} AS ${mainAlias}`,
@@ -5480,11 +5617,26 @@ export abstract class External {
         );
       }
 
+      // A left-joined lookup whose harvested filter rejects orphans joins as
+      // inner FOR THIS REQUEST: the filter already excludes every orphan main
+      // row, so keeping them (with the linked columns undefined) would only
+      // resurrect rows the user filtered out — the bug seen on rc when a panel
+      // filtered a mapping dimension by one image and still showed the whole
+      // cube as an "undefined" bucket. The cube's declared joinMode is untouched.
+      const harvestedFilter: Expression | undefined = (config as any).filter;
+      const effectiveJoinMode: 'inner' | 'left' =
+        resolvedJoinMode === 'left' &&
+        harvestedFilter &&
+        !harvestedFilter.equals(Expression.TRUE) &&
+        (config as any).filterRejectsOrphans === true
+          ? 'inner'
+          : resolvedJoinMode;
+
       linkedExternals.push({
         name: lsName,
         external: linkedExternal,
         joinKeys: sharedAliases,
-        joinMode: resolvedJoinMode,
+        joinMode: effectiveJoinMode,
       });
 
       // Stash the main-compatible split set for rebuilding main after the loop.
@@ -5531,6 +5683,21 @@ export abstract class External {
     const mainKeepableAliases: string[] = (this as any)._lastMainKeepableAliases || [];
     const syntheticSplitsAll: Record<string, Expression> = (this as any)._lastSyntheticSplits || {};
     const mainValue = this.valueOf();
+    // The linked sub-queries built above already honour any harvested
+    // linked-only clause, so the main sub-external must NOT also fire the
+    // semijoin-to-root IN-list for it (redundant lookup round-trip, and a
+    // multi-key lookup would throw on the single-joinKey assumption).
+    if (mainValue.linkedSources) {
+      const resetLinked: Record<string, LinkedSourceConfig> = {};
+      for (const lsName in mainValue.linkedSources) {
+        const cfg = mainValue.linkedSources[lsName] as any;
+        resetLinked[lsName] =
+          cfg.semijoinToRoot === true
+            ? ({ ...cfg, semijoinToRoot: false } as LinkedSourceConfig)
+            : cfg;
+      }
+      mainValue.linkedSources = resetLinked;
+    }
     // The main sub-query projects the segregated LEAF aggregates, not the
     // derived measures. The scalar recombination (mainPostAggApplies) runs in
     // JS after the post-join re-aggregation. For a pure single-aggregate
