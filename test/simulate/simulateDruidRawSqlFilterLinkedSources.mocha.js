@@ -183,7 +183,16 @@ describe('Raw-SQL (custom dimension) filter predicate with linked sources', () =
       expect(joined).to.match(/brand_country/);
       expect(joined).to.match(/'Francia'/);
       expect(joined).to.match(/CASE WHEN/);
-      expect(sqls.filter(q => q.includes('lookup_') && q.includes('CASE WHEN'))).to.deep.equal([]);
+      // Same-engine lookup: the totals semijoin is ONE statement whose WHERE
+      // carries `"brand" IN (SELECT … FROM "lookup_b_rev1" …)`. The raw-SQL
+      // clause must stay on the OUTER main WHERE, never inside that sub-query.
+      const totals = sqls.find(q => q.includes('lookup_b_rev1'));
+      expect(totals, 'one statement carries the lookup sub-query').to.exist;
+      const subStart = totals.indexOf('IN (SELECT');
+      expect(subStart, 'IN sub-query present').to.be.greaterThan(-1);
+      const sub = totals.slice(subStart, totals.indexOf('GROUP BY 1)', subStart));
+      expect(sub).to.match(/brand_country/);
+      expect(sub).to.not.match(/CASE WHEN/);
     });
   });
 });

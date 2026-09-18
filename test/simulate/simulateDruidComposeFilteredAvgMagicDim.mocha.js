@@ -49,6 +49,8 @@ const { expect } = require('chai');
 const { PassThrough } = require('readable-stream');
 
 const plywood = require('../plywood');
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
 
 const { External, $, ply } = plywood;
 
@@ -77,8 +79,13 @@ const timeFilter = $('__time').overlap({
 
 // Main cube + eternal magic-dim lookup (brand → brand_country). `promo` is a
 // real BOOLEAN dimension; `price`/`pvp` are unsplitable measures.
+// Since plywood 0.51.10 a linked source in main's OWN engine (a materialised
+// Druid datasource) is joined natively in one SQL for every shape. The
+// in-memory JS-join this file exercises is now the CROSS-ENGINE plan — a
+// Postgres staging view under a Druid main — so the fixture declares the
+// lookup on Postgres and hands it the same mock requester.
 function makeMain(requester) {
-  return External.fromJS(
+  const ext = External.fromJS(
     {
       engine: 'druidsql',
       source: 'main_ds',
@@ -99,6 +106,8 @@ function makeMain(requester) {
           sharedDimensions: ['brand'],
           joinMode: 'inner',
           timeAlignment: 'eternal',
+          engine: 'postgres',
+          version: '16.0.0',
           attributes: [
             { name: '__time', type: 'TIME' },
             { name: 'brand', type: 'STRING' },
@@ -110,6 +119,14 @@ function makeMain(requester) {
     },
     requester,
   );
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 // The canonical conditional-average measure: average($price) over promo rows.
@@ -137,7 +154,8 @@ function planSql(valueApplies, queryFilter) {
   return buildSplitExpr(valueApplies, queryFilter)
     .simulateQueryPlan({ main: makeMain() })
     .flat()
-    .filter(q => typeof q.query === 'string')
+    .map(q => (typeof q === 'string' ? { query: q } : q))
+    .filter(q => q && typeof q.query === 'string')
     .map(q => q.query);
 }
 
@@ -179,7 +197,9 @@ describe('Compose: FILTERED avg ($main.filter(promo).average) + magic-dim split'
       expect(lookupSql, 'lookup sub-query exists').to.exist;
       expect(lookupSql, 'lookup does not filter on __time (eternal)').to.not.match(/"__time"/);
       expect(lookupSql, 'lookup not WHERE FALSE').to.not.match(/WHERE\s+FALSE/i);
-      expect(lookupSql, 'lookup projects the join key').to.match(/"brand" AS "__join_brand"/);
+      expect(lookupSql, 'lookup projects the join key').to.match(
+        /"brand"(::text)? AS "__join_brand"/,
+      );
 
       // Structural well-formedness across every emitted query.
       for (const sql of sqls) {
@@ -236,7 +256,7 @@ describe('Compose: FILTERED avg ($main.filter(promo).average) + magic-dim split'
     // France B3: promo SUM=70 COUNT=10 (avg 7) ; all SUM=70 COUNT=10
     function reqWithLeaves() {
       return promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -329,7 +349,7 @@ describe('Compose: FILTERED avg ($main.filter(promo).average) + magic-dim split'
       // all countries (the would-be bug behaviour) — so an unhonoured filter
       // would visibly leak France into the result.
       const req = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           if (/Spain/.test(sql)) {
             return Promise.resolve([
@@ -388,7 +408,8 @@ describe('Compose: FILTERED avg ($main.filter(promo).average) + magic-dim split'
         .apply('SPLIT', split)
         .simulateQueryPlan({ main: makeMain() })
         .flat()
-        .filter(q => typeof q.query === 'string')
+        .map(q => (typeof q === 'string' ? { query: q } : q))
+        .filter(q => q && typeof q.query === 'string')
         .map(q => q.query);
       const mainSql = sqls.find(s => s.includes('"main_ds"') && !s.includes('lookup_bc_rev1'));
       expect(mainSql, 'main sub-query exists').to.exist;
@@ -425,7 +446,8 @@ describe('Compose: FILTERED avg ($main.filter(promo).average) + magic-dim split'
         sqls = expr
           .simulateQueryPlan({ main: makeMain() })
           .flat()
-          .filter(q => typeof q.query === 'string')
+          .map(q => (typeof q === 'string' ? { query: q } : q))
+          .filter(q => q && typeof q.query === 'string')
           .map(q => q.query);
       }, 'no throw without fan-out').to.not.throw();
       const mainSql = sqls.find(s => s.includes('"main_ds"'));

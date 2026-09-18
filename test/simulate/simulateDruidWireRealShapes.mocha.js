@@ -50,6 +50,8 @@ const { PassThrough } = require('readable-stream');
 const fs = require('fs');
 
 const plywood = require('../plywood');
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
 const { External, Expression, $, r } = plywood;
 
 const WIRE_AVG = JSON.parse(
@@ -74,8 +76,13 @@ const SUBSET_GRUPOIFA = $('url')
 // the join-key column (`competitor`) — which DOES exist on the lookup side.
 const SUBSET_NOTIN_COMPETITOR = $('competitor').in(['Alcampoes', 'Waitrosecom']).not();
 
+// Since plywood 0.51.10 a linked source in main's OWN engine (a materialised
+// Druid datasource) is joined natively in one SQL for every shape. The
+// in-memory JS-join this file exercises is now the CROSS-ENGINE plan — a
+// Postgres staging view under a Druid main — so the fixture declares the
+// lookup on Postgres and hands it the same mock requester.
 function makeMain(requester, filterExpr) {
-  return External.fromJS(
+  const ext = External.fromJS(
     {
       engine: 'druidsql',
       source: 'histories_507',
@@ -97,6 +104,8 @@ function makeMain(requester, filterExpr) {
           sharedDimensions: ['competitor'],
           joinMode: 'inner',
           timeAlignment: 'eternal',
+          engine: 'postgres',
+          version: '16.0.0',
           attributes: [
             { name: '__time', type: 'TIME' },
             { name: 'competitor', type: 'STRING' },
@@ -107,6 +116,14 @@ function makeMain(requester, filterExpr) {
     },
     requester,
   );
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 function promiseFnToStream(promiseRq) {
@@ -232,7 +249,7 @@ describe('Wire-real cross-source shapes (Expression.fromJS of captured front req
       expect(lookup, 'no url leak into lookup').to.not.match(/"url"/);
       expect(lookup, 'no price leak into lookup').to.not.match(/"price"/);
       // It projects the join key + the linked-only dim.
-      expect(lookup, 'projects join key').to.match(/"competitor" AS "__join_competitor"/);
+      expect(lookup, 'projects join key').to.match(/"competitor"(::text)? AS "__join_competitor"/);
       expect(lookup, 'projects linked-only dim').to.match(
         /"competitor_country" AS "competitor_country"/,
       );
@@ -247,7 +264,7 @@ describe('Wire-real cross-source shapes (Expression.fromJS of captured front req
       //     min_price = min(1,5) = 1 ; count = 100+1 = 101
       //   FR = C3(price sum=70 count=10 → avg 7) min=7 ; pvp sum=70 → avg(pvp)=7 → diff=0
       const req = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_4584fb7a_rev1')) {
           return Promise.resolve([
             { __join_competitor: 'C1', competitor_country: 'ES' },
@@ -349,7 +366,7 @@ describe('Wire-real cross-source shapes (Expression.fromJS of captured front req
       // point: limit is applied to the recombined+sorted result, never to the
       // pre-join main rows (which would silently drop buckets).
       const req = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_4584fb7a_rev1')) {
           return Promise.resolve([
             { __join_competitor: 'C1', competitor_country: 'ES' },
@@ -423,7 +440,7 @@ describe('Wire-real cross-source shapes (Expression.fromJS of captured front req
 
     it('compute: count fans out then re-aggregates by SUM to the country grain', async () => {
       const req = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_4584fb7a_rev1')) {
           return Promise.resolve([
             { __join_competitor: 'C1', competitor_country: 'ES' },

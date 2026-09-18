@@ -80,8 +80,11 @@ const timeFilter = $('__time').overlap({
   end: new Date('2026-05-02T00:00:00Z'),
 });
 
-function makeMain(requester) {
-  return External.fromJS(
+// `opts.crossEngine`: the lookup is a Postgres staging view, so the plan is
+// the JS-join. Without it the lookup is a Druid datasource in main's own
+// engine and (since 0.51.10) EVERY shape takes the native JOIN.
+function makeMain(requester, opts = {}) {
+  const ext = External.fromJS(
     {
       engine: 'druidsql',
       source: 'main_ds',
@@ -102,6 +105,7 @@ function makeMain(requester) {
           sharedDimensions: ['brand'],
           joinMode: 'inner',
           timeAlignment: 'eternal',
+          ...(opts.crossEngine ? { engine: 'postgres', version: '16.0.0' } : {}),
           attributes: [
             { name: 'brand', type: 'STRING' },
             { name: 'brand_country', type: 'STRING' },
@@ -112,6 +116,14 @@ function makeMain(requester) {
     },
     requester,
   );
+  if (opts.crossEngine) {
+    ext.linkedSources.magic_bc.requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 // The canonical non-decomposable measure that forces the native-JOIN route.
@@ -142,11 +154,12 @@ function buildNoHavingSplitExpr(valueApplies, sortName) {
     .apply('SPLIT', split);
 }
 
-function planSql(expr) {
+function planSql(expr, opts) {
   return expr
-    .simulateQueryPlan({ main: makeMain() })
+    .simulateQueryPlan({ main: makeMain(undefined, opts) })
     .flat()
-    .filter(q => typeof q.query === 'string')
+    .map(q => (typeof q === 'string' ? { query: q } : q))
+    .filter(q => q && typeof q.query === 'string')
     .map(q => q.query);
 }
 
@@ -177,11 +190,13 @@ describe('native-JOIN × HAVING (filter on aggregate value) — magic-dim + coun
       expect(sql, 'inline LIMIT stripped when HAVING present').to.not.match(/LIMIT/i);
     });
 
-    it('CONTRAST — the SAME HAVING over a DECOMPOSABLE measure (sum) IS honored in-SQL (jsJoin route)', () => {
-      // sum is trait 'sum' → no native-JOIN; the jsJoin path pushes HAVING to the
-      // main sub-query. Proves the native-JOIN fix did not regress the jsJoin route.
+    it('CONTRAST — the SAME HAVING over a DECOMPOSABLE measure (sum) IS honored in-SQL (jsJoin route, cross-engine lookup)', () => {
+      // On a CROSS-ENGINE lookup sum is trait 'sum' → jsJoin; that path pushes
+      // the HAVING to the main sub-query. Proves the native-JOIN fix did not
+      // regress the jsJoin route. (A same-engine lookup takes the native JOIN
+      // for sum too since 0.51.10, with the HAVING applied post-join.)
       const expr = buildHavingSplitExpr([['s', '$main.sum($price)']], $('s').greaterThan(100), 's');
-      const sqls = planSql(expr);
+      const sqls = planSql(expr, { crossEngine: true });
       expect(sqls.length, 'jsJoin emits 2 sub-queries').to.equal(2);
       const anyHaving = sqls.some(s => /HAVING/i.test(s));
       expect(anyHaving, 'jsJoin route DOES emit a HAVING for the sum measure').to.equal(true);

@@ -30,8 +30,12 @@ const filterStart = new Date('2026-05-01T00:00:00Z');
 const filterEnd = new Date('2026-05-02T00:00:00Z');
 const timeFilter = $('__time').overlap({ start: filterStart, end: filterEnd });
 
-function makeMainWithUsoTipicoLookup() {
-  return External.fromJS({
+// The F2 pre-gate rewrite matters on the JS-join, which since 0.51.10 is
+// the CROSS-ENGINE plan (a Postgres staging view under a Druid main). The
+// fixture therefore declares the lookup on Postgres; a same-engine lookup
+// takes the native JOIN for avg as for every other measure (pinned below).
+function makeMainWithUsoTipicoLookup(opts = {}) {
+  const ext = External.fromJS({
     engine: 'druidsql',
     source: 'main_ds',
     timeAttribute: '__time',
@@ -48,6 +52,7 @@ function makeMainWithUsoTipicoLookup() {
         sharedDimensions: ['productName'],
         joinMode: 'inner',
         timeAlignment: 'eternal',
+        ...(opts.sameEngine ? {} : { engine: 'postgres', version: '16.0.0' }),
         attributes: [
           { name: 'productName', type: 'STRING' },
           { name: 'uso_tipico', type: 'STRING' },
@@ -56,18 +61,24 @@ function makeMainWithUsoTipicoLookup() {
     },
     filter: timeFilter,
   });
+  if (!opts.sameEngine) {
+    ext.linkedSources.lookup_uso_tipico.requester = () => {
+      throw new Error('postgres requester must not run here');
+    };
+  }
+  return ext;
 }
 
 describe('Cross-source decomposability — average is decomposed pre-gate (F2)', () => {
-  function buildSplitExternal(applyExpr) {
-    const main = makeMainWithUsoTipicoLookup();
+  function buildSplitExternal(applyExpr, opts) {
+    const main = makeMainWithUsoTipicoLookup(opts);
     const withSplit = main.addExpression(
       plywood.Expression.fromJS({ op: 'ref', name: 'main' }).split('$uso_tipico', 'uso_tipico'),
     );
     return withSplit.addExpression(applyExpr);
   }
 
-  it('average($price) + linked-only split routes to jsJoin (NOT nativeJoin)', () => {
+  it('average($price) + linked-only split on a CROSS-ENGINE lookup routes to jsJoin (NOT nativeJoin)', () => {
     const apply = plywood.Expression.fromJS({
       op: 'apply',
       operand: { op: 'literal', value: { attributes: [], data: [{}] }, type: 'DATASET' },
@@ -108,5 +119,26 @@ describe('Cross-source decomposability — average is decomposed pre-gate (F2)',
     expect(linkedNames, 'linkedExternals carries lookup_uso_tipico').to.include(
       'lookup_uso_tipico',
     );
+  });
+
+  it('average($price) + linked-only split on a SAME-ENGINE lookup routes to the native JOIN with AVG()', () => {
+    const apply = plywood.Expression.fromJS({
+      op: 'apply',
+      operand: { op: 'literal', value: { attributes: [], data: [{}] }, type: 'DATASET' },
+      expression: {
+        op: 'average',
+        operand: { op: 'ref', name: 'main' },
+        expression: { op: 'ref', name: 'price' },
+      },
+      name: 'AvgPrice',
+    });
+    const splitExt = buildSplitExternal(apply, { sameEngine: true });
+    const crossExt = splitExt.getCrossExternalDecomposition();
+    expect(crossExt, 'decomposition shape').to.not.be.null;
+    expect(crossExt.kind, 'same-engine lookup → nativeJoin').to.equal('nativeJoin');
+    // No fan-out in a single GROUP BY at the user's grain, so the ORIGINAL
+    // aggregate renders directly — no sum/count leaves, no recombination.
+    expect(crossExt.nativeJoin.sql).to.match(/AVG\(main\."price"\) AS "AvgPrice"/);
+    expect(crossExt.nativeJoin.sql).to.match(/INNER JOIN "lookup_uso_tipico_rev1" AS lookup/);
   });
 });

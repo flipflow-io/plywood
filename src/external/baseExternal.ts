@@ -1599,6 +1599,17 @@ export abstract class External {
    * `mainEngine` / `mainVersion` / `mainRequester` come from the main
    * external. `lsName` is only used to make the error message locatable.
    */
+  /**
+   * True when a linkedSource's sub-query runs in the SAME engine as main, so a
+   * single SQL statement can reference both sides (a native JOIN, an IN
+   * sub-query). Absent `engine` inherits main's; a declared-but-equal engine
+   * counts as same. A cross-engine override (a Postgres staging view under a
+   * Druid main) is the ONLY case where the two sides must be queried apart.
+   */
+  static isSameEngineLinkedSource(config: LinkedSourceConfig, mainEngine: string): boolean {
+    return !config.engine || config.engine === mainEngine;
+  }
+
   static resolveLinkedEngineBinding(
     config: LinkedSourceConfig,
     lsName: string,
@@ -3460,6 +3471,11 @@ export abstract class External {
     joinKeyType: PlyType;
     lookupExternal: External;
     buildFilteredMain: (joinKeyValues: any[]) => External;
+    // Same-engine only: main restricted by `main.<joinKey> IN (<lookup
+    // sub-query>)` — ONE statement, the engine performs the semijoin, no
+    // key list travels over the wire. Undefined for a cross-engine lookup
+    // (the IN-list of harvested keys is then the only option).
+    buildSubqueryFilteredMain?: () => External;
   } | null {
     // Only a NON-split (totals / value) query: a split is owned by the
     // cross-external path. `raw` mode never carries applies/aggregates to
@@ -3678,7 +3694,41 @@ export abstract class External {
       return External.fromValue(value);
     };
 
-    return { joinKey, joinKeyType, lookupExternal, buildFilteredMain };
+    // ── Same-engine lookup: fold the DISTINCT-joinKey sub-query INTO main's
+    // WHERE as `<joinKey> IN (SELECT …)` instead of round-tripping the key
+    // set through plywood. A literal IN-list grows with the keys behind the
+    // filter value (a 100k-key list is an 11 MB statement the Druid router
+    // drops after ~27 s); the sub-query form is constant-size and the engine
+    // materialises the lookup side itself (Druid: 1–2 s on 37.7 M rows for
+    // 12.5k or 100k keys alike). Rendered through an untyped SqlRefExpression
+    // so the dialect emits the predicate bare (a BOOLEAN-typed one would be
+    // wrapped in a CAST … IN ('1','true') coercion). Any failure to render or
+    // parse the sub-query leaves the IN-list path as the plan.
+    let buildSubqueryFilteredMain: (() => External) | undefined;
+    if (External.isSameEngineLinkedSource(config, this.engine) && (this as any).dialect) {
+      try {
+        const dialect = (this as any).dialect as SQLDialect;
+        const lookupQuery: any = lookupExternal.getQueryAndPostTransform().query;
+        const lookupSql: unknown =
+          typeof lookupQuery === 'string' ? lookupQuery : lookupQuery && lookupQuery.query;
+        if (typeof lookupSql === 'string' && lookupSql.length > 0) {
+          const predicate = Expression.fromJS({
+            op: 'sqlRef',
+            sql: `${dialect.escapeName(joinKey)} IN (${lookupSql.replace(/\s+/g, ' ').trim()})`,
+          });
+          buildSubqueryFilteredMain = (): External => {
+            const value = this.valueOf();
+            value.filter = this.filter.and(predicate).simplify();
+            value.linkedSources = {};
+            return External.fromValue(value);
+          };
+        }
+      } catch {
+        buildSubqueryFilteredMain = undefined;
+      }
+    }
+
+    return { joinKey, joinKeyType, lookupExternal, buildFilteredMain, buildSubqueryFilteredMain };
   }
 
   public simulateValue(
@@ -3775,6 +3825,13 @@ export abstract class External {
     // IN-list semijoin shape reaches the totals SQL.
     const semijoin = this.getSemijoinToRootDecomposition();
     if (semijoin) {
+      // Same-engine lookup: ONE statement, the IN sub-query rides inside
+      // main's WHERE — nothing to pre-simulate on the lookup side.
+      if (semijoin.buildSubqueryFilteredMain) {
+        return semijoin
+          .buildSubqueryFilteredMain()
+          .simulateValue(lastNode, simulatedQueries, externalForNext);
+      }
       // The lookup DISTINCT-joinKey query is a leaf: it has no nested
       // expression to attach, so it is simulated as a last node with no
       // next-external. Handing it the caller's `externalForNext` (a TOTALS
@@ -4059,6 +4116,15 @@ export abstract class External {
     // brand) yields `IN ()` → no rows → total 0, NOT the all-country leak.
     const semijoin = this.getSemijoinToRootDecomposition();
     if (semijoin) {
+      // Same-engine lookup: the engine performs the semijoin (IN sub-query),
+      // one dispatch, no key set through plywood.
+      if (semijoin.buildSubqueryFilteredMain) {
+        return External.valuePromiseToStream(
+          External.buildValueFromStream(
+            semijoin.buildSubqueryFilteredMain().queryBasicValueStream(rawQueries),
+          ),
+        );
+      }
       return External.valuePromiseToStream(
         External.buildValueFromStream(
           semijoin.lookupExternal.queryBasicValueStream(rawQueries),
@@ -5244,7 +5310,30 @@ export abstract class External {
         if (a.expression.type === 'DATASET') return false;
         return External.resolveApplyDecomposeTrait(a) === 'none';
       });
-      if (undecomposableLeaf) {
+      // Same-engine preference (policy of 19 Sep 2026: a mapping or magic
+      // dimension is served from Druid once materialised). When the single
+      // involved linkedSource lives in main's own SQL engine, the native JOIN
+      // is the right plan for EVERY shape, not only for the 'none'-trait
+      // measures that force it: the JS-join pre-aggregates main at the
+      // join-key grain (one group per image URL — 948k groups on a large
+      // client datasource, 15–32 s), scans the whole lookup and joins in
+      // memory, while the engine's own JOIN resolves the same grid in 2–4 s.
+      // The result is identical: one GROUP BY at the user's grain, LEFT or
+      // INNER per joinMode, the harvested linked filter on the lookup alias.
+      // Shapes the v1 renderer cannot express (a derived measure such as
+      // avg/avg, a multi-alias linked split, a linked measure) throw
+      // PlywoodUnsupportedNativeJoinShape; for those the JS-join below stays
+      // the plan — it is still correct for decomposable measures, only slower.
+      // Cross-engine linked sources (the Postgres staging view) never enter:
+      // a single SQL cannot span two engines.
+      const involvedNames = Object.keys(involvedLinkedNames);
+      const nativeJoinPreferred =
+        !undecomposableLeaf &&
+        involvedNames.length === 1 &&
+        Object.keys(linkedAppliesByName).length === 0 &&
+        External.isSameEngineLinkedSource(this.linkedSources[involvedNames[0]], this.engine) &&
+        !!(this as any).dialect;
+      if (undecomposableLeaf || nativeJoinPreferred) {
         // The JS-join path is unsafe. Surface a nativeJoin
         // discriminator so the execution layer (Phase 4) emits a
         // single Druid SQL with an in-engine JOIN.
@@ -5307,13 +5396,28 @@ export abstract class External {
         const nativeJoinApplies = this.applies.filter(
           a => a.expression.type === 'DATASET' || mainValueApplies.some(m => m.name === a.name),
         );
-        const nativeJoin = this.getNativeJoinDecomposition(
-          linkedOnlySplitAliases,
-          nativeJoinApplies,
-          involvedLinkedNames,
-          mainSideSplitAliases,
-        );
-        return nativeJoin;
+        if (undecomposableLeaf) {
+          // Mandatory route: the JS-join would return wrong numbers, so an
+          // unsupported shape must fail loud here (F4), never fall back.
+          return this.getNativeJoinDecomposition(
+            linkedOnlySplitAliases,
+            nativeJoinApplies,
+            involvedLinkedNames,
+            mainSideSplitAliases,
+          );
+        }
+        // Preferred route: a shape the renderer cannot express falls back to
+        // the JS-join, which is correct for these (decomposable) measures.
+        try {
+          return this.getNativeJoinDecomposition(
+            linkedOnlySplitAliases,
+            nativeJoinApplies,
+            involvedLinkedNames,
+            mainSideSplitAliases,
+          );
+        } catch (e) {
+          if (!(e instanceof PlywoodUnsupportedNativeJoinShape)) throw e;
+        }
       }
     }
 

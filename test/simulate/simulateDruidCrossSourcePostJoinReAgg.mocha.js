@@ -23,6 +23,8 @@ const { expect } = require('chai');
 const { PassThrough } = require('readable-stream');
 
 const plywood = require('../plywood');
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
 
 const { External, $ } = plywood;
 
@@ -58,8 +60,13 @@ const BRAND_COUNTRY = [
   { __join_brand: 'Havana', brand_country: 'Cuba' },
 ];
 
+// Since plywood 0.51.10 a linked source in main's OWN engine (a materialised
+// Druid datasource) is joined natively in one SQL for every shape. The
+// in-memory JS-join this file exercises is now the CROSS-ENGINE plan — a
+// Postgres staging view under a Druid main — so the fixture declares the
+// lookup on Postgres and hands it the same mock requester.
 function makeMain(requester) {
-  return External.fromJS(
+  const ext = External.fromJS(
     {
       engine: 'druidsql',
       source: 'histories',
@@ -76,6 +83,8 @@ function makeMain(requester) {
           sharedDimensions: ['brand'],
           joinMode: 'inner',
           timeAlignment: 'eternal',
+          engine: 'postgres',
+          version: '16.0.0',
           attributes: [
             { name: 'brand', type: 'STRING' },
             { name: 'brand_country', type: 'STRING' },
@@ -86,13 +95,21 @@ function makeMain(requester) {
     },
     requester,
   );
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 // Build a requester that returns the lookup mapping for the linked query and
 // `mainRows` (per-brand pre-aggregated measure) for the main query.
 function makeRequester(mainRows) {
   return promiseFnToStream(rq => {
-    const sql = (rq && rq.query && rq.query.query) || '';
+    const sql = sqlOf(rq);
     if (sql.includes('"lookup_bc_rev1"')) return Promise.resolve(BRAND_COUNTRY);
     if (sql.includes('"histories"')) return Promise.resolve(mainRows);
     return Promise.resolve([]);

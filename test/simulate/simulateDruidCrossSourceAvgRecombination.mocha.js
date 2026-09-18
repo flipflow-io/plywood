@@ -52,6 +52,8 @@ const { expect } = require('chai');
 const { PassThrough } = require('readable-stream');
 
 const plywood = require('../plywood');
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
 
 const { External, $, ply, Dataset, Expression } = plywood;
 
@@ -90,8 +92,13 @@ const timeFilter = $('__time').overlap({
 // (`brand_country`), joinKey is `brand`. This is the live "avg + magic dim"
 // shape that routes through getCrossExternalDecomposition + the executor at
 // baseExternal.ts:3825.
+// Since plywood 0.51.10 a linked source in main's OWN engine (a materialised
+// Druid datasource) is joined natively in one SQL for every shape. The
+// in-memory JS-join this file exercises is now the CROSS-ENGINE plan — a
+// Postgres staging view under a Druid main — so the fixture declares the
+// lookup on Postgres and hands it the same mock requester.
 function makeMain(requester, joinMode) {
-  return External.fromJS(
+  const ext = External.fromJS(
     {
       engine: 'druidsql',
       source: 'main_ds',
@@ -110,6 +117,8 @@ function makeMain(requester, joinMode) {
           sharedDimensions: ['brand'],
           joinMode: joinMode || 'inner',
           timeAlignment: 'eternal',
+          engine: 'postgres',
+          version: '16.0.0',
           backing: { phase: 'canonical' },
           attributes: [
             { name: 'brand', type: 'STRING' },
@@ -121,6 +130,14 @@ function makeMain(requester, joinMode) {
     },
     requester,
   );
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 // Turnilo-style top-level: scope registrations + a SPLIT by the linked-only dim.
@@ -162,7 +179,7 @@ describe('Cross-source AVG recombination — one source of truth (per-row)', fun
       // = 15) and KEEP France's finished 8. The GLOBAL fn divides France's
       // null/null channels → NaN, destroying the finished value.
       const requester = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -215,7 +232,7 @@ describe('Cross-source AVG recombination — one source of truth (per-row)', fun
       // media-de-medias 50.5); France has one (70/10 = 7). This is GREEN under
       // BOTH fns — the per-row routing must not regress the live happy path.
       const requester = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -250,7 +267,7 @@ describe('Cross-source AVG recombination — one source of truth (per-row)', fun
       // benign half), so this PINS that the orphan never becomes NaN — and after
       // the fix it stays null via the per-row gate, not via accident.
       const requester = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -284,7 +301,7 @@ describe('Cross-source AVG recombination — one source of truth (per-row)', fun
       // null (avg kept, ratio left null) rather than NaN. France returns the
       // finished avg (8) and a max (4); per-row keeps avg=8.
       const requester = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -329,7 +346,7 @@ describe('Cross-source AVG recombination — one source of truth (per-row)', fun
       // and `price_max` per brand. avg recombines from rev/!T_0 AFTER re-agg, sum
       // sums, max maximises — all collapse to one row per country.
       const requester = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -498,7 +515,8 @@ describe('Cross-source AVG recombination — one source of truth (per-row)', fun
       const sqls = ex
         .simulateQueryPlan({ main: intExt() })
         .flat()
-        .filter(q => typeof q.query === 'string')
+        .map(q => (typeof q === 'string' ? { query: q } : q))
+        .filter(q => q && typeof q.query === 'string')
         .map(q => q.query);
       const mainSql = sqls.find(s => /avg_qty/i.test(s));
       expect(mainSql, 'main sub-query exists').to.exist;
@@ -515,7 +533,7 @@ describe('Cross-source AVG recombination — one source of truth (per-row)', fun
       // average (3/2 = 1.5), proving the recombination divides as a real ratio,
       // not integer division.
       const requester = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           return Promise.resolve([{ __join_brand: 'B1', brand_country: 'Spain' }]);
         }
@@ -551,7 +569,8 @@ describe('Cross-source AVG recombination — one source of truth (per-row)', fun
         .apply('AvgByRef', nested)
         .simulateQueryPlan({ main: ext })
         .flat()
-        .filter(q => typeof q.query === 'string')
+        .map(q => (typeof q === 'string' ? { query: q } : q))
+        .filter(q => q && typeof q.query === 'string')
         .map(q => q.query);
       expect(sqls.length, 'single nested-CTE query').to.equal(1);
       expect(sqls[0], 'inner per-reference avg').to.match(/AVG\("pvp"\) AS "B_main_0"/);
@@ -585,7 +604,8 @@ describe('Cross-source AVG recombination — one source of truth (per-row)', fun
           .apply('Deep', threeLevel)
           .simulateQueryPlan({ main: ext })
           .flat()
-          .filter(q => typeof q.query === 'string');
+          .map(q => (typeof q === 'string' ? { query: q } : q))
+          .filter(q => q && typeof q.query === 'string');
       }).to.throw(/can not convert split expression to SQL|resplit/i);
     });
   });

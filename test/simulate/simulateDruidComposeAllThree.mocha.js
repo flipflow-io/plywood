@@ -58,6 +58,8 @@ const { expect } = require('chai');
 const { PassThrough } = require('readable-stream');
 
 const plywood = require('../plywood');
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
 
 const { External, $, ply } = plywood;
 
@@ -93,8 +95,13 @@ const MAGIC = 'magic_d01f07da-1111-2222-3333-444455556666';
 // Main cube mirror + eternal magic-dim lookup. The lookup carries its OWN
 // `__time` (snapshot sentinel) — the overlap with main's timeAttribute is what
 // tripped fix-B's ambiguity guard before the fix.
+// Since plywood 0.51.10 a linked source in main's OWN engine (a materialised
+// Druid datasource) is joined natively in one SQL for every shape. The
+// in-memory JS-join this file exercises is now the CROSS-ENGINE plan — a
+// Postgres staging view under a Druid main — so the fixture declares the
+// lookup on Postgres and hands it the same mock requester.
 function makeMain(requester) {
-  return External.fromJS(
+  const ext = External.fromJS(
     {
       engine: 'druidsql',
       source: 'histories_main',
@@ -117,6 +124,8 @@ function makeMain(requester) {
           sharedDimensions: ['brand'],
           joinMode: 'inner',
           timeAlignment: 'eternal',
+          engine: 'postgres',
+          version: '16.0.0',
           attributes: [
             { name: '__time', type: 'TIME' },
             { name: 'brand', type: 'STRING' },
@@ -127,6 +136,14 @@ function makeMain(requester) {
     },
     requester,
   );
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 // The composed panel: DOUBLE split (time-bucket fix-B + linked-only brand_country)
@@ -152,7 +169,8 @@ function planSql(expr) {
   return expr
     .simulateQueryPlan({ main: makeMain() })
     .flat()
-    .filter(q => typeof q.query === 'string')
+    .map(q => (typeof q === 'string' ? { query: q } : q))
+    .filter(q => q && typeof q.query === 'string')
     .map(q => q.query);
 }
 
@@ -216,7 +234,9 @@ describe('Compose all three magic-dim fixes in one panel (time × brand_country,
       );
       expect(lookupSql, 'lookup is not WHERE FALSE').to.not.match(/WHERE\s+FALSE/i);
       expect(lookupSql, 'lookup does not filter on __time (eternal)').to.not.match(/"__time"/);
-      expect(lookupSql, 'lookup projects the join key').to.match(/"brand" AS "__join_brand"/);
+      expect(lookupSql, 'lookup projects the join key').to.match(
+        /"brand"(::text)? AS "__join_brand"/,
+      );
 
       // ── Main must NOT leak the linked-only column. ───────────────────────
       expect(mainSql, 'main does not reference brand_country').to.not.match(/brand_country/);
@@ -253,7 +273,7 @@ describe('Compose all three magic-dim fixes in one panel (time × brand_country,
     // `time` = the P1D day bucket value.
     function reqFrancia() {
       return promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_d01f07da_rev1')) {
           // WHERE Francia present → only Francia brands come back.
           return Promise.resolve([
@@ -345,7 +365,7 @@ describe('Compose all three magic-dim fixes in one panel (time × brand_country,
       // is what narrows the result to Francia, and that the double split +
       // leaf decomposition still compose for the multi-country case.
       const reqAll = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_d01f07da_rev1')) {
           expect(sql, 'no-filter lookup carries no Francia clause').to.not.match(/Francia/);
           return Promise.resolve([
