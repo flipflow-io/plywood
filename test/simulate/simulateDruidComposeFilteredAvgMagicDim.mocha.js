@@ -425,17 +425,26 @@ describe('Compose: FILTERED avg ($main.filter(promo).average) + magic-dim split'
     });
   });
 
-  describe('HONEST FINDING — bare boolean ref in a measure filter is a narrow composition gap', () => {
+  describe('bare boolean ref in a measure filter — the former composition gap is closed (0.51.10)', () => {
     // The brief literally asks for `$main.filter($promo)` with promo:BOOLEAN.
-    // That BARE-ref form throws the moment the linked-only split forces leaf
-    // segregation — but works on a main-only split and is fully avoided by the
-    // comparison form used above. Pinned as a counterfactual so the gap is
-    // VISIBLE, not silently routed around. The fix (carry bare boolean dims into
-    // the leaf type context) belongs to the next phase.
+    // Until 0.51.9 that BARE-ref form threw "could not resolve $promo" the
+    // moment a linked-only split forced leaf segregation: the linked-filter
+    // harvester treated the MEASURE filter as a cube filter and rewrote it.
+    // Measure-level filters are no longer harvested, so the bare ref stays
+    // where it belongs and renders as a conditional leaf on main.
     const bareFiltered = $('main').filter('$promo').average('$price');
 
-    it('bare $promo + linked-only split THROWS "could not resolve $promo" (the gap)', () => {
-      expect(() => planSql([['m', bareFiltered]])).to.throw(/could not resolve \$promo/);
+    it('bare $promo + linked-only split renders conditional leaves on main (no throw)', () => {
+      let sqls;
+      expect(() => {
+        sqls = planSql([['m', bareFiltered]]);
+      }).to.not.throw();
+      const mainSql = sqls.find(s => s.includes('"main_ds"') && !s.includes('lookup_bc_rev1'));
+      expect(mainSql, 'main sub-query exists').to.exist;
+      expect(mainSql, 'promo condition inside the leaves').to.match(/CASE WHEN \("promo" = TRUE\)/);
+      expect(mainSql, 'the measure filter never reaches the WHERE').to.not.match(
+        /WHERE[\s\S]*"promo"/,
+      );
     });
 
     it('the SAME bare-$promo measure works on a MAIN-only split (gap is fan-out specific)', () => {

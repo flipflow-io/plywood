@@ -97,6 +97,8 @@ function renderAggregateSQL(
   applyValueExpr: Expression,
   dialect: SQLDialect,
   tableAlias: string,
+  lookupAlias?: string,
+  linkedAttrs?: Record<string, true>,
 ): string {
   // The apply's expression is typically the aggregate directly
   // (countDistinct, sum, etc.) or a binary chain (sum(a) + sum(b)).
@@ -127,9 +129,36 @@ function renderAggregateSQL(
     );
   }
   const op = ex.op;
-  // Stub operandSQL: any string lacking ' WHERE ' satisfies
-  // aggregateFilterIfNeeded's "no per-apply filter" branch.
-  const stubOperand = `${tableAlias}`;
+  // operandSQL. Without a per-apply filter any string lacking ' WHERE '
+  // satisfies aggregateFilterIfNeeded's "no filter" branch. A MEASURE-level
+  // filter — `$main.filter(F).count()`, the aggregate's operand is a
+  // FilterExpression — renders as `<alias> WHERE <F>` so the dialect emits the
+  // conditional aggregate (SUM(CASE WHEN F THEN … END)). F is qualified to the
+  // side that owns its columns: all linked-only → the lookup alias, all main →
+  // the main alias; a clause mixing both sides cannot be qualified by a single
+  // table context and fails loud.
+  let stubOperand = `${tableAlias}`;
+  if (ex.isAggregate && ex.isAggregate() && ex.operand instanceof FilterExpression) {
+    const f: Expression = (ex.operand as FilterExpression).expression;
+    const refs = f.getFreeReferences();
+    const onLookup = refs.filter(r => linkedAttrs && linkedAttrs[r]);
+    let side: string;
+    if (onLookup.length === 0) side = tableAlias;
+    else if (onLookup.length === refs.length && lookupAlias) side = lookupAlias;
+    else {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `renderAggregateSQL: measure filter ${f.toString()} mixes main and linked columns ` +
+          `[${refs.join(', ')}]; a native-JOIN conditional aggregate needs one side.`,
+      );
+    }
+    const prev = (dialect as any).table;
+    (dialect as any).setTable(side);
+    try {
+      stubOperand = `${tableAlias} WHERE ${f.getSQL(dialect)}`;
+    } finally {
+      (dialect as any).setTable(prev);
+    }
+  }
   switch (op) {
     // Arithmetic composition (Ismael's RP/PVP-diff bug). A derived measure such as
     // `(avg(price) - avg(pvp)) / avg(pvp)` has a root op of `divide`/`subtract`/etc,
@@ -155,7 +184,7 @@ function renderAggregateSQL(
         // A literal operand (e.g. the `1` in `(avg/avg) - 1`) renders directly;
         // it carries no aggregate and must not recurse into the aggregate switch.
         if (sub instanceof LiteralExpression) return sub.getSQL(dialect);
-        return renderAggregateSQL(sub, dialect, tableAlias);
+        return renderAggregateSQL(sub, dialect, tableAlias, lookupAlias, linkedAttrs);
       };
       const operandSQL = renderOperand(chain.operand);
       const expressionSQL = renderOperand(chain.expression);
@@ -164,7 +193,10 @@ function renderAggregateSQL(
       return (chain as any)._getSQLChainableUnaryHelper(dialect, operandSQL, expressionSQL);
     }
     case 'count':
-      return dialect.aggregateFilterIfNeeded(stubOperand, 'COUNT(*)', '0');
+      // Same rendering as CountExpression: a filtered count is a SUM of 1/0.
+      return stubOperand.indexOf(' WHERE ') === -1
+        ? 'COUNT(*)'
+        : `SUM(${dialect.aggregateFilterIfNeeded(stubOperand, '1', '0')})`;
     case 'sum':
       return `SUM(${dialect.aggregateFilterIfNeeded(
         stubOperand,
@@ -1631,6 +1663,90 @@ export abstract class External {
     return !config.engine || config.engine === mainEngine;
   }
 
+  /**
+   * Measures whose per-apply filter (`$main.filter(F).agg(…)`) references a
+   * column that only a linkedSource has — e.g. "number of generated images"
+   * = count where the mapped image is not null. Keyed by linkedSource name,
+   * the measure names that need it. Such a measure can only be answered by a
+   * conditional aggregate over the engine's own JOIN (native-JOIN path); the
+   * JS-join pre-aggregates main without the lookup columns and has no way to
+   * evaluate F per row.
+   */
+  static linkedOnlyMeasureFilterRefs(
+    applies: ApplyExpression[],
+    mainAttrs: Record<string, true>,
+    linkedSources: Record<string, LinkedSourceConfig>,
+  ): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+    if (!linkedSources) return out;
+    for (const apply of applies || []) {
+      if (!apply.expression || apply.expression.type === 'DATASET') continue;
+      const refs: string[] = [];
+      apply.expression.forEach(e => {
+        if (
+          e.isAggregate() &&
+          e.type !== 'DATASET' &&
+          (e as ChainableExpression).operand instanceof FilterExpression
+        ) {
+          const f = ((e as ChainableExpression).operand as FilterExpression).expression;
+          for (const r of f.getFreeReferences()) refs.push(r);
+        }
+      });
+      for (const r of refs) {
+        if (mainAttrs[r]) continue;
+        for (const lsName in linkedSources) {
+          const ls = linkedSources[lsName];
+          const has =
+            (ls.attributes && (ls.attributes as any[]).some(a => a.name === r)) ||
+            (ls.derivedAttributes && Object.prototype.hasOwnProperty.call(ls.derivedAttributes, r));
+          if (has) {
+            (out[lsName] ||= []).push(apply.name);
+            break;
+          }
+        }
+      }
+    }
+    for (const k in out) out[k] = out[k].filter((n, i, a) => a.indexOf(n) === i);
+    return out;
+  }
+
+  /**
+   * Main-side schema names: rawAttributes ∪ derivedAttributes ∪ timeAttribute.
+   */
+  public mainSchemaNames(): Record<string, true> {
+    const m: Record<string, true> = {};
+    for (const a of this.rawAttributes || []) m[a.name] = true;
+    for (const k in this.derivedAttributes) m[k] = true;
+    const ta = (this as any).timeAttribute;
+    if (typeof ta === 'string' && ta.length > 0) m[ta] = true;
+    return m;
+  }
+
+  /**
+   * Refuse, loudly and by name, a measure filter on a linked column whose
+   * linkedSource lives in another engine: there is no plan that answers it
+   * correctly (the JS-join cannot see the column per row, a single SQL cannot
+   * span two stores). The caller (the front) serves the OTHER measures and
+   * marks these as not yet available while the source is materialised.
+   */
+  static assertMeasureFiltersJoinable(
+    measureFilterByLs: Record<string, string[]>,
+    linkedSources: Record<string, LinkedSourceConfig>,
+    mainEngine: string,
+  ): void {
+    for (const lsName in measureFilterByLs) {
+      const cfg = linkedSources[lsName];
+      if (cfg && !External.isSameEngineLinkedSource(cfg, mainEngine)) {
+        throw new PlywoodUnsupportedNativeJoinShape(
+          `measure(s) [${measureFilterByLs[lsName].join(', ')}] filter on a column of ` +
+            `linkedSource "${lsName}" which lives in engine "${cfg.engine}" while main is ` +
+            `"${mainEngine}"; a conditional aggregate over that column needs both in ONE ` +
+            `engine (materialise the source), and the JS-join cannot evaluate it per row.`,
+        );
+      }
+    }
+  }
+
   static resolveLinkedEngineBinding(
     config: LinkedSourceConfig,
     lsName: string,
@@ -2285,6 +2401,30 @@ export abstract class External {
     }
     if (Object.keys(schemas).length === 0) return expression;
 
+    // MEASURE-level filters — `$main.filter(F).count()`, the operand of an
+    // aggregate — are NOT the cube filter. Harvesting them would apply F to
+    // the WHOLE query (every sibling measure and the totals restricted by a
+    // clause one measure asked for) and pruning them would silently turn the
+    // measure into its unfiltered twin. Both were observed (19 Sep 2026: a
+    // "generated images" measure restricted the panel's plain count). They
+    // are left untouched here: the decomposition renders them as filtered
+    // aggregates on the native JOIN, or fails loud where no engine can.
+    // (`Set` here is plywood's datatype, so a plain array keyed by identity.)
+    // A measure is a VALUE-typed aggregate; a split over a filtered dataset
+    // (`$main.filter(F).split(…)`, also an Aggregate by mixin, DATASET-typed)
+    // is the cube filter and must keep being harvested.
+    const measureFilterNodes: Expression[] = [];
+    expression.forEach(e => {
+      if (
+        e.isAggregate() &&
+        e.type !== 'DATASET' &&
+        (e as ChainableExpression).operand instanceof FilterExpression
+      ) {
+        measureFilterNodes.push((e as ChainableExpression).operand);
+      }
+    });
+    const isMeasureFilter = (e: Expression) => measureFilterNodes.some(f => f === e);
+
     // Per-linkedSource harvest of the linked-ONLY filter clauses.
     //
     // The Turnilo front stamps the full cube filter (including clauses over a
@@ -2371,6 +2511,7 @@ export abstract class External {
         // linked-only column.
         expression.forEach(e => {
           if (e instanceof FilterExpression) {
+            if (isMeasureFilter(e)) return;
             const op = e.operand;
             if (!(op instanceof RefExpression)) return;
             if (op.name !== k && op.name !== lsName) return;
@@ -2456,6 +2597,7 @@ export abstract class External {
     return expression.substitute(e => {
       // Target: .filter(F) whose operand is a RefExpression to a known source
       if (!(e instanceof FilterExpression)) return null;
+      if (isMeasureFilter(e)) return null;
       const op = e.operand;
       if (!(op instanceof RefExpression)) return null;
       const schema = schemas[op.name];
@@ -3565,6 +3707,114 @@ export abstract class External {
     return External.fromValue(value);
   }
 
+  /**
+   * A TOTALS (or single VALUE) query whose measures filter on a linked-only
+   * column: answered by the native JOIN with conditional aggregates and
+   * `GROUP BY ()`. Null when no measure needs the lookup. Cross-engine fails
+   * loud by measure name (assertMeasureFiltersJoinable).
+   */
+  public getNativeJoinTotalsDecomposition(): ReturnType<
+    External['getNativeJoinDecomposition']
+  > | null {
+    if (this.mode !== 'total' && this.mode !== 'value') return null;
+    if (!this.linkedSources || Object.keys(this.linkedSources).length === 0) return null;
+    const applies: ApplyExpression[] =
+      this.mode === 'value'
+        ? [Expression._.apply(External.VALUE_NAME, this.valueExpression)]
+        : (this.applies || []).filter(a => a.expression.type !== 'DATASET');
+    if (applies.length === 0) return null;
+    const mainNames = this.mainSchemaNames();
+    const byLs = External.linkedOnlyMeasureFilterRefs(applies, mainNames, this.linkedSources);
+    // A LONE filtered aggregate (`ply().apply('gen', $main.filter(F).count())`)
+    // is absorbed by plywood as a filtered VALUE/TOTAL external: F lands in
+    // `this.filter`, not inside the apply. Its linked-only clauses belong on
+    // the lookup alias of the JOIN (a `IS NULL` clause then counts orphans
+    // correctly under a LEFT join — something no IN-list could express).
+    const filterOwner = (r: string): string | undefined => {
+      if (mainNames[r]) return undefined;
+      for (const lsName in this.linkedSources) {
+        const ls = this.linkedSources[lsName];
+        const has =
+          (ls.attributes && (ls.attributes as any[]).some(a => a.name === r)) ||
+          (ls.derivedAttributes && Object.prototype.hasOwnProperty.call(ls.derivedAttributes, r));
+        if (has) return lsName;
+      }
+      return undefined;
+    };
+    const filterLs: Record<string, string[]> = {};
+    if (this.filter) {
+      for (const r of this.filter.getFreeReferences()) {
+        const owner = filterOwner(r);
+        if (owner) (filterLs[owner] ||= []).push(applies.map(a => a.name).join(', '));
+      }
+    }
+    const lsNames = Object.keys({ ...byLs, ...filterLs });
+    if (lsNames.length === 0) return null;
+    External.assertMeasureFiltersJoinable(byLs, this.linkedSources, this.engine);
+    External.assertMeasureFiltersJoinable(filterLs, this.linkedSources, this.engine);
+    if (!(this as any).dialect) return null;
+    if (lsNames.length > 1) {
+      throw new PlywoodUnsupportedNativeJoinShape(
+        `measure filters reference columns of ${lsNames.length} linkedSources [${lsNames.join(
+          ', ',
+        )}] — a totals native JOIN supports exactly one`,
+      );
+    }
+    const lsName = lsNames[0];
+    const involved: Record<string, true> = { [lsName]: true };
+    let self: External = this;
+    if (filterLs[lsName]) {
+      // Split the absorbed filter into main-side atoms (stay in main's WHERE)
+      // and linked-side atoms (go to the lookup alias); an atom mixing both
+      // sides cannot be qualified and fails loud.
+      const cfg: any = this.linkedSources[lsName];
+      const linkedOnly: Record<string, true> = {};
+      if (cfg.attributes) {
+        for (const a of cfg.attributes as any[]) if (!mainNames[a.name]) linkedOnly[a.name] = true;
+      }
+      if (cfg.derivedAttributes) {
+        for (const k in cfg.derivedAttributes) if (!mainNames[k]) linkedOnly[k] = true;
+      }
+      const flattenAnd = (ex: Expression): Expression[] =>
+        ex instanceof AndExpression
+          ? [...flattenAnd(ex.operand), ...flattenAnd(ex.expression)]
+          : [ex];
+      const atoms: Expression[] = flattenAnd(this.filter);
+      const mainAtoms: Expression[] = [];
+      const linkedAtoms: Expression[] = [];
+      for (const atom of atoms) {
+        const refs = atom.getFreeReferences();
+        if (refs.every(r => mainNames[r])) mainAtoms.push(atom);
+        else if (refs.every(r => linkedOnly[r])) linkedAtoms.push(atom);
+        else {
+          throw new PlywoodUnsupportedNativeJoinShape(
+            `filter clause ${atom.toString()} mixes main and linked columns [${refs.join(
+              ', ',
+            )}]; a native-JOIN WHERE needs each clause on one side`,
+          );
+        }
+      }
+      const conj = (xs: Expression[]): Expression =>
+        xs.length ? xs.reduce((acc, x) => acc.and(x)).simplify() : Expression.TRUE;
+      const linkedClause = conj(linkedAtoms);
+      const prevLinked: Expression | undefined = cfg.filter;
+      const value = this.valueOf();
+      value.filter = conj(mainAtoms);
+      value.linkedSources = {
+        ...this.linkedSources,
+        [lsName]: {
+          ...cfg,
+          filter:
+            prevLinked && !prevLinked.equals(Expression.TRUE)
+              ? prevLinked.and(linkedClause).simplify()
+              : linkedClause,
+        },
+      };
+      self = External.fromValue(value);
+    }
+    return self.getNativeJoinDecomposition([], applies, involved, []);
+  }
+
   public getSemijoinToRootDecomposition(): {
     joinKey: string;
     joinKeyType: PlyType;
@@ -3964,6 +4214,24 @@ export abstract class External {
         .simulateValue(lastNode, simulatedQueries, externalForNext);
     }
 
+    // Totals / value with a measure filter on a linked column: one native
+    // JOIN SQL with conditional aggregates (see getNativeJoinTotalsDecomposition).
+    const njTotals = this.getNativeJoinTotalsDecomposition();
+    if (njTotals) {
+      simulatedQueries.push({
+        query: njTotals.nativeJoin.sql,
+        context: { ...((this as any).context || {}), sqlTimeZone: 'Etc/UTC' },
+      });
+      if (mode === 'value') return getSampleValue(this.valueExpression.type, this.valueExpression);
+      const datum: Datum = {};
+      for (const apply of this.applies || []) {
+        datum[apply.name] = getSampleValue(apply.expression.type, apply.expression);
+      }
+      // A totals row is a TotalContainer (as the plain path returns), never a
+      // Dataset — the simulate loop would otherwise re-run the external.
+      return new TotalContainer(datum);
+    }
+
     simulatedQueries.push(this.getQueryAndPostTransform().query);
 
     if (mode === 'value') {
@@ -4026,6 +4294,103 @@ export abstract class External {
     return valuePromise;
   }
 
+  /**
+   * Dispatch ONE native-JOIN SQL through main's requester and shape the rows:
+   * split keys + measures for a split (keyed Dataset), a one-row Dataset for
+   * a totals row, the bare number for a VALUE query.
+   */
+  private dispatchNativeJoin(
+    crossExt: ReturnType<External['getNativeJoinDecomposition']>,
+    rawQueries: any[] | null,
+  ): ReadableStream {
+    const nj = crossExt.nativeJoin;
+    return External.valuePromiseToStream(
+      new Promise<PlywoodValue>((resolve, reject) => {
+        const requester = this.requester;
+        if (!requester) {
+          reject(
+            new Error(
+              'Cross-source native-JOIN: external has no requester to dispatch the combined SQL',
+            ),
+          );
+          return;
+        }
+        if (rawQueries) rawQueries.push({ engine: this.engine, query: nj.sql });
+        // Druid SQL: requester expects `query: { query: <sql> }`.
+        // Other engines accept the bare string. Match Druid's
+        // nesting unconditionally — non-Druid engines that take
+        // this path can override via subclass-aware wiring (out
+        // of scope for v1 — native-JOIN currently only fires on
+        // the Druid SQL transport).
+        const reqStream = requester({
+          query: { query: nj.sql } as any,
+          context: (this as any).context,
+        });
+        const rows: Datum[] = [];
+        reqStream.on('data', (r: any) => rows.push(r));
+        reqStream.on('error', (e: any) => reject(e));
+        reqStream.on('end', () => {
+          // A VALUE query is one aggregate: hand back the bare number.
+          if (this.mode === 'value') {
+            const only = rows[0];
+            resolve(only ? (only[nj.applyNames[0]] as PlywoodValue) : null);
+            return;
+          }
+          // Build attributes + inflaters from splitKeyAttributes when the
+          // combined SQL carries more than the linked key (e.g. a Time(Day)
+          // main-side bucket): the time column must inflate to a TimeRange
+          // (not a bare STRING) and the dataset must be keyed on EVERY split.
+          // Fall back to the single-key shape for plain linked-only splits.
+          const skAttrs =
+            nj.splitKeyAttributes && nj.splitKeyAttributes.length > 0
+              ? nj.splitKeyAttributes
+              : nj.splitAlias !== undefined
+              ? [{ name: nj.splitAlias, type: 'STRING' as PlyType, splitExpr: null as any }]
+              : [];
+          const splitAttributeInfos = skAttrs.map(
+            sk => new AttributeInfo({ name: sk.name, type: sk.type }),
+          );
+          const inflaters: Inflater[] = [];
+          for (const sk of skAttrs) {
+            if (sk.splitExpr) {
+              const inf = External.getIntelligentInflater(sk.splitExpr, sk.name);
+              if (inf) inflaters.push(inf);
+            }
+          }
+          if (inflaters.length > 0) {
+            for (const r of rows) for (const inf of inflaters) inf(r);
+          }
+          let ds = new Dataset({
+            keys: nj.keys,
+            attributes: [
+              ...splitAttributeInfos,
+              ...nj.applyNames.map(n => new AttributeInfo({ name: n, type: 'NUMBER' })),
+            ],
+            data: rows,
+          });
+          // Post-join HAVING / sort / limit (mirror of the jsJoin branch at
+          // ~3341-3349). The engine returned the JOIN+GROUP BY rows; the
+          // HAVING is applied here by alias (the Dataset is keyed by
+          // applyNames). When a HAVING is present the combined SQL stripped
+          // its inline ORDER BY / LIMIT, so sort/limit must run AFTER the
+          // filter — order filter → sort → limit — else a pre-filter cut
+          // would starve the surviving rows.
+          if (crossExt.postJoinHavingFilter) {
+            ds = ds.filter(crossExt.postJoinHavingFilter);
+          }
+          if (crossExt.postJoinSort) {
+            ds = ds.sort(crossExt.postJoinSort.expression, crossExt.postJoinSort.direction);
+          }
+          if (crossExt.postJoinLimit) {
+            ds = ds.limit(crossExt.postJoinLimit.value);
+          }
+          External.assertDatasetShape(ds); // INV-1: also pin the native-JOIN result.
+          resolve(ds);
+        });
+      }),
+    );
+  }
+
   protected queryBasicValueStream(rawQueries: any[] | null): ReadableStream {
     const crossExt = this.getCrossExternalDecomposition();
     if (crossExt) {
@@ -4034,84 +4399,7 @@ export abstract class External {
       // already-grouped, already-joined dataset; we just need to
       // attach keys + inflaters and hand it back.
       if (crossExt.kind === 'nativeJoin' && crossExt.nativeJoin) {
-        const nj = crossExt.nativeJoin;
-        return External.valuePromiseToStream(
-          new Promise<PlywoodValue>((resolve, reject) => {
-            const requester = this.requester;
-            if (!requester) {
-              reject(
-                new Error(
-                  'Cross-source native-JOIN: external has no requester to dispatch the combined SQL',
-                ),
-              );
-              return;
-            }
-            if (rawQueries) rawQueries.push({ engine: this.engine, query: nj.sql });
-            // Druid SQL: requester expects `query: { query: <sql> }`.
-            // Other engines accept the bare string. Match Druid's
-            // nesting unconditionally — non-Druid engines that take
-            // this path can override via subclass-aware wiring (out
-            // of scope for v1 — native-JOIN currently only fires on
-            // the Druid SQL transport).
-            const reqStream = requester({
-              query: { query: nj.sql } as any,
-              context: (this as any).context,
-            });
-            const rows: Datum[] = [];
-            reqStream.on('data', (r: any) => rows.push(r));
-            reqStream.on('error', (e: any) => reject(e));
-            reqStream.on('end', () => {
-              // Build attributes + inflaters from splitKeyAttributes when the
-              // combined SQL carries more than the linked key (e.g. a Time(Day)
-              // main-side bucket): the time column must inflate to a TimeRange
-              // (not a bare STRING) and the dataset must be keyed on EVERY split.
-              // Fall back to the single-key shape for plain linked-only splits.
-              const skAttrs =
-                nj.splitKeyAttributes && nj.splitKeyAttributes.length > 0
-                  ? nj.splitKeyAttributes
-                  : [{ name: nj.splitAlias, type: 'STRING' as PlyType, splitExpr: null as any }];
-              const splitAttributeInfos = skAttrs.map(
-                sk => new AttributeInfo({ name: sk.name, type: sk.type }),
-              );
-              const inflaters: Inflater[] = [];
-              for (const sk of skAttrs) {
-                if (sk.splitExpr) {
-                  const inf = External.getIntelligentInflater(sk.splitExpr, sk.name);
-                  if (inf) inflaters.push(inf);
-                }
-              }
-              if (inflaters.length > 0) {
-                for (const r of rows) for (const inf of inflaters) inf(r);
-              }
-              let ds = new Dataset({
-                keys: nj.keys,
-                attributes: [
-                  ...splitAttributeInfos,
-                  ...nj.applyNames.map(n => new AttributeInfo({ name: n, type: 'NUMBER' })),
-                ],
-                data: rows,
-              });
-              // Post-join HAVING / sort / limit (mirror of the jsJoin branch at
-              // ~3341-3349). The engine returned the JOIN+GROUP BY rows; the
-              // HAVING is applied here by alias (the Dataset is keyed by
-              // applyNames). When a HAVING is present the combined SQL stripped
-              // its inline ORDER BY / LIMIT, so sort/limit must run AFTER the
-              // filter — order filter → sort → limit — else a pre-filter cut
-              // would starve the surviving rows.
-              if (crossExt.postJoinHavingFilter) {
-                ds = ds.filter(crossExt.postJoinHavingFilter);
-              }
-              if (crossExt.postJoinSort) {
-                ds = ds.sort(crossExt.postJoinSort.expression, crossExt.postJoinSort.direction);
-              }
-              if (crossExt.postJoinLimit) {
-                ds = ds.limit(crossExt.postJoinLimit.value);
-              }
-              External.assertDatasetShape(ds); // INV-1: also pin the native-JOIN result.
-              resolve(ds);
-            });
-          }),
-        );
+        return this.dispatchNativeJoin(crossExt as any, rawQueries);
       }
       // Dispatch order (see planCrossSourceDispatch). Sequential orders narrow
       // the second query by the first's keys; the join below is unchanged.
@@ -4383,6 +4671,11 @@ export abstract class External {
         );
       }
     }
+
+    // Totals / value with a measure filter on a linked column (see
+    // getNativeJoinTotalsDecomposition): one native JOIN statement.
+    const njTotals = this.getNativeJoinTotalsDecomposition();
+    if (njTotals) return this.dispatchNativeJoin(njTotals, rawQueries);
 
     const { engine, requester } = this;
 
@@ -4799,7 +5092,7 @@ export abstract class External {
     nativeJoin: {
       sql: string;
       joinMode: 'inner' | 'left';
-      splitAlias: string;
+      splitAlias?: string;
       mainSource: string;
       linkedSource: string;
       keys: string[];
@@ -4846,7 +5139,10 @@ export abstract class External {
     // returning null silently let the caller fall back to a single-
     // source path that died late with "could not get attribute info
     // for X" from the Druid inflater.
-    if (linkedOnlySplitAliases.length !== 1) {
+    // Zero linked-only aliases is a legal shape since 0.51.10: the lookup is
+    // joined only for a measure filter (or a linked filter) and the GROUP BY
+    // carries main-side aliases alone — none at all for a totals row.
+    if (linkedOnlySplitAliases.length > 1) {
       throw new PlywoodUnsupportedNativeJoinShape(
         `multi-alias linked-only split unsupported (aliases=${linkedOnlySplitAliases.join(
           ',',
@@ -4861,7 +5157,7 @@ export abstract class External {
         )}] — native-JOIN v1 supports exactly 1`,
       );
     }
-    const splitAlias = linkedOnlySplitAliases[0];
+    const splitAlias: string | undefined = linkedOnlySplitAliases[0];
     const lsName = lsNames[0];
     const config = this.linkedSources[lsName];
     if (!config) {
@@ -4916,22 +5212,32 @@ export abstract class External {
         `native Druid engine has no SQLDialect; native-JOIN requires SQL transport (engine="${this.engine}")`,
       );
     }
-    const splitExpr = this.split.splits[splitAlias];
-    if (!splitExpr) {
-      throw new PlywoodUnsupportedNativeJoinShape(
-        `split alias "${splitAlias}" not found in this.split.splits`,
-      );
+    let splitExpr: Expression | undefined;
+    let linkedColName: string | undefined;
+    if (splitAlias !== undefined) {
+      splitExpr = this.split ? this.split.splits[splitAlias] : undefined;
+      if (!splitExpr) {
+        throw new PlywoodUnsupportedNativeJoinShape(
+          `split alias "${splitAlias}" not found in this.split.splits`,
+        );
+      }
+      // For v1 we only support the simplest shape: split is a bare
+      // RefExpression to a column that exists on the linked side. More
+      // complex transforms (TIME_FLOOR, etc.) are out of scope.
+      const splitRef = splitExpr instanceof RefExpression ? splitExpr : null;
+      if (!splitRef) {
+        throw new PlywoodUnsupportedNativeJoinShape(
+          `split expr ${splitExpr.toString()} is not a bare RefExpression (TIME_FLOOR/SUBSTR/etc unsupported)`,
+        );
+      }
+      linkedColName = splitRef.name;
     }
-    // For v1 we only support the simplest shape: split is a bare
-    // RefExpression to a column that exists on the linked side. More
-    // complex transforms (TIME_FLOOR, etc.) are out of scope.
-    const splitRef = splitExpr instanceof RefExpression ? splitExpr : null;
-    if (!splitRef) {
-      throw new PlywoodUnsupportedNativeJoinShape(
-        `split expr ${splitExpr.toString()} is not a bare RefExpression (TIME_FLOOR/SUBSTR/etc unsupported)`,
-      );
-    }
-    const linkedColName = splitRef.name;
+    // Linked-side column names, for qualifying measure filters to `lookup`.
+    const linkedAttrNames: Record<string, true> = {};
+    if (config.attributes)
+      for (const a of config.attributes as any[]) linkedAttrNames[a.name] = true;
+    if (config.derivedAttributes)
+      for (const k in config.derivedAttributes) linkedAttrNames[k] = true;
 
     const mainSource = String(this.source);
     const linkedSource = String(config.source);
@@ -4962,7 +5268,7 @@ export abstract class External {
     // M+1. Collect them in this order so positions line up.
     const orderedSplitKeyAliases: string[] = [];
     for (const msAlias of mainSideSplitAliases) {
-      const msExpr = this.split.splits[msAlias];
+      const msExpr = this.split ? this.split.splits[msAlias] : undefined;
       if (!msExpr) {
         throw new PlywoodUnsupportedNativeJoinShape(
           `main-side split alias "${msAlias}" not found in this.split.splits`,
@@ -4985,15 +5291,18 @@ export abstract class External {
       });
       orderedSplitKeyAliases.push(msAlias);
     }
-    // The linked-only split column from the lookup side.
-    selectParts.push(`${lookupAlias}.${escName(linkedColName)} AS ${escName(splitAlias)}`);
-    groupByPositions.push(selectParts.length);
-    splitKeyAttributes.push({
-      name: splitAlias,
-      type: Set.unwrapSetType(splitExpr.type),
-      splitExpr,
-    });
-    orderedSplitKeyAliases.push(splitAlias);
+    // The linked-only split column from the lookup side (when the user split
+    // on one).
+    if (splitAlias !== undefined) {
+      selectParts.push(`${lookupAlias}.${escName(linkedColName)} AS ${escName(splitAlias)}`);
+      groupByPositions.push(selectParts.length);
+      splitKeyAttributes.push({
+        name: splitAlias,
+        type: Set.unwrapSetType(splitExpr.type),
+        splitExpr,
+      });
+      orderedSplitKeyAliases.push(splitAlias);
+    }
     const applyNames: string[] = [];
     for (const apply of mainApplies) {
       if (apply.expression.type === 'DATASET') continue; // skip scope-registrations
@@ -5015,7 +5324,13 @@ export abstract class External {
         // unrenderable op — it never returns a silent null that would drop the
         // SELECT item while the ORDER BY still references it. So every value
         // apply is guaranteed to contribute a SELECT column here.
-        const aggSQL = renderAggregateSQL(aggExpr, dialect, mainAlias);
+        const aggSQL = renderAggregateSQL(
+          aggExpr,
+          dialect,
+          mainAlias,
+          lookupAlias,
+          linkedAttrNames,
+        );
         selectParts.push(`${aggSQL} AS ${escName(apply.name)}`);
         applyNames.push(apply.name);
       } finally {
@@ -5085,7 +5400,11 @@ export abstract class External {
     // GROUP BY covers EVERY split-key position (main-side buckets + linked
     // key), not just `1`. A single linked-only split still emits `GROUP BY 1`;
     // a [Time(Day) × country] double split emits `GROUP BY 1, 2`.
-    sqlParts.push(`GROUP BY ${groupByPositions.join(', ')}`);
+    // No split key at all (a totals row joined for a measure filter) groups
+    // the whole result: `GROUP BY ()`.
+    sqlParts.push(
+      groupByPositions.length ? `GROUP BY ${groupByPositions.join(', ')}` : 'GROUP BY ()',
+    );
 
     // HAVING routing (mirror of the jsJoin branch, ~5006-5028). A `.filter()`
     // on the aggregate value folded into `this.havingFilter`. The native-JOIN
@@ -5201,7 +5520,7 @@ export abstract class External {
     nativeJoin?: {
       sql: string;
       joinMode: 'inner' | 'left';
-      splitAlias: string;
+      splitAlias?: string;
       mainSource: string;
       linkedSource: string;
       keys: string[];
@@ -5383,6 +5702,20 @@ export abstract class External {
         if (allInLinked && !anyInMain) involvedLinkedNames[lsName] = true;
       }
     }
+    // A measure-level filter on a linked-only column involves that
+    // linkedSource too, and can only be answered by the native JOIN (a
+    // conditional aggregate over the joined rows). Cross-engine: fail loud
+    // here, by measure name, before anything is dispatched.
+    const measureFilterByLs = External.linkedOnlyMeasureFilterRefs(
+      mainValueApplies,
+      this.mainSchemaNames(),
+      this.linkedSources,
+    );
+    const measureFilterLsNames = Object.keys(measureFilterByLs);
+    for (const n of measureFilterLsNames) involvedLinkedNames[n] = true;
+    if (measureFilterLsNames.length > 0) {
+      External.assertMeasureFiltersJoinable(measureFilterByLs, this.linkedSources, this.engine);
+    }
     if (Object.keys(involvedLinkedNames).length === 0) return null;
 
     // INV-2 decomposability gate.
@@ -5467,7 +5800,7 @@ export abstract class External {
     const mainLeafApplies: ApplyExpression[] = [...mainDatasetApplies, ...mainSeg.aggregateApplies];
     const mainPostAggApplies: ApplyExpression[] = mainSeg.postAggregateApplies;
 
-    if (gateHasLinkedOnlySplit) {
+    if (gateHasLinkedOnlySplit || measureFilterLsNames.length > 0) {
       // INV-2 gate, evaluated on the segregated LEAVES (post avg-rewrite +
       // segregation). A measure is jsJoin-safe iff every one of its leaf
       // aggregates re-aggregates by a single homomorphic reducer (trait
@@ -5498,13 +5831,16 @@ export abstract class External {
       // Cross-engine linked sources (the Postgres staging view) never enter:
       // a single SQL cannot span two engines.
       const involvedNames = Object.keys(involvedLinkedNames);
+      // A measure filter on a linked column is answerable ONLY as a
+      // conditional aggregate over the engine's JOIN: mandatory route.
+      const nativeJoinRequired = !!undecomposableLeaf || measureFilterLsNames.length > 0;
       const nativeJoinPreferred =
-        !undecomposableLeaf &&
+        !nativeJoinRequired &&
         involvedNames.length === 1 &&
         Object.keys(linkedAppliesByName).length === 0 &&
         External.isSameEngineLinkedSource(this.linkedSources[involvedNames[0]], this.engine) &&
         !!(this as any).dialect;
-      if (undecomposableLeaf || nativeJoinPreferred) {
+      if (nativeJoinRequired || nativeJoinPreferred) {
         // The JS-join path is unsafe. Surface a nativeJoin
         // discriminator so the execution layer (Phase 4) emits a
         // single Druid SQL with an in-engine JOIN.
@@ -5567,7 +5903,7 @@ export abstract class External {
         const nativeJoinApplies = this.applies.filter(
           a => a.expression.type === 'DATASET' || mainValueApplies.some(m => m.name === a.name),
         );
-        if (undecomposableLeaf) {
+        if (nativeJoinRequired) {
           // Mandatory route: the JS-join would return wrong numbers, so an
           // unsupported shape must fail loud here (F4), never fall back.
           return this.getNativeJoinDecomposition(

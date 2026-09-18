@@ -389,4 +389,89 @@ describe('Linked source routing by engine (0.51.10)', () => {
       expect(split, 'restricted to no key').to.match(/FALSE|"imageUrl" IN \(\)/i);
     });
   });
+
+  describe('measure-level filter on a mapped column — the "generated images" measure', () => {
+    const GEN = '$main.filter($generated_image.isnt(null)).count()';
+    const GEN_ONE = "$main.filter($generated_image == 'https://x/1.jpg').count()";
+
+    it('same engine, split by product: conditional aggregate over the native JOIN; the sibling count stays unrestricted', () => {
+      const sqls = planSqls(
+        query(TIME, { productName: $('productName') }, [
+          ['count', '$main.count()'],
+          ['gen', GEN_ONE],
+        ]),
+        makeMain({ where: 'druid' }),
+      );
+      const join = sqls.find(s => /LEFT JOIN "mapping_abc" AS lookup/.test(s));
+      expect(join, 'native JOIN emitted for the split').to.exist;
+      expect(join).to.match(/"main"\."productName" AS "productName"/);
+      expect(join, 'plain count untouched').to.match(/COUNT\(\*\) AS "count"/);
+      expect(join, 'measure filter as a conditional aggregate on the lookup alias').to.match(
+        /SUM\(CASE WHEN \(("lookup"|lookup)\."generated_image"='https:\/\/x\/1\.jpg'\) THEN 1 ELSE 0 END\) AS "gen"/,
+      );
+      expect(join, 'the measure filter never becomes a WHERE clause').to.not.match(
+        /WHERE[\s\S]*generated_image/,
+      );
+      expect(join).to.match(/GROUP BY 1\n/);
+    });
+
+    it('same engine, totals: one native JOIN statement with GROUP BY () and the conditional count', () => {
+      const sqls = planSqls(query(TIME).apply('gen', GEN), makeMain({ where: 'druid' }));
+      const totals = sqls.find(
+        s => /JOIN "mapping_abc" AS lookup/.test(s) && /GROUP BY \(\)/.test(s),
+      );
+      expect(totals, 'totals joined natively').to.exist;
+      expect(totals).to.match(/COUNT\(\*\) AS "count"/);
+      expect(totals).to.match(
+        /SUM\(CASE WHEN \(?\(("lookup"|lookup)\."generated_image" IS (NOT NULL|NULL\) IS NOT TRUE)\)? THEN 1 ELSE 0 END\) AS "gen"/,
+      );
+      expect(totals, 'LEFT join keeps every main row for the plain count').to.match(/LEFT JOIN/);
+      expect(
+        sqls.filter(s => s.includes('"histories"')),
+        'one statement for the totals',
+      ).to.have.length(1);
+    });
+
+    it('same engine, single value: the bare number comes back from the joined statement', async () => {
+      let sql = null;
+      const druid = promiseFnToStream(rq => {
+        sql = sqlOf(rq);
+        return Promise.resolve([{ __VALUE__: 42 }]);
+      });
+      const v = await ply()
+        .apply('main', $('main').filter(TIME))
+        .apply(MAP, $(MAP).filter(TIME))
+        .apply('gen', GEN)
+        .compute({ main: makeMain({ where: 'druid', requester: druid }) });
+      expect(sql, 'joined statement dispatched').to.match(/LEFT JOIN "mapping_abc" AS lookup/);
+      expect(sql).to.match(/AS "__VALUE__"/);
+      expect(v.toJS().data[0].gen).to.equal(42);
+    });
+
+    it('cross engine: refused loudly BY MEASURE NAME (the front marks only that measure as materializing)', () => {
+      expect(() =>
+        planSqls(
+          query(TIME, { productName: $('productName') }, [
+            ['count', '$main.count()'],
+            ['gen', GEN_ONE],
+          ]),
+          makeMain({ where: 'postgres' }),
+        ),
+      ).to.throw(
+        plywood.PlywoodUnsupportedNativeJoinShape,
+        /measure\(s\) \[gen\] filter on a column of linkedSource "mapping_img"/,
+      );
+    });
+
+    it('regression: the measure filter is never harvested as a cube filter (0.51.9 restricted every sibling measure)', () => {
+      // Cross-engine, totals only: before 0.51.10 the clause was hoisted into a
+      // semijoin and the plain count came back filtered. Now the shape is
+      // refused instead — and a plain count WITHOUT the measure is untouched.
+      const sqls = planSqls(query(TIME), makeMain({ where: 'postgres' }));
+      expect(totalsSql(sqls)).to.not.match(/imageUrl|generated_image/);
+      expect(() =>
+        planSqls(query(TIME).apply('gen', GEN_ONE), makeMain({ where: 'postgres' })),
+      ).to.throw(plywood.PlywoodUnsupportedNativeJoinShape);
+    });
+  });
 });
