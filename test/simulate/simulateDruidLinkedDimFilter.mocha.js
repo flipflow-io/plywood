@@ -388,17 +388,37 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
       }
     });
 
-    it('TOTALS semijoin-to-root with joinMode:left FAILS LOUD (IN-list is inner-only)', () => {
-      // The semijoin-to-root models an INNER join as a main-side IN-list. A LEFT
-      // join keeps orphan main rows, so an IN-list would silently DISCARD rows
-      // the user asked to keep — it cannot express left semantics. The rescue
-      // must throw a clear PlywoodUnsupportedNativeJoinShape, never silently
-      // emit the all-country totals. Parity with the split left-join pin above.
+    it('TOTALS semijoin-to-root with joinMode:left is honoured when the clause rejects orphans', () => {
+      // `brand_country ∈ ['Francia']` can never hold for a main row with no
+      // lookup match (its brand_country is null), so for this request LEFT and
+      // INNER agree and the IN-list rescue is exact: the lookup keeps the
+      // Francia WHERE and the totals SQL is restricted by `brand IN (…)`.
       const time = $('__time').overlap({
         start: new Date('2026-05-02T11:50:00.000Z'),
         end: new Date('2026-06-02T11:50:00.000Z'),
       });
       const cf = time.and($('brand_country').overlap(['Francia']));
+      const totals = ply()
+        .apply('main', $('main').filter(cf))
+        .apply(D01, $(D01).filter(cf))
+        .apply('avg_price', '$main.average($price)');
+      const sqls = totals
+        .simulateQueryPlan({ main: makeMain(undefined, undefined, 'left') })
+        .flat()
+        .map(q => (typeof q === 'string' ? q : q && q.query));
+      expect(lookupSubQuery(sqls), 'lookup carries Francia').to.match(/Francia/);
+      expect(totalsSubQuery(sqls), 'totals restricted by the brand IN-list').to.match(/"brand"/);
+    });
+
+    it('TOTALS semijoin-to-root with joinMode:left FAILS LOUD when the clause keeps orphans', () => {
+      // A negated clause (`NOT brand_country ∈ ['Francia']`) is satisfied by
+      // orphan main rows, so an IN-list would silently DISCARD rows the user
+      // asked to keep — the rescue must refuse, never emit all-country totals.
+      const time = $('__time').overlap({
+        start: new Date('2026-05-02T11:50:00.000Z'),
+        end: new Date('2026-06-02T11:50:00.000Z'),
+      });
+      const cf = time.and($('brand_country').overlap(['Francia']).not());
       const totals = ply()
         .apply('main', $('main').filter(cf))
         .apply(D01, $(D01).filter(cf))
