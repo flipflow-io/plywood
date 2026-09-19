@@ -473,5 +473,19 @@ describe('Linked source routing by engine (0.51.10)', () => {
         planSqls(query(TIME).apply('gen', GEN_ONE), makeMain({ where: 'postgres' })),
       ).to.throw(plywood.PlywoodUnsupportedNativeJoinShape);
     });
+
+    it('the refusal names the measures and the linked source as fields, so a host can drop exactly those applies', () => {
+      let caught;
+      try {
+        planSqls(query(TIME).apply('gen', GEN_ONE), makeMain({ where: 'postgres' }));
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).to.be.instanceOf(plywood.PlywoodUnsupportedNativeJoinShape);
+      expect(caught.name).to.equal('PlywoodUnsupportedNativeJoinShape');
+      expect(caught.measures).to.deep.equal(['gen']);
+      expect(caught.linkedSource).to.equal(MAP);
+      expect(caught.message).to.match(/measure\(s\) \[gen\]/);
+    });
   });
 });

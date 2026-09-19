@@ -283,9 +283,22 @@ export class PlywoodTraitMissing extends Error {
  * from the Druid inflater. F4 of the cycle-2 plan.
  */
 export class PlywoodUnsupportedNativeJoinShape extends Error {
-  constructor(reason: string) {
+  /**
+   * The applies (measure names) that cannot be computed in this shape,
+   * when the refusal is per measure (a measure-level filter on a column
+   * of a linked source that lives in another engine). A host can drop
+   * exactly these applies, re-run the rest and tell the user which
+   * measures are waiting for the source to be materialised.
+   */
+  public measures: string[];
+  /** The linked source the refused measures depend on, when known. */
+  public linkedSource?: string;
+
+  constructor(reason: string, measures: string[] = [], linkedSource?: string) {
     super(`Cross-source native-JOIN cannot emit SQL: ${reason}`);
     this.name = 'PlywoodUnsupportedNativeJoinShape';
+    this.measures = measures;
+    this.linkedSource = linkedSource;
     Object.setPrototypeOf(this, PlywoodUnsupportedNativeJoinShape.prototype);
   }
 }
@@ -1742,6 +1755,8 @@ export abstract class External {
             `linkedSource "${lsName}" which lives in engine "${cfg.engine}" while main is ` +
             `"${mainEngine}"; a conditional aggregate over that column needs both in ONE ` +
             `engine (materialise the source), and the JS-join cannot evaluate it per row.`,
+          [...measureFilterByLs[lsName]],
+          lsName,
         );
       }
     }
