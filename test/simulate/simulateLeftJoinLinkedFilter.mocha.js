@@ -173,6 +173,12 @@ describe('linkedFilterRejectsOrphans', () => {
     ],
     ['not', $('generated_image').is(lit(IMG)).not(), false],
     ['is null', $('generated_image').is(lit(null)), false],
+    // "has a value in the mapping": NOT(col IS NULL) rejects exactly the orphans.
+    ['isnt null', $('generated_image').isnt(lit(null)), true],
+    ['not(is null), literal first', lit(null).is($('generated_image')).not(), true],
+    ['isnt null and a main clause', TIME.and($('generated_image').isnt(lit(null))), true],
+    ['isnt null on a main column', $('productName').isnt(lit(null)), false],
+    ['not(isnt null) keeps the orphans', $('generated_image').isnt(lit(null)).not(), false],
     [
       'set containing null',
       $('generated_image').overlap(

@@ -1308,6 +1308,14 @@ export abstract class External {
         External.linkedFilterRejectsOrphans(anyOp.expression, linkedOnly)
       );
     }
+    // NOT(X) rejects orphans exactly when X accepts every orphan. The one
+    // clause that accepts every orphan by construction is `col IS NULL` on
+    // a linked-only column (an orphan has NULL there), so `$col.isnt(null)`
+    // — "has a value in the mapping" — rejects them. Any other operand under
+    // NOT keeps the conservative answer (false).
+    if (op === 'not') {
+      return External.linkedFilterAcceptsEveryOrphan(anyOp.operand, linkedOnly);
+    }
     const NULL_REJECTING_OPS: Record<string, true> = {
       is: true,
       in: true,
@@ -1341,6 +1349,35 @@ export abstract class External {
       return elements.every(e => e !== null && e !== undefined);
     }
     return true;
+  }
+
+  /**
+   * True when `filter` is `$col.is(null)` (either operand order) on a
+   * linked-only column: every orphan main row satisfies it, because the LEFT
+   * join leaves the column NULL for them. The complement of
+   * linkedFilterRejectsOrphans for the NOT case; deliberately narrow.
+   */
+  static linkedFilterAcceptsEveryOrphan(
+    filter: Expression,
+    linkedOnly: Record<string, true>,
+  ): boolean {
+    if (!filter) return false;
+    const anyOp: any = filter;
+    if (anyOp.op !== 'is') return false;
+    const operand: Expression | undefined = anyOp.operand;
+    const expression: Expression | undefined = anyOp.expression;
+    let col: RefExpression | null = null;
+    let lit: Expression | undefined;
+    if (operand instanceof RefExpression && expression instanceof LiteralExpression) {
+      col = operand;
+      lit = expression;
+    } else if (expression instanceof RefExpression && operand instanceof LiteralExpression) {
+      col = expression;
+      lit = operand;
+    }
+    if (!col || !lit || col.nest !== 0 || !linkedOnly[col.name]) return false;
+    const value = (lit as LiteralExpression).value;
+    return value === null || value === undefined;
   }
 
   static pruneFilterToSchema(

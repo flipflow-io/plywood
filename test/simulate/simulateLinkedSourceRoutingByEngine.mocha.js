@@ -204,6 +204,24 @@ describe('Linked source routing by engine (0.51.10)', () => {
       expect(splitSql(sqls)).to.match(/"imageUrl" IN \(SELECT/);
     });
 
+    it('"has a generated image" (isnt null) with a main split → plans as an orphan-rejecting filter, never a wrong total', () => {
+      // Seen on the local front against rc Druid, 19 Sep 2026: this shape threw
+      // "joinMode=\"left\" cannot honour a linked-only filter" because NOT(IS NULL)
+      // was not recognised as rejecting orphans. It rejects exactly them.
+      const filter = TIME.and(
+        $('generated_image').isnt(Expression.fromJS({ op: 'literal', value: null })),
+      );
+      const sqls = planSqls(
+        query(filter, { productName: $('productName') }),
+        makeMain({ where: 'druid', joinMode: 'left' }),
+      );
+      expect(mappingOnly(sqls), 'no lookup round-trip').to.deep.equal([]);
+      const sub =
+        /"imageUrl" IN \(SELECT "imageUrl" AS "imageUrl" FROM "mapping_abc" AS t WHERE \("generated_image" IS NULL\) IS NOT TRUE GROUP BY 1\)/;
+      expect(totalsSql(sqls), 'totals restricted to the keys that have a value').to.match(sub);
+      expect(splitSql(sqls), 'split restricted to the keys that have a value').to.match(sub);
+    });
+
     it('filter AND split on the mapping column → native INNER JOIN with the clause on the lookup alias', () => {
       const filter = TIME.and($('familia').is(Expression.fromJS({ op: 'literal', value: 'F3' })));
       const sqls = planSqls(
