@@ -275,13 +275,89 @@ describe('Linked source routing by engine (0.51.10)', () => {
       for (const v of views) expect(v).to.match(/"familia"/);
     });
 
-    it('countDistinct split by the mapping column has no correct cross-engine plan → fails loud', () => {
-      expect(() =>
-        planSqls(
-          query(TIME, { familia: $('familia') }, [['products', '$main.countDistinct($productId)']]),
+    // A measure that cannot be re-aggregated after the JS join (countDistinct,
+    // a derived measure over one) needs the engine's own JOIN; while the
+    // mapping lives in Postgres that JOIN cannot exist. The refusal names
+    // exactly those applies and the linked source, so the front answers the
+    // split with the other measures and shows these as "preparing" (19 Sep
+    // 2026: COUNT DISTINCT split by a fresh mapping was a 500, not a chip).
+    describe('a non-reaggregable measure split by the mapping column is refused BY NAME', () => {
+      const refusal = measures => {
+        let caught;
+        try {
+          planSqls(
+            query(TIME, { familia: $('familia') }, measures),
+            makeMain({ where: 'postgres' }),
+          );
+        } catch (e) {
+          caught = e;
+        }
+        expect(caught, 'a refusal').to.be.instanceOf(plywood.PlywoodUnsupportedNativeJoinShape);
+        expect(caught.linkedSource).to.equal(MAP);
+        return caught;
+      };
+      const cases = [
+        ['one countDistinct', [['products', '$main.countDistinct($productId)']], ['products']],
+        [
+          'count and sum stay, only the countDistinct is named',
+          [
+            ['count', '$main.count()'],
+            ['revenue', '$main.sum($price)'],
+            ['products', '$main.countDistinct($productId)'],
+          ],
+          ['products'],
+        ],
+        [
+          'two countDistincts are both named',
+          [
+            ['products', '$main.countDistinct($productId)'],
+            ['images', '$main.countDistinct($imageUrl)'],
+          ],
+          ['products', 'images'],
+        ],
+        [
+          'a derived measure over a countDistinct is named by ITS name, not by a synthetic leaf',
+          [
+            ['count', '$main.count()'],
+            ['perProduct', '$main.count().divide($main.countDistinct($productId))'],
+          ],
+          ['perProduct'],
+        ],
+        [
+          'an average decomposes (sum/count) and is not named beside the countDistinct',
+          [
+            ['avgPrice', '$main.average($price)'],
+            ['products', '$main.countDistinct($productId)'],
+          ],
+          ['products'],
+        ],
+      ];
+      for (const [title, measures, expected] of cases) {
+        it(title, () => {
+          const caught = refusal(measures);
+          expect(caught.measures).to.deep.equal(expected);
+          expect(caught.message).to.match(/cannot be re-aggregated after a JS join/);
+          expect(caught.message).to.match(/cannot span two engines/);
+        });
+      }
+
+      it('the same shapes plan in one native JOIN once the mapping is on Druid', () => {
+        for (const [, measures] of cases) {
+          const sqls = planSqls(
+            query(TIME, { familia: $('familia') }, measures),
+            makeMain({ where: 'druid' }),
+          );
+          expect(sqls.filter(s => /JOIN/.test(s)).length, 'a JOIN statement').to.be.at.least(1);
+        }
+      });
+
+      it('count split by the mapping column still plans cross-engine (JS join, per-side statements)', () => {
+        const sqls = planSqls(
+          query(TIME, { familia: $('familia') }),
           makeMain({ where: 'postgres' }),
-        ),
-      ).to.throw(plywood.PlywoodUnsupportedNativeJoinShape, /cannot span two engines/);
+        );
+        expect(mappingOnly(sqls).length).to.be.at.least(1);
+      });
     });
   });
 
