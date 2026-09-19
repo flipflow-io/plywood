@@ -58,36 +58,52 @@ function buildTurniloShape() {
     );
 }
 
+// The staging view lives in Postgres: declared as such (engine override +
+// requester) so the plan is the JS-join this file describes. A same-engine
+// lookup would take the native JOIN since 0.51.10.
+function withStagingRequesters(ext) {
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester = () => {
+      throw new Error('postgres requester must not run in simulate');
+    };
+  }
+  return ext;
+}
+
 function makeMainTimeAttributeOnly() {
-  return External.fromJS({
-    engine: 'druidsql',
-    source: 'histories',
-    timeAttribute: 'time', // ← declared HERE only
-    attributes: [
-      // 'time' is intentionally NOT listed — this mirrors what Druid SQL
-      // introspect emits for a real cube. The bug lives in the gap.
-      { name: 'brand', type: 'STRING' },
-      { name: 'productName', type: 'STRING' },
-      { name: 'price', type: 'NUMBER', unsplitable: true },
-    ],
-    linkedSources: {
-      magic_headphone_form: {
-        // staging-fresh shape: PostgresExternal-backed view, joins on
-        // productName, classifies into a small enum. timeAlignment
-        // omitted — the staging view has no __time column. That part
-        // is correct; the bug is on the OTHER side (main).
-        source: 'magic_staging_headphone_form_rev1',
-        joinKeys: ['productName'],
-        autoInjectJoinKeys: ['productName'],
-        sharedDimensions: ['productName'],
-        joinMode: 'inner',
-        attributes: [
-          { name: 'productName', type: 'STRING' },
-          { name: 'headphone_form', type: 'STRING' },
-        ],
+  return withStagingRequesters(
+    External.fromJS({
+      engine: 'druidsql',
+      source: 'histories',
+      timeAttribute: 'time', // ← declared HERE only
+      attributes: [
+        // 'time' is intentionally NOT listed — this mirrors what Druid SQL
+        // introspect emits for a real cube. The bug lives in the gap.
+        { name: 'brand', type: 'STRING' },
+        { name: 'productName', type: 'STRING' },
+        { name: 'price', type: 'NUMBER', unsplitable: true },
+      ],
+      linkedSources: {
+        magic_headphone_form: {
+          // staging-fresh shape: PostgresExternal-backed view, joins on
+          // productName, classifies into a small enum. timeAlignment
+          // omitted — the staging view has no __time column. That part
+          // is correct; the bug is on the OTHER side (main).
+          source: 'magic_staging_headphone_form_rev1',
+          joinKeys: ['productName'],
+          autoInjectJoinKeys: ['productName'],
+          sharedDimensions: ['productName'],
+          joinMode: 'inner',
+          engine: 'postgres',
+          version: '16.0.0',
+          attributes: [
+            { name: 'productName', type: 'STRING' },
+            { name: 'headphone_form', type: 'STRING' },
+          ],
+        },
       },
-    },
-  });
+    }),
+  );
 }
 
 const timeFilter = $('time').overlap({
@@ -100,7 +116,10 @@ describe('Main timeAttribute schema completeness — split on linked alias keeps
     const ex = buildTurniloShape();
 
     const plan = ex.simulateQueryPlan({ main: makeMainTimeAttributeOnly() });
-    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const queries = plan
+      .flat()
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     const mainQ = queries.find(q => q.query.includes('"histories"'));
     expect(mainQ, 'main query was emitted').to.exist;
@@ -120,7 +139,10 @@ describe('Main timeAttribute schema completeness — split on linked alias keeps
     const ex = buildTurniloShape();
 
     const plan = ex.simulateQueryPlan({ main: makeMainTimeAttributeOnly() });
-    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const queries = plan
+      .flat()
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     const linkedQ = queries.find(q => q.query.includes('magic_staging_headphone_form_rev1'));
     expect(linkedQ, 'linked query was emitted').to.exist;
@@ -145,41 +167,47 @@ describe('Main timeAttribute schema completeness — split on linked alias keeps
     // both omit timeAlignment. Cross-source decomposition must still
     // produce a main query with the time filter intact.
     function makeMainTwoMagic() {
-      return External.fromJS({
-        engine: 'druidsql',
-        source: 'histories',
-        timeAttribute: 'time',
-        attributes: [
-          { name: 'brand', type: 'STRING' },
-          { name: 'productName', type: 'STRING' },
-          { name: 'competitor', type: 'STRING' },
-          { name: 'price', type: 'NUMBER', unsplitable: true },
-        ],
-        linkedSources: {
-          magic_headphone_form: {
-            source: 'magic_staging_headphone_form_rev1',
-            joinKeys: ['productName'],
-            autoInjectJoinKeys: ['productName'],
-            sharedDimensions: ['productName'],
-            joinMode: 'inner',
-            attributes: [
-              { name: 'productName', type: 'STRING' },
-              { name: 'headphone_form', type: 'STRING' },
-            ],
+      return withStagingRequesters(
+        External.fromJS({
+          engine: 'druidsql',
+          source: 'histories',
+          timeAttribute: 'time',
+          attributes: [
+            { name: 'brand', type: 'STRING' },
+            { name: 'productName', type: 'STRING' },
+            { name: 'competitor', type: 'STRING' },
+            { name: 'price', type: 'NUMBER', unsplitable: true },
+          ],
+          linkedSources: {
+            magic_headphone_form: {
+              source: 'magic_staging_headphone_form_rev1',
+              joinKeys: ['productName'],
+              autoInjectJoinKeys: ['productName'],
+              sharedDimensions: ['productName'],
+              joinMode: 'inner',
+              engine: 'postgres',
+              version: '16.0.0',
+              attributes: [
+                { name: 'productName', type: 'STRING' },
+                { name: 'headphone_form', type: 'STRING' },
+              ],
+            },
+            magic_competitor_size: {
+              source: 'magic_staging_competitor_size_rev1',
+              joinKeys: ['competitor'],
+              autoInjectJoinKeys: ['competitor'],
+              sharedDimensions: ['competitor'],
+              joinMode: 'inner',
+              engine: 'postgres',
+              version: '16.0.0',
+              attributes: [
+                { name: 'competitor', type: 'STRING' },
+                { name: 'competitor_size', type: 'STRING' },
+              ],
+            },
           },
-          magic_competitor_size: {
-            source: 'magic_staging_competitor_size_rev1',
-            joinKeys: ['competitor'],
-            autoInjectJoinKeys: ['competitor'],
-            sharedDimensions: ['competitor'],
-            joinMode: 'inner',
-            attributes: [
-              { name: 'competitor', type: 'STRING' },
-              { name: 'competitor_size', type: 'STRING' },
-            ],
-          },
-        },
-      });
+        }),
+      );
     }
 
     const ex = ply()
@@ -194,7 +222,10 @@ describe('Main timeAttribute schema completeness — split on linked alias keeps
       );
 
     const plan = ex.simulateQueryPlan({ main: makeMainTwoMagic() });
-    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const queries = plan
+      .flat()
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     const mainQ = queries.find(
       q => q.query.includes('"histories"') && !q.query.includes('magic_staging'),

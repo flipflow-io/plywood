@@ -155,19 +155,24 @@ describe('Cross-source mixed-engine — canonical Druid lookup + Postgres stagin
     expect(crossExt.mainExternal.engine, 'main external stays druidsql').to.equal('druidsql');
   });
 
-  it('canonical linkedSource (no override) inherits the main engine — counterfactual for the override', () => {
+  it('canonical linkedSource (no override) inherits the main engine — and so joins natively in ONE Druid SQL', () => {
     const main = makeMainMixed({ injectStagingRequester: true });
     const splitExt = buildSplitExt(main, '$brand_tier');
     const crossExt = splitExt.getCrossExternalDecomposition();
     expect(crossExt).to.not.be.null;
 
-    const canon = (crossExt.linkedExternals || []).find(le => le.name === 'lookup_canon');
-    expect(canon, 'lookup_canon linkedExternal present').to.exist;
-    // No engine override → inherits main's druidsql engine + requester.
-    expect(canon.external.engine, 'canonical lookup inherits druidsql').to.equal('druidsql');
-    expect(canon.external.source, 'canonical lookup targets its Druid lookup table').to.equal(
+    // No engine override → same engine as main → the native JOIN is the plan
+    // (0.51.10): one statement over main's requester, the canonical lookup
+    // table joined in-engine. The staging view is not involved in this split.
+    expect(crossExt.kind, 'same-engine canonical lookup → nativeJoin').to.equal('nativeJoin');
+    expect(crossExt.nativeJoin.linkedSource, 'targets its Druid lookup table').to.equal(
       'lookup_canon_rev1',
     );
+    expect(crossExt.nativeJoin.sql).to.match(/INNER JOIN "lookup_canon_rev1" AS lookup/);
+    expect(crossExt.nativeJoin.sql, 'the staging view never enters this SQL').to.not.include(
+      STAGING_SOURCE,
+    );
+    expect(crossExt.mainExternal.engine, 'dispatched through main (druidsql)').to.equal('druidsql');
   });
 
   it('FAIL-LOUD: engine override declared without a requester throws (never inherits the wrong store)', () => {

@@ -48,12 +48,18 @@ function mkMain(filterExpr) {
   });
 }
 
+// The lookup is a same-engine Druid datasource, so since 0.51.10 the split
+// is ONE native-JOIN SQL: the lookup appears as the `lookup` alias inside the
+// combined statement. "Nothing leaks to the lookup" therefore means: no
+// main-only column is ever qualified to `lookup.`, and no clause collapses to
+// FALSE — the main-only clauses stay on the `main` alias.
 function linkedQueries(plan) {
   return plan
     .flat()
     .map(q => (typeof q === 'string' ? q : q && q.query))
     .filter(q => typeof q === 'string' && q.includes('lookup_cc_rev1'));
 }
+const LEAK = /lookup\."(url|price)"/;
 
 function splitByCountry() {
   return ply()
@@ -79,8 +85,9 @@ describe('Cross-source: negated cube filter prunes to identity on the linked sid
     expect(linked.length, 'lookup sub-query emitted').to.be.greaterThan(0);
     for (const q of linked) {
       expect(q, `lookup SQL must not be emptied:\n${q}`).to.not.match(/WHERE\s+FALSE/i);
-      expect(q, `main-only columns must not leak into lookup SQL:\n${q}`).to.not.match(
-        /"url"|"price"/,
+      expect(q, `main-only columns must not leak into lookup SQL:\n${q}`).to.not.match(LEAK);
+      expect(q, 'the lookup joins in one statement').to.match(
+        /INNER JOIN "lookup_cc_rev1" AS lookup/,
       );
     }
   });
@@ -97,7 +104,7 @@ describe('Cross-source: negated cube filter prunes to identity on the linked sid
     const filter = r(0).lessThan($('price')).toJS();
     const plan = splitByCountry().simulateQueryPlan({ main: mkMain(filter) });
     for (const q of linkedQueries(plan)) {
-      expect(q).to.not.match(/"price"/);
+      expect(q).to.not.match(LEAK);
       expect(q).to.not.match(/WHERE\s+FALSE/i);
     }
   });

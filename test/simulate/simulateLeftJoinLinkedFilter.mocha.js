@@ -142,7 +142,10 @@ function planSqls(expression) {
     .filter(q => typeof q === 'string');
 }
 const totalsSql = sqls => sqls.find(s => s.includes('"histories"') && /GROUP BY \(\)/.test(s));
-const mainSplitSql = sqls => sqls.find(s => s.includes('"histories"') && /GROUP BY 1/.test(s));
+// The OUTER `GROUP BY 1` (followed by a newline or the end) — a same-engine
+// semijoin embeds `… GROUP BY 1)` inside its IN sub-query, which is not a split.
+const mainSplitSql = sqls =>
+  sqls.find(s => s.includes('"histories"') && /GROUP BY 1(?!\))/.test(s));
 const mappingSql = sqls => sqls.find(s => s.includes('mapping_view_4df31318'));
 const lookupSql = sqls => sqls.find(s => s.includes('lookup_c717fdfa_rev1'));
 
@@ -170,6 +173,12 @@ describe('linkedFilterRejectsOrphans', () => {
     ],
     ['not', $('generated_image').is(lit(IMG)).not(), false],
     ['is null', $('generated_image').is(lit(null)), false],
+    // "has a value in the mapping": NOT(col IS NULL) rejects exactly the orphans.
+    ['isnt null', $('generated_image').isnt(lit(null)), true],
+    ['not(is null), literal first', lit(null).is($('generated_image')).not(), true],
+    ['isnt null and a main clause', TIME.and($('generated_image').isnt(lit(null))), true],
+    ['isnt null on a main column', $('productName').isnt(lit(null)), false],
+    ['not(isnt null) keeps the orphans', $('generated_image').isnt(lit(null)).not(), false],
     [
       'set containing null',
       $('generated_image').overlap(
@@ -320,13 +329,18 @@ describe('LEFT-joined mapping dimension: filter on the linked-only column', () =
   });
 
   describe('no linked filter — inert', () => {
-    it('the left join keeps orphan rows and the mapping view is scanned without WHERE', async () => {
+    it('the left join keeps orphan rows and the mapping view is fetched for the result keys only', async () => {
       const ex = query(TIME, {
         productName: $('productName'),
         generated_image: $('generated_image'),
       });
       const sqls = planSqls(ex);
-      expect(mappingSql(sqls)).to.not.match(/WHERE/);
+      // Enrichment by result keys (0.51.10): the mapped column is only
+      // displayed, so main runs first and the Postgres view is asked for the
+      // result's image URLs — `WHERE "imageUrl" IN (…)` — not scanned whole.
+      // No linked clause reaches the view and the totals stay unrestricted.
+      expect(mappingSql(sqls)).to.match(/WHERE \("imageUrl" (IN \(|IS NOT DISTINCT FROM )/);
+      expect(mappingSql(sqls)).to.not.match(/"generated_image"\s*(=|IN |IS NOT DISTINCT)/);
       expect(totalsSql(sqls)).to.not.match(/"imageUrl"/);
       const druid = promiseFnToStream(rq => {
         const sql = sqlOf(rq);
@@ -355,9 +369,17 @@ describe('INNER magic dimension: filter and split on the same linked column', ()
     const ex = query(TIME.and($('tienda').is(lit('Farmacia'))), { tienda: $('tienda') });
     const sqls = planSqls(ex);
     expect(lookupSql(sqls), 'lookup filtered').to.include('Farmacia');
-    expect(totalsSql(sqls), 'totals restricted by competitor IN-list').to.match(/"competitor"/);
-    expect(mainSplitSql(sqls), 'main leaves are joined, not IN-listed twice').to.not.match(
-      /WHERE[\s\S]*"competitor"\s*(=|IN)/,
+    // Same-engine magic lookup: the totals restriction is an IN sub-query the
+    // engine resolves itself (no key list through plywood).
+    expect(totalsSql(sqls), 'totals restricted by a competitor IN sub-query').to.match(
+      /"competitor" IN \(SELECT "competitor"[\s\S]*"lookup_c717fdfa_rev1"[\s\S]*'Farmacia'/,
     );
+    // …and the split by the linked column is ONE native JOIN, not a second
+    // IN-list on the main leaves.
+    const split = mainSplitSql(sqls);
+    expect(split, 'split is the native JOIN').to.match(
+      /INNER JOIN "lookup_c717fdfa_rev1" AS lookup/,
+    );
+    expect(split).to.not.match(/WHERE[\s\S]*"competitor"\s*IN/);
   });
 });

@@ -44,6 +44,8 @@ const { expect } = require('chai');
 const { PassThrough } = require('readable-stream');
 
 const plywood = require('../plywood');
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
 
 const { External, $, ply } = plywood;
 
@@ -74,8 +76,13 @@ const timeFilter = $('__time').overlap({
 // Main cube + eternal magic-dim lookup. NOTE the lookup carries its OWN `__time`
 // attribute (a snapshot sentinel) — that overlap with main's `timeAttribute` is
 // exactly what tripped the ambiguity guard before the fix.
+// Since plywood 0.51.10 a linked source in main's OWN engine (a materialised
+// Druid datasource) is joined natively in one SQL for every shape. The
+// in-memory JS-join this file exercises is now the CROSS-ENGINE plan — a
+// Postgres staging view under a Druid main — so the fixture declares the
+// lookup on Postgres and hands it the same mock requester.
 function makeMain(requester) {
-  return External.fromJS(
+  const ext = External.fromJS(
     {
       engine: 'druidsql',
       source: 'histories_main',
@@ -97,6 +104,8 @@ function makeMain(requester) {
           sharedDimensions: ['brand'],
           joinMode: 'inner',
           timeAlignment: 'eternal',
+          engine: 'postgres',
+          version: '16.0.0',
           attributes: [
             { name: '__time', type: 'TIME' },
             { name: 'brand', type: 'STRING' },
@@ -107,6 +116,14 @@ function makeMain(requester) {
     },
     requester,
   );
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 const MAGIC = 'magic_d01f07da-1111-2222-3333-444455556666';
@@ -132,7 +149,8 @@ function planSql(expr) {
   return expr
     .simulateQueryPlan({ main: makeMain() })
     .flat()
-    .filter(q => typeof q.query === 'string')
+    .map(q => (typeof q === 'string' ? { query: q } : q))
+    .filter(q => q && typeof q.query === 'string')
     .map(q => q.query);
 }
 
@@ -182,7 +200,7 @@ describe('Time-bucket split + magic-dimension (eternal linked source)', () => {
       // Lookup query is TIME-FREE (eternal prune): no WHERE FALSE, no __time clause.
       expect(lookupSql, 'lookup has no WHERE FALSE').to.not.match(/WHERE\s+FALSE/i);
       expect(lookupSql, 'lookup does not filter on __time').to.not.match(/"__time"/);
-      expect(lookupSql, 'lookup projects join key').to.match(/"brand" AS "__join_brand"/);
+      expect(lookupSql, 'lookup projects join key').to.match(/"brand"(::text)? AS "__join_brand"/);
 
       // No mutilated SELECT anywhere.
       for (const sql of sqls) {
@@ -208,7 +226,7 @@ describe('Time-bucket split + magic-dimension (eternal linked source)', () => {
 
     function reqUnequalCounts() {
       return promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_d01f07da_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -282,7 +300,7 @@ describe('Time-bucket split + magic-dimension (eternal linked source)', () => {
       //     weighted = 200/101 = 1.98019…  (media-de-medias would be 50.5)
       const DAY1b = new Date('2026-05-01T00:00:00Z');
       const req = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_d01f07da_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -316,7 +334,7 @@ describe('Time-bucket split + magic-dimension (eternal linked source)', () => {
     it('count over the double split does not throw and re-aggregates per cell', async () => {
       const DAY1 = new Date('2026-05-01T00:00:00Z');
       const req = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_d01f07da_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -397,6 +415,10 @@ describe('Time-bucket split + magic-dimension (eternal linked source)', () => {
             sharedDimensions: ['brand'], // competitor deliberately NOT shared
             joinMode: 'inner',
             timeAlignment: 'eternal',
+            // cross-engine: the guard belongs to the JS-join classifier; a same-
+            // engine lookup joins natively and groups by main's own column.
+            engine: 'postgres',
+            version: '16.0.0',
             attributes: [
               { name: '__time', type: 'TIME' },
               { name: 'brand', type: 'STRING' },
@@ -406,6 +428,9 @@ describe('Time-bucket split + magic-dimension (eternal linked source)', () => {
           },
         },
       });
+      mainAmbig.linkedSources[MAGIC].requester = () => {
+        throw new Error('postgres requester must not run in simulate');
+      };
       let split = $('main').split({
         brand_country: '$brand_country',
         competitor: '$competitor',

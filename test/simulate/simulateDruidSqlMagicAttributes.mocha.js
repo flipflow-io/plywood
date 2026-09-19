@@ -23,6 +23,24 @@ const { PassThrough } = require('readable-stream');
 
 const plywood = require('../plywood');
 
+// Since plywood 0.51.10 a lookup in main's OWN engine (a Druid datasource) is
+// joined natively in ONE SQL for every shape. The two-query decomposition this
+// file exercises (main + lookup, joined in memory) is now the CROSS-ENGINE
+// plan — a Postgres staging view under a Druid main — so every fixture here
+// declares the lookup on Postgres and hands it the same mock requester.
+const withPg = (ext, requester) => {
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
+};
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
+
 const { Expression, External, $ } = plywood;
 
 /**
@@ -62,34 +80,38 @@ const timeFilter = $('__time').overlap({
  * derivedAttribute alias.
  */
 const makeMainWithDerivedAttrLookup = () =>
-  External.fromJS({
-    engine: 'druidsql',
-    source: 'histories-42f0bec',
-    timeAttribute: '__time',
-    attributes: [
-      { name: '__time', type: 'TIME' },
-      { name: 'brand', type: 'STRING' },
-      { name: 'price', type: 'NUMBER', unsplitable: true },
-      { name: 'pvp', type: 'NUMBER', unsplitable: true },
-    ],
-    linkedSources: {
-      magic_abc: {
-        source: 'lookup_abc_rev1',
-        joinKeys: ['brand'],
-        sharedDimensions: ['brand'],
-        joinMode: 'inner',
-        attributes: [
-          { name: '__time', type: 'TIME' },
-          { name: 'brand', type: 'STRING' },
-          { name: 'category', type: 'STRING' },
-        ],
-        derivedAttributes: {
-          brand_tier: '$category',
+  withPg(
+    External.fromJS({
+      engine: 'druidsql',
+      source: 'histories-42f0bec',
+      timeAttribute: '__time',
+      attributes: [
+        { name: '__time', type: 'TIME' },
+        { name: 'brand', type: 'STRING' },
+        { name: 'price', type: 'NUMBER', unsplitable: true },
+        { name: 'pvp', type: 'NUMBER', unsplitable: true },
+      ],
+      linkedSources: {
+        magic_abc: {
+          source: 'lookup_abc_rev1',
+          joinKeys: ['brand'],
+          sharedDimensions: ['brand'],
+          joinMode: 'inner',
+          engine: 'postgres',
+          version: '16.0.0',
+          attributes: [
+            { name: '__time', type: 'TIME' },
+            { name: 'brand', type: 'STRING' },
+            { name: 'category', type: 'STRING' },
+          ],
+          derivedAttributes: {
+            brand_tier: '$category',
+          },
         },
       },
-    },
-    filter: timeFilter,
-  });
+      filter: timeFilter,
+    }),
+  );
 
 /**
  * Plan-B reconciler output: the MSQ INSERT names the output column
@@ -98,32 +120,36 @@ const makeMainWithDerivedAttrLookup = () =>
  * attribute. No derivedAttribute indirection.
  */
 const makeMainWithRawAttrLookup = () =>
-  External.fromJS({
-    engine: 'druidsql',
-    source: 'histories-42f0bec',
-    timeAttribute: '__time',
-    attributes: [
-      { name: '__time', type: 'TIME' },
-      { name: 'brand', type: 'STRING' },
-      { name: 'price', type: 'NUMBER', unsplitable: true },
-      { name: 'pvp', type: 'NUMBER', unsplitable: true },
-    ],
-    linkedSources: {
-      magic_abc: {
-        source: 'lookup_abc_rev1',
-        joinKeys: ['brand'],
-        sharedDimensions: ['brand'],
-        joinMode: 'inner',
-        attributes: [
-          { name: '__time', type: 'TIME' },
-          { name: 'brand', type: 'STRING' },
-          { name: 'brand_tier', type: 'STRING' },
-          { name: 'confidence', type: 'NUMBER' },
-        ],
+  withPg(
+    External.fromJS({
+      engine: 'druidsql',
+      source: 'histories-42f0bec',
+      timeAttribute: '__time',
+      attributes: [
+        { name: '__time', type: 'TIME' },
+        { name: 'brand', type: 'STRING' },
+        { name: 'price', type: 'NUMBER', unsplitable: true },
+        { name: 'pvp', type: 'NUMBER', unsplitable: true },
+      ],
+      linkedSources: {
+        magic_abc: {
+          source: 'lookup_abc_rev1',
+          joinKeys: ['brand'],
+          sharedDimensions: ['brand'],
+          joinMode: 'inner',
+          engine: 'postgres',
+          version: '16.0.0',
+          attributes: [
+            { name: '__time', type: 'TIME' },
+            { name: 'brand', type: 'STRING' },
+            { name: 'brand_tier', type: 'STRING' },
+            { name: 'confidence', type: 'NUMBER' },
+          ],
+        },
       },
-    },
-    filter: timeFilter,
-  });
+      filter: timeFilter,
+    }),
+  );
 
 describe('External decomposition — magic-attribute dim-only shape', () => {
   // Green control on the pre-Plan-B fixture. Split by a raw linked
@@ -133,7 +159,10 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const ex = $('main').split('$category', 'category').apply('AvgPrice', '$main.average($price)');
 
     const plan = ex.simulateQueryPlan({ main: makeMainWithDerivedAttrLookup() });
-    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const queries = plan
+      .flat()
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     const mainQueries = queries.filter(
       q => q.query.includes('"histories-42f0bec"') && !q.query.includes('lookup_abc_rev1'),
@@ -154,7 +183,10 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       .apply('AvgPrice', '$main.average($price)');
 
     const plan = ex.simulateQueryPlan({ main: makeMainWithRawAttrLookup() });
-    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const queries = plan
+      .flat()
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     const mainQueries = queries.filter(
       q => q.query.includes('"histories-42f0bec"') && !q.query.includes('lookup_abc_rev1'),
@@ -173,7 +205,10 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const ex = $('main').split('$brand', 'Brand').apply('AvgPrice', '$main.average($price)');
 
     const plan = ex.simulateQueryPlan({ main: makeMainWithRawAttrLookup() });
-    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const queries = plan
+      .flat()
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     expect(queries).to.have.length(1);
     expect(queries[0].query).to.include('"histories-42f0bec"');
@@ -217,7 +252,10 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       );
 
     const plan = ex.simulateQueryPlan({ main: makeMainWithRawAttrLookup() });
-    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const queries = plan
+      .flat()
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     const mainQueries = queries.filter(
       q => q.query.includes('"histories-42f0bec"') && !q.query.includes('lookup_abc_rev1'),
@@ -365,7 +403,10 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
 
     const ex = Expression.fromJS(applyChain);
     const plan = ex.simulateQueryPlan({ main: makeMainWithRawAttrLookup() });
-    const queries = plan.flat().filter(q => typeof q.query === 'string');
+    const queries = plan
+      .flat()
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     const mainQueries = queries.filter(
       q => q.query.includes('"histories-42f0bec"') && !q.query.includes('lookup_abc_rev1'),
@@ -390,7 +431,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const dispatched = [];
     const requester = promiseFnToStream(rq => {
       dispatched.push(rq);
-      const sql = (rq && rq.query && rq.query.query) || '';
+      const sql = sqlOf(rq);
       // Return a single row per query so plywood can assemble a
       // Dataset — the row shape must carry the SELECT columns.
       if (sql.includes('"lookup_abc_rev1"')) {
@@ -419,6 +460,8 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
           joinKeys: ['brand'],
           sharedDimensions: ['brand'],
           joinMode: 'inner',
+          engine: 'postgres',
+          version: '16.0.0',
           attributes: [
             { name: '__time', type: 'TIME' },
             { name: 'brand', type: 'STRING' },
@@ -427,7 +470,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
         },
       },
     };
-    const main = External.fromJS(mainValue, requester);
+    const main = withPg(External.fromJS(mainValue, requester), requester);
 
     const ex = $('main')
       .filter(
@@ -442,7 +485,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
 
     await ex.compute({ main });
 
-    const sqls = dispatched.map(rq => (rq && rq.query && rq.query.query) || '');
+    const sqls = dispatched.map(rq => sqlOf(rq));
     const mainSql = sqls.filter(
       q => q.includes('"histories-42f0bec"') && !q.includes('lookup_abc_rev1'),
     );
@@ -461,7 +504,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const dispatched = [];
     const requester = promiseFnToStream(rq => {
       dispatched.push(rq);
-      const sql = (rq && rq.query && rq.query.query) || '';
+      const sql = sqlOf(rq);
       if (sql.includes('"lookup_abc_rev1"')) {
         return Promise.resolve([{ __join_brand: 'Jbl', brand_tier: 'premium' }]);
       }
@@ -496,6 +539,8 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
             joinKeys: ['brand'],
             sharedDimensions: ['brand'],
             joinMode: 'inner',
+            engine: 'postgres',
+            version: '16.0.0',
             attributes: [
               { name: '__time', type: 'TIME' },
               { name: 'brand', type: 'STRING' },
@@ -506,6 +551,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       },
       requester,
     );
+    withPg(main, requester);
 
     const timeRange = {
       op: 'literal',
@@ -610,7 +656,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const ex = Expression.fromJS(applyChain);
     await ex.compute({ main });
 
-    const sqls = dispatched.map(rq => (rq && rq.query && rq.query.query) || '');
+    const sqls = dispatched.map(rq => sqlOf(rq));
     const mainSql = sqls.filter(
       q => q.includes('"histories-42f0bec"') && !q.includes('lookup_abc_rev1'),
     );
@@ -630,7 +676,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const dispatched = [];
     const requester = promiseFnToStream(rq => {
       dispatched.push(rq);
-      const sql = (rq && rq.query && rq.query.query) || '';
+      const sql = sqlOf(rq);
       if (sql.includes('"lookup_abc_rev1"')) {
         return Promise.resolve([
           { __join_brand: 'Jbl', brand_tier: 'premium' },
@@ -666,6 +712,8 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
             joinKeys: ['brand'],
             sharedDimensions: ['brand'],
             joinMode: 'inner',
+            engine: 'postgres',
+            version: '16.0.0',
             attributes: [
               { name: '__time', type: 'TIME' },
               { name: 'brand', type: 'STRING' },
@@ -677,6 +725,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       },
       requester,
     );
+    withPg(main, requester);
 
     // EXACT curl body shape (stream=false), simplified (1 measure).
     const body = {
@@ -732,7 +781,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const ex = Expression.fromJS(body);
     const result = await ex.compute({ main });
 
-    const sqls = dispatched.map(rq => (rq && rq.query && rq.query.query) || '');
+    const sqls = dispatched.map(rq => sqlOf(rq));
     const mainSql = sqls.filter(
       q => q.includes('"histories-42f0bec"') && !q.includes('lookup_abc_rev1'),
     );
@@ -781,31 +830,35 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
   // ───────────────────────────────────────────────────────────────────────
 
   const makeMainWithTimeAlignment = alignment =>
-    External.fromJS({
-      engine: 'druidsql',
-      source: 'histories-42f0bec',
-      timeAttribute: '__time',
-      attributes: [
-        { name: '__time', type: 'TIME' },
-        { name: 'brand', type: 'STRING' },
-        { name: 'price', type: 'NUMBER', unsplitable: true },
-      ],
-      linkedSources: {
-        magic_abc: {
-          source: 'lookup_abc_rev1',
-          joinKeys: ['brand'],
-          sharedDimensions: ['brand'],
-          joinMode: 'inner',
-          ...(alignment !== undefined ? { timeAlignment: alignment } : {}),
-          attributes: [
-            { name: '__time', type: 'TIME' },
-            { name: 'brand', type: 'STRING' },
-            { name: 'brand_tier', type: 'STRING' },
-          ],
+    withPg(
+      External.fromJS({
+        engine: 'druidsql',
+        source: 'histories-42f0bec',
+        timeAttribute: '__time',
+        attributes: [
+          { name: '__time', type: 'TIME' },
+          { name: 'brand', type: 'STRING' },
+          { name: 'price', type: 'NUMBER', unsplitable: true },
+        ],
+        linkedSources: {
+          magic_abc: {
+            source: 'lookup_abc_rev1',
+            joinKeys: ['brand'],
+            sharedDimensions: ['brand'],
+            joinMode: 'inner',
+            engine: 'postgres',
+            version: '16.0.0',
+            ...(alignment !== undefined ? { timeAlignment: alignment } : {}),
+            attributes: [
+              { name: '__time', type: 'TIME' },
+              { name: 'brand', type: 'STRING' },
+              { name: 'brand_tier', type: 'STRING' },
+            ],
+          },
         },
-      },
-      filter: timeFilter,
-    });
+        filter: timeFilter,
+      }),
+    );
 
   it('[timeAlignment=bucketed default] lookup SQL carries main time filter', () => {
     const ex = $('main')
@@ -815,7 +868,8 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const queries = ex
       .simulateQueryPlan({ main: makeMainWithTimeAlignment(undefined) })
       .flat()
-      .filter(q => typeof q.query === 'string');
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     const linked = queries.filter(q => q.query.includes('"lookup_abc_rev1"'));
     expect(linked, 'lookup query dispatched').to.have.length(1);
@@ -832,7 +886,8 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const queries = ex
       .simulateQueryPlan({ main: makeMainWithTimeAlignment('eternal') })
       .flat()
-      .filter(q => typeof q.query === 'string');
+      .map(q => (typeof q === 'string' ? { query: q } : q))
+      .filter(q => q && typeof q.query === 'string');
 
     const mainQ = queries.filter(
       q => q.query.includes('"histories-42f0bec"') && !q.query.includes('lookup_abc_rev1'),
@@ -854,7 +909,7 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
     const dispatched = [];
     const requester = promiseFnToStream(rq => {
       dispatched.push(rq);
-      const sql = (rq && rq.query && rq.query.query) || '';
+      const sql = sqlOf(rq);
       if (sql.includes('"lookup_abc_rev1"')) {
         // Simulates the MSQ-materialised snapshot at 1970. The rows
         // carry no time bound so they'd be filtered out under
@@ -898,6 +953,8 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
             joinKeys: ['brand'],
             sharedDimensions: ['brand'],
             joinMode: 'inner',
+            engine: 'postgres',
+            version: '16.0.0',
             timeAlignment: 'eternal',
             attributes: [
               { name: '__time', type: 'TIME' },
@@ -910,13 +967,14 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       },
       requester,
     );
+    withPg(main, requester);
 
     const ex = $('main')
       .split('$brand_tier', 'brand_tier')
       .apply('AvgPrice', '$main.average($price)');
 
     const result = await ex.compute({ main });
-    const sqls = dispatched.map(rq => (rq && rq.query && rq.query.query) || '');
+    const sqls = dispatched.map(rq => sqlOf(rq));
     const linkedSql = sqls.find(q => q.includes('"lookup_abc_rev1"')) || '';
     expect(linkedSql, 'lookup dispatched without __time').to.not.match(/"__time"/);
 
@@ -963,6 +1021,8 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
             joinKeys: ['brand'],
             sharedDimensions: ['brand'],
             joinMode: 'inner',
+            engine: 'postgres',
+            version: '16.0.0',
             timeAlignment: 'bucketed',
             attributes: [
               { name: '__time', type: 'TIME' },
@@ -975,13 +1035,14 @@ describe('External decomposition — magic-attribute dim-only shape', () => {
       },
       requester,
     );
+    withPg(main, requester);
 
     const ex = $('main')
       .split('$brand_tier', 'brand_tier')
       .apply('AvgPrice', '$main.average($price)');
 
     await ex.compute({ main });
-    const sqls = dispatched.map(rq => (rq && rq.query && rq.query.query) || '');
+    const sqls = dispatched.map(rq => sqlOf(rq));
     const linked = sqls.find(q => q.includes('"lookup_abc_rev1"')) || '';
     expect(linked, 'explicit bucketed carries time filter').to.match(/"__time"/);
     expect(linked).to.match(/2026-04-22/);

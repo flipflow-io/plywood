@@ -40,6 +40,8 @@ const { expect } = require('chai');
 const { PassThrough } = require('readable-stream');
 
 const plywood = require('../plywood');
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
 
 const { External, $, ply } = plywood;
 
@@ -66,8 +68,13 @@ const timeFilter = $('__time').overlap({
   end: new Date('2026-05-02T00:00:00Z'),
 });
 
-function makeMain(requester) {
-  return External.fromJS(
+// Since plywood 0.51.10 a linked source in main's OWN engine (a materialised
+// Druid datasource) is joined natively in one SQL for every shape. The
+// in-memory JS-join this file exercises is now the CROSS-ENGINE plan — a
+// Postgres staging view under a Druid main — so the fixture declares the
+// lookup on Postgres and hands it the same mock requester.
+function makeMain(requester, opts = {}) {
+  const ext = External.fromJS(
     {
       engine: 'druidsql',
       source: 'main_ds',
@@ -86,6 +93,7 @@ function makeMain(requester) {
           sharedDimensions: ['brand'],
           joinMode: 'inner',
           timeAlignment: 'eternal',
+          ...(opts.sameEngine ? {} : { engine: 'postgres', version: '16.0.0' }),
           backing: { phase: 'canonical' },
           attributes: [
             { name: 'brand', type: 'STRING' },
@@ -97,6 +105,15 @@ function makeMain(requester) {
     },
     requester,
   );
+  for (const name in ext.linkedSources) {
+    if (opts.sameEngine) break;
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 // Build the Turnilo-style top-level expression: scope registrations + a SPLIT
@@ -111,11 +128,12 @@ function buildSplitExpr(valueApplies, sortName) {
     .apply('SPLIT', split);
 }
 
-function planSql(valueApplies, sortName) {
+function planSql(valueApplies, sortName, opts) {
   const queries = buildSplitExpr(valueApplies, sortName)
-    .simulateQueryPlan({ main: makeMain() })
+    .simulateQueryPlan({ main: makeMain(undefined, opts) })
     .flat()
-    .filter(q => typeof q.query === 'string');
+    .map(q => (typeof q === 'string' ? { query: q } : q))
+    .filter(q => q && typeof q.query === 'string');
   return queries.map(q => q.query);
 }
 
@@ -206,7 +224,10 @@ describe('Cross-source AVG + magic-dimension split (segregate-then-recombine)', 
     });
 
     it('countDistinct over a linked-only split STILL routes to native-JOIN (single well-formed SQL)', () => {
-      const sqls = planSql([['uniq', '$main.countDistinct($brand)']]);
+      // Same-engine lookup: the native JOIN is available (and mandatory here).
+      const sqls = planSql([['uniq', '$main.countDistinct($brand)']], undefined, {
+        sameEngine: true,
+      });
       expect(sqls.length, 'single combined SQL').to.equal(1);
       const sql = sqls[0];
       expect(sql, 'INNER JOIN').to.match(/INNER JOIN/i);
@@ -225,7 +246,7 @@ describe('Cross-source AVG + magic-dimension split (segregate-then-recombine)', 
     //   min: B1=1 B2=5 → Spain min 1 ; B3=7 → France min 7
     function reqWithLeaves() {
       return promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -281,7 +302,7 @@ describe('Cross-source AVG + magic-dimension split (segregate-then-recombine)', 
       // avg(pvp): B1 sum=200 count=100 (avg 2), B2 sum=200 count=1 (avg 200);
       // weighted = (200+200)/(100+1)=400/101=3.96039. RP_Spain=1.98019/3.96039=0.5.
       const req = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_bc_rev1')) {
           return Promise.resolve([
             { __join_brand: 'B1', brand_country: 'Spain' },
@@ -330,10 +351,14 @@ describe('Cross-source AVG + magic-dimension split (segregate-then-recombine)', 
       // rewritten form. The native-JOIN path now receives ORIGINAL applies, so
       // the public guarantee is: every emitted native-JOIN query projects a
       // column for every value apply (none silently dropped).
-      const sqls = planSql([
-        ['avg_price', '$main.average($price)'],
-        ['uniq', '$main.countDistinct($brand)'],
-      ]);
+      const sqls = planSql(
+        [
+          ['avg_price', '$main.average($price)'],
+          ['uniq', '$main.countDistinct($brand)'],
+        ],
+        undefined,
+        { sameEngine: true },
+      );
       // countDistinct forces native-JOIN; avg must render as AVG (original
       // form), NOT be dropped.
       expect(sqls.length, 'single native-JOIN SQL').to.equal(1);
@@ -364,9 +389,10 @@ describe('Cross-source AVG + magic-dimension split (segregate-then-recombine)', 
         .apply('magic_bc', $('magic_bc').filter(timeFilter))
         .apply('SPLIT', split);
       const sqls = ex
-        .simulateQueryPlan({ main: makeMain() })
+        .simulateQueryPlan({ main: makeMain(undefined, { sameEngine: true }) })
         .flat()
-        .filter(q => typeof q.query === 'string')
+        .map(q => (typeof q === 'string' ? { query: q } : q))
+        .filter(q => q && typeof q.query === 'string')
         .map(q => q.query);
       const mainSql = sqls.find(s => s.includes('"main_ds"') && !s.includes('lookup_bc_rev1'));
       expect(mainSql, 'main sub-query exists').to.exist;

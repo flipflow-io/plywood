@@ -191,18 +191,21 @@ describe('FIXED — TOTALS row + linked-only magic-dim filter + countDistinct', 
       expect(lookup, 'lookup projects the joinKey (brand)').to.match(/"brand"/);
     });
 
-    it('the totals main carries an IN-list on the joinKey (brand), no JOIN', () => {
+    it('the totals main carries an IN sub-query on the joinKey (brand), no JOIN', () => {
+      // Same-engine lookup (0.51.10): the DISTINCT-brand lookup query rides
+      // INSIDE main's WHERE as `"brand" IN (SELECT …)` — one statement, the
+      // engine performs the semijoin; brand_country appears only in there.
       const sqls = planSql(FRANCIA);
       const totals = sqls.find(s => /COUNT\(DISTINCT/i.test(s));
       expect(totals, 'COUNT(DISTINCT) query exists').to.exist;
       expect(totals, 'totals grouping is GROUP BY ()').to.match(/GROUP BY \(\)/);
-      // The semijoin is an IN-list on main — NOT an in-SQL JOIN (that is the
-      // split-path native-JOIN shape). The totals main references the joinKey.
       expect(totals, 'no INNER JOIN against the lookup').to.not.match(/INNER JOIN/i);
-      expect(totals, 'totals main restricts on the joinKey "brand"').to.match(/"brand"/);
-      // The linked-only column never leaks into the main SQL (it lives only on
-      // the lookup; the semijoin folds it into a brand IN-list).
-      expect(totals, 'no brand_country in the totals main SQL').to.not.match(/brand_country/i);
+      expect(totals, 'totals main restricts on the joinKey via a sub-query').to.match(
+        /"brand" IN \(SELECT "brand"[\s\S]*"lookup_bc_rev1"/,
+      );
+      const outer = totals.slice(0, totals.indexOf('IN (SELECT'));
+      expect(outer, 'no brand_country outside the sub-query').to.not.match(/brand_country/i);
+      expect(sqls.length, 'one statement, no separate lookup round-trip').to.equal(1);
     });
 
     it('ORTHOGONALITY — the no-filter totals SQL is UNCHANGED (no lookup, no IN-list)', () => {
@@ -235,11 +238,13 @@ describe('FIXED — TOTALS row + linked-only magic-dim filter + countDistinct', 
     function honestRequester() {
       return promiseFnToStream(rq => {
         const sql = (rq && rq.query && rq.query.query) || '';
-        // The lookup DISTINCT-brand sub-query: return the Francia brand set.
-        if (/lookup_bc_rev1/i.test(sql)) {
-          return Promise.resolve([{ brand: 'B_FR' }]);
+        // The totals statement embeds the lookup as an IN sub-query, so test
+        // for the aggregate FIRST; a bare lookup DISTINCT-brand query (the
+        // cross-engine IN-list path) returns the Francia brand set.
+        if (!/COUNT\(DISTINCT/i.test(sql)) {
+          if (/lookup_bc_rev1/i.test(sql)) return Promise.resolve([{ brand: 'B_FR' }]);
+          return Promise.resolve([{ __VALUE__: 0 }]);
         }
-        if (!/COUNT\(DISTINCT/i.test(sql)) return Promise.resolve([{ __VALUE__: 0 }]);
         // The fixed main query restricts to the Francia brand set (IN-list).
         if (/"brand"\s*(=|IN)|Francia/i.test(sql)) {
           return Promise.resolve([{ __VALUE__: 864 }]); // Francia-only distinct products

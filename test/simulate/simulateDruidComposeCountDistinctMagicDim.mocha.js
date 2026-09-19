@@ -326,17 +326,23 @@ describe('Compose: countDistinct(concat) × magic-dimension split (native-JOIN r
       expect(sql, 'no synthetic leaf columns').to.not.match(/!T_\d+/);
     });
 
-    it('the SAME ratio measure ALONE (no countDistinct) composes fine via jsJoin leaves', () => {
-      // Orthogonality proof: the throw above is caused by the COMPOSITION
-      // (derived measure forced onto native-JOIN by countDistinct), NOT by the
-      // ratio being intrinsically broken. Alone, the linked-only split segregates
-      // avg/avg into SUM(price) + null-aware count(price) + SUM(pvp) + null-aware
-      // count(pvp) leaves across two sub-queries (each avg's denominator is a
-      // NULL-aware count of its averaged column, Ogievetsky BUG 1 — not COUNT(*)).
+    it('the SAME ratio measure ALONE (no countDistinct) takes the native JOIN too (same-engine lookup, 0.51.10)', () => {
+      // The lookup is a Druid datasource in main's own engine, so the native
+      // JOIN is the plan for EVERY measure, not only for countDistinct: one SQL,
+      // the ratio rendered as arithmetic over AVG() at the split grain — no
+      // leaves, no post-join recombination. (The JS-join leaf decomposition of
+      // avg/avg stays the CROSS-ENGINE plan — pinned in
+      // simulateDruidCrossSourceAvgMagicDim with a Postgres lookup.)
       const sqls = planSql([['rp', '$main.average($price) / $main.average($pvp)']]);
-      expect(sqls.length, 'jsJoin emits main + lookup sub-queries').to.equal(2);
-      const mainSql = sqls.find(s => s.includes('"main_ds"') && !s.includes('lookup_bc_rev1'));
-      expect(mainSql, 'main sub-query exists').to.exist;
+      expect(sqls.length, 'one native-JOIN SQL').to.equal(1);
+      const mainSql = sqls[0];
+      expect(mainSql, 'INNER JOIN').to.match(/INNER JOIN "lookup_bc_rev1" AS lookup/);
+      expect(mainSql, 'ratio as floatDivision of AVGs').to.match(
+        /\(AVG\(main\."price"\)\*1\.0\/AVG\(main\."pvp"\)\) AS "rp"/,
+      );
+      expect(mainSql, 'no synthetic leaf columns').to.not.match(/!T_\d+/);
+      return; // the leaf assertions below describe the cross-engine plan only
+      // eslint-disable-next-line no-unreachable
       expect(mainSql, 'SUM(price) leaf').to.match(/SUM\("price"\) AS "!T_\d+"/);
       expect(mainSql, 'no bare COUNT(*) leaf').to.not.match(/COUNT\(\*\) AS "!T_\d+"/);
       expect(mainSql, 'null-aware count of price').to.match(

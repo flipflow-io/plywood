@@ -37,8 +37,12 @@ const plywood = require('../plywood');
 
 const { External, $ } = plywood;
 
-function makeMain() {
-  return External.fromJS({
+// `crossEngine`: the lookup lives in Postgres (a staging view). Same-engine
+// (the default) models a materialised Druid datasource: since 0.51.10 every
+// linked-only split on it takes the native JOIN, whatever the measure; the
+// JS-join and its decomposability gate remain the cross-engine plan.
+function makeMain(opts = {}) {
+  const ext = External.fromJS({
     engine: 'druidsql',
     source: 'main_ds',
     timeAttribute: '__time',
@@ -56,6 +60,7 @@ function makeMain() {
         sharedDimensions: ['productName'],
         joinMode: 'inner',
         timeAlignment: 'eternal',
+        ...(opts.crossEngine ? { engine: 'postgres', version: '16.0.0' } : {}),
         attributes: [
           { name: 'productName', type: 'STRING' },
           { name: 'uso_tipico', type: 'STRING' },
@@ -67,10 +72,16 @@ function makeMain() {
       end: new Date('2026-05-02T00:00:00Z'),
     }),
   });
+  if (opts.crossEngine) {
+    ext.linkedSources.lookup_x.requester = () => {
+      throw new Error('postgres requester must not run in simulate');
+    };
+  }
+  return ext;
 }
 
-function runPlan(ex) {
-  const queries = ex.simulateQueryPlan({ main: makeMain() }).flat();
+function runPlan(ex, opts) {
+  const queries = ex.simulateQueryPlan({ main: makeMain(opts) }).flat();
   // Normalize to SQL strings — different paths wrap differently.
   const sqls = [];
   for (const q of queries) {
@@ -131,25 +142,44 @@ describe('Cross-source decomposability matrix (4 measures × 3 splits)', () => {
     // outside the matrix to keep this assertion crisp.
   ];
 
-  // For each measure + linked-only split: countDistinct + average
-  // route to nativeJoin (1 query). Sum routes to JS-join (2 queries).
+  // Same-engine lookup (a materialised Druid datasource): EVERY measure over
+  // a linked-only split routes to the native JOIN — one combined SQL. The
+  // measure's trait no longer decides the route here; it only decides whether
+  // the JS-join would ALSO have been correct (sum/avg) or not (countDistinct).
   for (const m of MEASURES) {
-    it(`linked-only split + ${m.name} → ${
-      m.trait === 'sum' ? 'JS-join (2 queries)' : 'native-JOIN (1 query)'
-    }`, () => {
+    it(`same-engine lookup: linked-only split + ${m.name} → native JOIN (1 combined query)`, () => {
       const ex = buildEx('$uso_tipico', 'uso_tipico', m.json);
       const sqls = runPlan(ex);
+      const combined = sqls.filter(s => s.includes('"main_ds"') && s.includes('"lookup_x_rev1"'));
+      expect(combined, 'one combined SQL').to.have.length(1);
+      expect(combined[0], 'has JOIN clause').to.match(/INNER\s+JOIN|LEFT\s+JOIN/i);
+      expect(
+        sqls.filter(s => s.includes('"lookup_x_rev1"') && !s.includes('"main_ds"')),
+        'no separate lookup scan',
+      ).to.have.length(0);
+    });
+  }
+
+  // Cross-engine lookup (a Postgres staging view): the gate keeps deciding.
+  // Decomposable measures (sum, avg→sum/count) take the JS-join (2 queries);
+  // a 'none'-trait measure cannot be recombined AND cannot be joined in one
+  // SQL across engines, so it fails loud instead of returning a wrong number.
+  for (const m of MEASURES) {
+    it(`cross-engine lookup: linked-only split + ${m.name} → ${
+      m.trait === 'sum' ? 'JS-join (2 queries)' : 'fails loud (no correct plan)'
+    }`, () => {
+      const ex = buildEx('$uso_tipico', 'uso_tipico', m.json);
       if (m.trait === 'sum') {
-        // JS-join: separate main + linked queries.
+        const sqls = runPlan(ex, { crossEngine: true });
         const mains = sqls.filter(s => s.includes('"main_ds"') && !s.includes('"lookup_x_rev1"'));
         const linkeds = sqls.filter(s => s.includes('"lookup_x_rev1"') && !s.includes('"main_ds"'));
         expect(mains, 'one main query').to.have.length(1);
         expect(linkeds, 'one linked query').to.have.length(1);
       } else {
-        // Native-JOIN: one combined query referencing both sources.
-        const combined = sqls.filter(s => s.includes('"main_ds"') && s.includes('"lookup_x_rev1"'));
-        expect(combined, 'one combined SQL').to.have.length(1);
-        expect(combined[0], 'has JOIN clause').to.match(/INNER\s+JOIN|LEFT\s+JOIN/i);
+        expect(() => runPlan(ex, { crossEngine: true })).to.throw(
+          plywood.PlywoodUnsupportedNativeJoinShape,
+          /cannot span two engines/,
+        );
       }
     });
   }

@@ -38,6 +38,8 @@ const { expect } = require('chai');
 const { PassThrough } = require('readable-stream');
 
 const plywood = require('../plywood');
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
 const { External, $, ply, r } = plywood;
 
 const MAGIC = 'magic_cc';
@@ -71,8 +73,13 @@ function promiseFnToStream(promiseRq) {
   };
 }
 
+// Since plywood 0.51.10 a linked source in main's OWN engine (a materialised
+// Druid datasource) is joined natively in one SQL for every shape. The
+// in-memory JS-join this file exercises is now the CROSS-ENGINE plan — a
+// Postgres staging view under a Druid main — so the fixture declares the
+// lookup on Postgres and hands it the same mock requester.
 function makeMain(requester) {
-  return External.fromJS(
+  const ext = External.fromJS(
     {
       engine: 'druidsql',
       source: 'histories_507',
@@ -94,6 +101,8 @@ function makeMain(requester) {
           sharedDimensions: ['competitor'],
           joinMode: 'inner',
           timeAlignment: 'eternal',
+          engine: 'postgres',
+          version: '16.0.0',
           attributes: [
             { name: '__time', type: 'TIME' },
             { name: 'competitor', type: 'STRING' },
@@ -104,6 +113,14 @@ function makeMain(requester) {
     },
     requester,
   );
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 function planSqls(expression) {

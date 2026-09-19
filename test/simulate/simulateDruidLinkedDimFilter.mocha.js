@@ -43,6 +43,8 @@ const { PassThrough } = require('readable-stream');
 const fs = require('fs');
 
 const plywood = require('../plywood');
+const sqlOf = rq =>
+  typeof rq.query === 'string' ? rq.query : (rq && rq.query && rq.query.query) || '';
 const { External, Expression, $, r, ply } = plywood;
 
 const WIRE = JSON.parse(
@@ -53,6 +55,10 @@ const WIRE = JSON.parse(
 const D01 = 'magic_d01f07da-6a6f-41bc-9bf0-13ddb3bdc422'; // owns brand_country, joinKey brand
 const A14 = 'magic_a14b8bf6-4f82-442f-bdc6-c0152c9eaf73'; // sibling, joinKey competitor
 
+// Since plywood 0.51.10 a lookup in main's OWN engine is joined natively in one
+// SQL; the two-query decomposition and the IN-list semijoin this file pins are
+// now the CROSS-ENGINE plan (a Postgres staging view under a Druid main), so
+// the fixture declares both lookups on Postgres with the same mock requester.
 function makeMain(requester, mainFilter, d01JoinMode) {
   const value = {
     engine: 'druidsql',
@@ -74,6 +80,8 @@ function makeMain(requester, mainFilter, d01JoinMode) {
         sharedDimensions: ['brand'],
         joinMode: d01JoinMode || 'inner',
         timeAlignment: 'eternal',
+        engine: 'postgres',
+        version: '16.0.0',
         attributes: [
           { name: '__time', type: 'TIME' },
           { name: 'brand', type: 'STRING' },
@@ -87,6 +95,8 @@ function makeMain(requester, mainFilter, d01JoinMode) {
         sharedDimensions: ['competitor'],
         joinMode: 'inner',
         timeAlignment: 'eternal',
+        engine: 'postgres',
+        version: '16.0.0',
         attributes: [
           { name: '__time', type: 'TIME' },
           { name: 'competitor', type: 'STRING' },
@@ -96,7 +106,15 @@ function makeMain(requester, mainFilter, d01JoinMode) {
     },
   };
   if (mainFilter) value.filter = mainFilter;
-  return External.fromJS(value, requester);
+  const ext = External.fromJS(value, requester);
+  for (const name in ext.linkedSources) {
+    ext.linkedSources[name].requester =
+      requester ||
+      (() => {
+        throw new Error('postgres requester must not run in simulate');
+      });
+  }
+  return ext;
 }
 
 function promiseFnToStream(promiseRq) {
@@ -174,7 +192,7 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
       // main rows are per (brand, competitor); the lookup maps brand→country.
       // If Francia is honoured, only B_FR's rows survive the inner join.
       const req = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_d01f07da_rev1')) {
           // Honest lookup: only Francia rows come back when WHERE Francia is present.
           if (/Francia/.test(sql)) {
@@ -288,7 +306,7 @@ describe('Linked-only dimension filter (Francia wire fixture) must reach the loo
       // ── COMPUTE: honest engine returns Francia-only when the brand restriction
       // is present, all-country otherwise. The fix must yield the Francia value.
       const req = promiseFnToStream(rq => {
-        const sql = (rq && rq.query && rq.query.query) || '';
+        const sql = sqlOf(rq);
         if (sql.includes('lookup_d01f07da_rev1')) return Promise.resolve([{ brand: 'B_FR' }]);
         if (!/AVG\("price"\)/.test(sql)) return Promise.resolve([{ __VALUE__: 0 }]);
         if (/"brand"\s*(=|IN)/i.test(sql)) return Promise.resolve([{ __VALUE__: 7 }]); // Francia avg

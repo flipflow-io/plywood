@@ -99,9 +99,13 @@ describe('Cross-source decomposability gate (Phase 3)', () => {
     expect(crossExt.nativeJoin.sql, 'SQL contains INNER JOIN').to.match(/INNER JOIN/i);
   });
 
-  it('sum + linked-only split STILL takes the JS-join path (kind=jsJoin or absent)', () => {
-    // Build with a NUMBER attribute on main so sum can apply.
-    const mainNum = External.fromJS({
+  // Since 0.51.10 the route for a SAME-ENGINE lookup is the native JOIN for
+  // every measure (the engine joins faster than plywood pre-aggregates and
+  // joins in memory, and the result is identical). The JS-join is the plan
+  // for a CROSS-ENGINE lookup, where one SQL cannot see both sides. Both are
+  // pinned here on the same sum + linked-only split.
+  function mainForSum(crossEngine) {
+    const ext = External.fromJS({
       engine: 'druidsql',
       source: 'main_ds',
       timeAttribute: '__time',
@@ -118,6 +122,7 @@ describe('Cross-source decomposability gate (Phase 3)', () => {
           sharedDimensions: ['productName'],
           joinMode: 'inner',
           timeAlignment: 'eternal',
+          ...(crossEngine ? { engine: 'postgres', version: '16.0.0' } : {}),
           attributes: [
             { name: 'productName', type: 'STRING' },
             { name: 'uso_tipico', type: 'STRING' },
@@ -126,7 +131,16 @@ describe('Cross-source decomposability gate (Phase 3)', () => {
       },
       filter: timeFilter,
     });
-    const split = mainNum.addExpression(
+    if (crossEngine) {
+      ext.linkedSources.lookup_uso_tipico.requester = () => {
+        throw new Error('postgres requester must not run here');
+      };
+    }
+    return ext;
+  }
+
+  function sumSplitExt(crossEngine) {
+    const split = mainForSum(crossEngine).addExpression(
       plywood.Expression.fromJS({ op: 'ref', name: 'main' }).split('$uso_tipico', 'uso_tipico'),
     );
     const apply = plywood.Expression.fromJS({
@@ -139,13 +153,27 @@ describe('Cross-source decomposability gate (Phase 3)', () => {
       },
       name: 'total_price',
     });
-    const splitExt = split.addExpression(apply);
+    return split.addExpression(apply);
+  }
+
+  it('sum + linked-only split on a SAME-ENGINE lookup takes the native JOIN (SUM in one SQL)', () => {
+    const splitExt = sumSplitExt(false);
     expect(splitExt, 'split-mode external built').to.exist;
     const crossExt = splitExt.getCrossExternalDecomposition();
     expect(crossExt, 'gate returned a decomposition object').to.exist;
-    // 'jsJoin' is the new discriminator value (or undefined if the
-    // gate keeps the legacy shape untagged — accept both as long as
-    // it's NOT 'nativeJoin').
+    expect(crossExt.kind, 'same-engine → nativeJoin').to.equal('nativeJoin');
+    expect(crossExt.nativeJoin.sql).to.match(/SUM\(main\."price"\) AS "total_price"/);
+  });
+
+  it('sum + linked-only split on a CROSS-ENGINE lookup takes the JS-join path (kind=jsJoin or absent)', () => {
+    const splitExt = sumSplitExt(true);
+    expect(splitExt, 'split-mode external built').to.exist;
+    const crossExt = splitExt.getCrossExternalDecomposition();
+    expect(crossExt, 'gate returned a decomposition object').to.exist;
+    // 'jsJoin' is the discriminator value (or undefined if the gate keeps
+    // the legacy shape untagged — accept both as long as it's NOT
+    // 'nativeJoin').
     expect(crossExt.kind, 'kind must not be nativeJoin for sum').to.not.equal('nativeJoin');
+    expect(crossExt.linkedExternals.map(le => le.name)).to.include('lookup_uso_tipico');
   });
 });

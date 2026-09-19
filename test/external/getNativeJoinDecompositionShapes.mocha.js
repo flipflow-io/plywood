@@ -94,12 +94,17 @@ function buildSplit(main, splitExprJS, splitAlias) {
 }
 
 describe('getNativeJoinDecomposition — fail-loud on unsupported shapes (F4)', () => {
-  it('throws when linkedOnlySplitAliases is empty (count=0)', () => {
+  it('accepts an empty linkedOnlySplitAliases (0.51.10): the lookup is joined without a linked key, GROUP BY ()', () => {
+    // Since 0.51.10 a zero-alias native JOIN is a legal shape — the lookup is
+    // joined for a measure filter (or a linked filter) only, and the GROUP BY
+    // carries the main-side aliases alone; none here, so a totals grouping.
     const splitExt = buildSplit(makeMainDruidSql(), '$uso_tipico');
-    expect(() => splitExt.getNativeJoinDecomposition([], [], { lookup_uso_tipico: true })).to.throw(
-      PlywoodUnsupportedNativeJoinShape,
-      /multi-alias linked-only split/,
-    );
+    const nj = splitExt.getNativeJoinDecomposition([], [], { lookup_uso_tipico: true });
+    expect(nj.kind).to.equal('nativeJoin');
+    expect(nj.nativeJoin.splitAlias).to.equal(undefined);
+    expect(nj.nativeJoin.keys).to.deep.equal([]);
+    expect(nj.nativeJoin.sql).to.match(/INNER JOIN "lookup_uso_tipico_rev1" AS lookup/);
+    expect(nj.nativeJoin.sql).to.match(/GROUP BY \(\)/);
   });
 
   it('throws when linkedOnlySplitAliases has >1 alias', () => {
