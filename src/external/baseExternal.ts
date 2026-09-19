@@ -1779,6 +1779,39 @@ export abstract class External {
    * span two stores). The caller (the front) serves the OTHER measures and
    * marks these as not yet available while the source is materialised.
    */
+  /**
+   * The user-facing apply names whose value cannot be re-aggregated after a
+   * JS join: every value apply that IS a 'none'-trait leaf (countDistinct,
+   * quantile, mode, a custom aggregate) or that combines one (a derived
+   * measure over a countDistinct). `leaves` are the segregated leaf applies
+   * (`segregationAggregateApplies`), `valueApplies` the originals and
+   * `postAggApplies` the originals rewritten over leaf refs (`!T_n`), so a
+   * derived measure is named by its own name, never by its synthetic leaf.
+   * Order follows `valueApplies`; each name once.
+   */
+  static nonReaggregableApplyNames(
+    leaves: ApplyExpression[],
+    valueApplies: ApplyExpression[],
+    postAggApplies: ApplyExpression[],
+  ): string[] {
+    const noneLeaves: Record<string, true> = {};
+    for (const leaf of leaves) {
+      if (leaf.expression.type === 'DATASET') continue;
+      if (External.resolveApplyDecomposeTrait(leaf) === 'none') noneLeaves[leaf.name] = true;
+    }
+    const named: Record<string, true> = {};
+    for (const apply of valueApplies) {
+      if (noneLeaves[apply.name]) {
+        named[apply.name] = true;
+        continue;
+      }
+      const post = postAggApplies.find(p => p.name === apply.name);
+      if (post && post.expression.getFreeReferences().some(r => noneLeaves[r]))
+        named[apply.name] = true;
+    }
+    return valueApplies.map(a => a.name).filter(n => named[n]);
+  }
+
   static assertMeasureFiltersJoinable(
     measureFilterByLs: Record<string, string[]>,
     linkedSources: Record<string, LinkedSourceConfig>,
@@ -5886,6 +5919,34 @@ export abstract class External {
       // A measure filter on a linked column is answerable ONLY as a
       // conditional aggregate over the engine's JOIN: mandatory route.
       const nativeJoinRequired = !!undecomposableLeaf || measureFilterLsNames.length > 0;
+      if (nativeJoinRequired) {
+        // The mandatory route needs the engine's own JOIN, which cannot span
+        // two engines (the gate in getNativeJoinDecomposition refuses without
+        // naming anything). Refuse HERE, per measure: the applies that force
+        // the route are known, so a host can drop exactly those, answer the
+        // rest and show them as "preparing" until the source is materialised
+        // (19 Sep 2026: COUNT DISTINCT split by a mapping still served from
+        // its Postgres view was a 500 instead of a pending chip).
+        const crossEngineNames = involvedNames.filter(
+          n => !External.isSameEngineLinkedSource(this.linkedSources[n], this.engine),
+        );
+        if (crossEngineNames.length > 0) {
+          const lsName = crossEngineNames[0];
+          const measures = External.nonReaggregableApplyNames(
+            mainLeafApplies,
+            mainValueApplies,
+            mainPostAggApplies,
+          );
+          throw new PlywoodUnsupportedNativeJoinShape(
+            `measure(s) [${measures.join(', ')}] cannot be re-aggregated after a JS join ` +
+              `(countDistinct, quantile, a custom aggregate) and need the engine's own JOIN, but ` +
+              `linkedSource "${lsName}" lives in engine "${this.linkedSources[lsName].engine}" while main is ` +
+              `"${this.engine}"; a single native SQL JOIN cannot span two engines (materialise the source).`,
+            measures,
+            lsName,
+          );
+        }
+      }
       const nativeJoinPreferred =
         !nativeJoinRequired &&
         involvedNames.length === 1 &&
