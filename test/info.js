@@ -23,7 +23,7 @@ Object.defineProperty(exports, 'druidHost', {
   get() {
     if (!process.env.DRUID_HOST) {
       throw new Error(
-        'DRUID_HOST is not set: point it at a disposable test Druid, never at production',
+        'DRUID_HOST is not set: name the Druid to query (localhost:8182 is the production tunnel on flipflow-dev)',
       );
     }
     return process.env.DRUID_HOST;

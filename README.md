@@ -185,15 +185,16 @@ Functional tests connect to real databases. Config is in `test/info.js`:
 | MySQL      | `localhost:3306` | `mySqlFunctional`                          |
 | PostgreSQL | `localhost:5432` | `postgresFunctional`                       |
 
-`DRUID_HOST` must point at a disposable test Druid. Never point it at production: on `flipflow-dev`, `localhost:8182` is the SSH tunnel to the production router, and `load-wikipedia.sh` overwrites the `wikipedia` datasource of whatever cluster it reaches.
+`DRUID_HOST` has no default, so every run names the Druid it queries. An occasional local run against production is fine: the functional suites only read, and their expected values are calibrated on the `wikipedia` datasource that lives there. What must never reach production is `load-wikipedia.sh` (below), which would replace that datasource.
 
 ```bash
-export DRUID_HOST=localhost:8888   # e.g. the router of a local Docker Druid
+export DRUID_HOST=localhost:8182   # the production router through the SSH tunnel on flipflow-dev
+export DRUID_HOST=localhost:8888   # or the router of a local Docker Druid
 ```
 
 ### Load the Wikipedia test dataset into Druid
 
-The loader creates a `wikipedia` datasource with 39244 rows (the sampled Wikipedia edits from 2015-09-12). Note that the expected values in `druidSqlFunctional` were calibrated against the full day (about 390K rows), so a cluster loaded by this script does not match them yet:
+For a test Druid only, never production: the loader replaces the `wikipedia` datasource with 39244 rows (the sampled Wikipedia edits from 2015-09-12). Production holds the full day (about 390K rows), which is what the expected values in `druidSqlFunctional` were calibrated against, so a cluster loaded by this script does not match them yet:
 
 ```bash
 ./test/load-wikipedia.sh
