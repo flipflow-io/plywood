@@ -1,6 +1,6 @@
 # === Basic ===
 .DS_Store
-/node_modules/
+/node_modules
 
 # === WebStorm ===
 /.idea/workspace.xml
