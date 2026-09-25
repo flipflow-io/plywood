@@ -1,11 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# Load the Wikipedia test dataset into Druid for functional tests.
-# Expects Druid at localhost:8182 (or override with DRUID_HOST env var).
+# Load the Wikipedia test dataset into a test Druid for functional tests.
+# DRUID_HOST is required and has no default: the ingestion REPLACEs the "wikipedia"
+# datasource, so it must never reach production (on flipflow-dev, localhost:8182 is
+# the SSH tunnel to the production router), whose full-day copy (~390K rows) is what
+# the functional expectations are calibrated on.
 # Dataset: 39244 rows of Wikipedia edits from 2015-09-12.
 
-DRUID_HOST="${DRUID_HOST:-localhost:8182}"
+: "${DRUID_HOST:?DRUID_HOST is not set: point it at a test Druid router, never at production}"
 DATA_URL="https://raw.githubusercontent.com/YahooArchive/swiv/768ebff8fd23f08fa480c35af200e9096cc6f414/assets/data/wikiticker-2015-09-12-sampled.json"
 
 echo "==> Submitting wikipedia ingestion to Druid at $DRUID_HOST..."

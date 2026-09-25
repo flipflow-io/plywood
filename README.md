@@ -181,23 +181,20 @@ Functional tests connect to real databases. Config is in `test/info.js`:
 
 | Database   | Host            | Required by                                |
 |------------|-----------------|--------------------------------------------|
-| Druid      | `localhost:8182` | `druidSqlFunctional`, `druidFunctional`    |
+| Druid      | `$DRUID_HOST` (required, no default) | `druidSqlFunctional`, `druidFunctional`    |
 | MySQL      | `localhost:3306` | `mySqlFunctional`                          |
 | PostgreSQL | `localhost:5432` | `postgresFunctional`                       |
 
-On `flipflow-dev`, Druid is available via SSH tunnel:
+`DRUID_HOST` has no default, so every run names the Druid it queries. An occasional local run against production is fine: the functional suites only read, and their expected values are calibrated on the `wikipedia` datasource that lives there. What must never reach production is `load-wikipedia.sh` (below), which would replace that datasource.
 
 ```bash
-# Check if tunnel is already running
-ss -tlnp | grep 8182
-
-# If not, start it
-systemctl --user start tunnel@druid-router
+export DRUID_HOST=localhost:8182   # the production router through the SSH tunnel on flipflow-dev
+export DRUID_HOST=localhost:8888   # or the router of a local Docker Druid
 ```
 
 ### Load the Wikipedia test dataset into Druid
 
-The functional tests expect a `wikipedia` datasource with 39244 rows (Wikipedia edits from 2015-09-12):
+For a test Druid only, never production: the loader replaces the `wikipedia` datasource with 39244 rows (the sampled Wikipedia edits from 2015-09-12). Production holds the full day (about 390K rows), which is what the expected values in `druidSqlFunctional` were calibrated against, so a cluster loaded by this script does not match them yet:
 
 ```bash
 ./test/load-wikipedia.sh
@@ -208,7 +205,7 @@ This script loads the data via Druid MSQ, polls until ingestion completes, and v
 Verify manually if needed:
 
 ```bash
-curl -s 'http://localhost:8182/druid/v2/sql' \
+curl -s "http://$DRUID_HOST/druid/v2/sql" \
   -H 'Content-Type: application/json' \
   -d '{"query": "SELECT COUNT(*) AS cnt FROM \"wikipedia\""}' | jq
 # Should return 39244
