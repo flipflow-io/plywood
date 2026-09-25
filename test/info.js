@@ -15,7 +15,20 @@
  */
 
 exports.druidVersion = process.env.DRUID_VERSION || '35.0.0';
-exports.druidHost = process.env.DRUID_HOST || `localhost:8182`;
+// No default host: the Druid suites must never reach a production cluster by accident (on
+// flipflow-dev, localhost:8182 is the SSH tunnel to the production router). Read lazily so the
+// MySQL and PostgreSQL suites still load without it.
+Object.defineProperty(exports, 'druidHost', {
+  enumerable: true,
+  get() {
+    if (!process.env.DRUID_HOST) {
+      throw new Error(
+        'DRUID_HOST is not set: point it at a disposable test Druid, never at production',
+      );
+    }
+    return process.env.DRUID_HOST;
+  },
+});
 exports.druidContext = {
   timeout: 10000,
   useCache: false,
