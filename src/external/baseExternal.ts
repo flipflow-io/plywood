@@ -5329,6 +5329,14 @@ export abstract class External {
     const mainAlias = 'main';
     const lookupAlias = 'lookup';
     const escName = (n: string) => dialect.escapeName(n);
+    // A source list is one table to Druid only through TABLE(APPEND(...)), the
+    // same FROM DruidSQLExternal.getFrom writes; escaping String(list) named a
+    // single table "a,b" that does not exist (identifier longer than 128 chars
+    // on the Dermofarm cube, 7 Oct 2026).
+    const fromTable = (source: string | string[]) =>
+      Array.isArray(source)
+        ? `TABLE(APPEND(${source.map(s => dialect.escapeLiteral(s)).join(', ')}))`
+        : escName(source);
 
     // ON clause: AND of every declared joinKey
     const onConds = joinKeys
@@ -5478,8 +5486,8 @@ export abstract class External {
     const joinSql = nativeEffectiveJoinMode === 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
     const sqlParts = [
       `SELECT ${selectParts.join(', ')}`,
-      `FROM ${escName(mainSource)} AS ${mainAlias}`,
-      `${joinSql} ${escName(linkedSource)} AS ${lookupAlias} ON ${onConds}`,
+      `FROM ${fromTable(this.source)} AS ${mainAlias}`,
+      `${joinSql} ${fromTable(config.source)} AS ${lookupAlias} ON ${onConds}`,
     ];
     if (whereSQL) sqlParts.push(whereSQL);
     // GROUP BY covers EVERY split-key position (main-side buckets + linked
