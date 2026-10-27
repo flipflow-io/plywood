@@ -23,6 +23,8 @@ import { BigQueryDialect } from '../dialect';
 import {
   $,
   AndExpression,
+  ApplyExpression,
+  AverageExpression,
   Expression,
   IsExpression,
   LiteralExpression,
@@ -34,11 +36,12 @@ import {
   RefExpression,
   SplitExpression,
   SqlRefExpression,
+  SumExpression,
 } from '../expressions';
 import { dictEqual } from '../helper';
 import { PlyType } from '../types';
 
-import { External, ExternalJS, ExternalValue } from './baseExternal';
+import { External, ExternalJS, ExternalValue, IntrospectOptions } from './baseExternal';
 import { SQLExternal } from './sqlExternal';
 
 export interface BigQueryField {
@@ -50,8 +53,9 @@ export interface BigQueryField {
 
 /**
  * How the multi-value columns used by a query are read. Druid evaluates a filter on a multi-value
- * column per row (true when any element matches) and a split on one per element, except that a
- * top level `= 'x'` or `IS NULL` filter turns a split on the same column into that single value.
+ * column per row (true when any element matches), also inside a measure, and a split on one per
+ * element, except that a top level `= 'x'` or `IS NULL` filter turns a split on the same column into
+ * that single value.
  */
 interface MultiValuePlan {
   filter: Expression;
@@ -60,6 +64,8 @@ interface MultiValuePlan {
   elementColumns: { name: string; array: string }[];
   predicates: string[];
   constants: Record<string, string>;
+  measurePredicates: string[];
+  measures: Record<string, Expression>;
 }
 
 export class BigQueryExternal extends SQLExternal {
@@ -233,6 +239,35 @@ export class BigQueryExternal extends SQLExternal {
     );
   }
 
+  /**
+   * As External.introspect, except that an attribute override keeps the column's BigQuery type,
+   * so the external still knows that a column the cube types as NUMBER is stored as text.
+   */
+  public introspect(options: IntrospectOptions = {}): Promise<External> {
+    const { attributeOverrides } = this;
+    if (!attributeOverrides || !attributeOverrides.length || this.attributes) {
+      return super.introspect(options);
+    }
+    const value = this.valueOf();
+    delete value.attributeOverrides;
+    return External.fromValue(value)
+      .introspect(options)
+      .then(introspected => {
+        const introspectedValue = introspected.valueOf();
+        introspectedValue.attributes = AttributeInfo.override(
+          introspectedValue.attributes,
+          attributeOverrides.map(override => {
+            const stored = introspectedValue.attributes.find(a => a.name === override.name);
+            return stored && stored.nativeType && !override.nativeType
+              ? AttributeInfo.fromJS({ ...override.toJS(), nativeType: stored.nativeType })
+              : override;
+          }),
+        );
+        introspectedValue.attributeOverrides = attributeOverrides;
+        return External.fromValue(introspectedValue);
+      });
+  }
+
   protected getIntrospectAttributes(): Promise<Attributes> {
     const { source, withQuery, dialect } = this;
     const table = Array.isArray(source) ? source[0] : source;
@@ -280,23 +315,8 @@ export class BigQueryExternal extends SQLExternal {
     const filter = super.getQueryFilter();
     const split = this.split ? super.getQuerySplit() : undefined;
 
-    for (const apply of this.applies || []) {
-      // Measure filters sit in a nested scope that getFreeReferences does not report
-      const refs: string[] = [];
-      this.inlineDerivedAttributes(apply.expression).substitute(ex => {
-        if (isMultiValueRef(ex)) refs.push((ex as RefExpression).name);
-        return null;
-      });
-      if (refs.length) {
-        throw new Error(
-          `multi-value column '${refs[0]}' in measure '${apply.name}' is not supported by the BigQuery external`,
-        );
-      }
-    }
-
-    // Each predicate on one multi-value column is computed per row next to the table
-    const predicates: string[] = [];
-    const newFilter = filter.substitute(ex => {
+    // A boolean leaf on one multi-value column, as a per row SQL predicate (any element matches)
+    const predicateSQLOf = (ex: Expression): string | null => {
       if (
         ex instanceof AndExpression ||
         ex instanceof OrExpression ||
@@ -310,22 +330,56 @@ export class BigQueryExternal extends SQLExternal {
       if (refs.length > 1) {
         throw new Error(`can not filter on two multi-value columns at once: ${ex}`);
       }
-      const column = refs[0];
-      let predicateSQL: string;
       if (
         (ex instanceof MvContainsExpression || ex instanceof MvOverlapExpression) &&
         isMultiValueRef(ex.operand)
       ) {
-        predicateSQL = ex.getSQL(dialect);
-      } else {
-        const elementPredicate = ex.substitute(sub => (isMultiValueRef(sub) ? $('v') : null));
-        predicateSQL = `EXISTS(SELECT 1 FROM ${this.multiValueElements(
-          column,
-        )} WHERE ${elementPredicate.getSQL(dialect)})`;
+        return ex.getSQL(dialect);
       }
-      predicates.push(predicateSQL);
+      const elementPredicate = ex.substitute(sub => (isMultiValueRef(sub) ? $('v') : null));
+      return `EXISTS(SELECT 1 FROM ${this.multiValueElements(
+        refs[0],
+      )} WHERE ${elementPredicate.getSQL(dialect)})`;
+    };
+
+    // Each predicate on one multi-value column is computed per row next to the table
+    const predicates: string[] = [];
+    const newFilter = filter.substitute(ex => {
+      const sql = predicateSQLOf(ex);
+      if (sql === null) return null;
+      predicates.push(sql);
       return $(`__mvp_${predicates.length - 1}`, 'BOOLEAN');
     });
+
+    // So is each one inside a measure (measure filters sit in a nested scope that
+    // getFreeReferences does not report)
+    const hasMultiValueRef = (ex: Expression) => {
+      let found = false;
+      ex.substitute(sub => {
+        if (isMultiValueRef(sub)) found = true;
+        return null;
+      });
+      return found;
+    };
+    const measurePredicates: string[] = [];
+    const measures: Record<string, Expression> = {};
+    const applies = this.applies || (this.valueExpression ? [this.toValueApply()] : []);
+    for (const apply of applies) {
+      const expression = this.inlineDerivedAttributes(apply.expression);
+      if (!hasMultiValueRef(expression)) continue;
+      const measure = expression.substitute(ex => {
+        const sql = predicateSQLOf(ex);
+        if (sql === null) return null;
+        measurePredicates.push(sql);
+        return $(`__mvm_${measurePredicates.length - 1}`, 'BOOLEAN');
+      });
+      if (hasMultiValueRef(measure)) {
+        throw new Error(
+          `multi-value column in measure '${apply.name}' is only supported in a filter`,
+        );
+      }
+      measures[apply.name] = measure;
+    }
 
     // A split on a multi-value column reads an element column added next to the table
     const constants: Record<string, string> = {};
@@ -364,7 +418,14 @@ export class BigQueryExternal extends SQLExternal {
       });
     }
 
-    if (!predicates.length && !elementColumns.length && !Object.keys(constants).length) return null;
+    if (
+      !predicates.length &&
+      !elementColumns.length &&
+      !Object.keys(constants).length &&
+      !measurePredicates.length
+    ) {
+      return null;
+    }
     return {
       filter: newFilter,
       split: newSplit,
@@ -372,6 +433,8 @@ export class BigQueryExternal extends SQLExternal {
       elementColumns,
       predicates,
       constants,
+      measurePredicates,
+      measures,
     };
   }
 
@@ -404,6 +467,42 @@ export class BigQueryExternal extends SQLExternal {
     return plan ? plan.filter : super.getQueryFilter();
   }
 
+  protected getQueryApplies(applies: ApplyExpression[]): ApplyExpression[] {
+    if (!applies) return applies;
+    const plan = this.getMultiValuePlan();
+    const textColumns = this.getTextColumnsTypedAsNumber();
+    return applies.map(apply => {
+      let measure =
+        plan && plan.measures[apply.name] ? plan.measures[apply.name] : apply.expression;
+      if (textColumns.length) {
+        // Druid SQL reads such a column as a number inside SUM and AVG; BigQuery refuses text there
+        measure = measure.substitute(ex => {
+          if (
+            (ex instanceof SumExpression || ex instanceof AverageExpression) &&
+            ex.expression instanceof RefExpression &&
+            textColumns.includes(ex.expression.name)
+          ) {
+            return ex.changeExpression($(ex.expression.name, 'STRING').cast('NUMBER'));
+          }
+          return null;
+        });
+      }
+      return measure === apply.expression ? apply : apply.changeExpression(measure);
+    });
+  }
+
+  // Columns stored as text that the cube types as NUMBER (attributeOverrides)
+  private getTextColumnsTypedAsNumber(): string[] {
+    const overrides = this.attributeOverrides || [];
+    return (this.rawAttributes || [])
+      .filter(attribute => {
+        if (attribute.nativeType !== 'STRING') return false;
+        const override = overrides.find(o => o.name === attribute.name);
+        return (override || attribute).type === 'NUMBER';
+      })
+      .map(attribute => attribute.name);
+  }
+
   public getQuerySplit(): SplitExpression {
     const plan = this.getMultiValuePlan();
     return plan && plan.split ? plan.split : super.getQuerySplit();
@@ -430,6 +529,7 @@ export class BigQueryExternal extends SQLExternal {
 
     const extraColumns = [
       ...plan.predicates.map((sql, i) => `${sql} AS ${dialect.escapeName(`__mvp_${i}`)}`),
+      ...plan.measurePredicates.map((sql, i) => `${sql} AS ${dialect.escapeName(`__mvm_${i}`)}`),
       ...Object.keys(plan.constants).map(
         column => `${plan.constants[column]} AS ${dialect.escapeName(`__mv__${column}`)}`,
       ),

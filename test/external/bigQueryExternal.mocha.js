@@ -166,24 +166,112 @@ describe('BigQueryExternal', () => {
       ).to.equal('other.brands');
     });
 
-    it('refuses a multi-value column inside a measure instead of counting it wrong', () => {
+    it('filters a measure on a multi-value column per row, as Druid does', () => {
       const external = External.fromJS(
         { engine: 'bigquery', source: 'histories', attributes },
         rowsRequester([]),
       );
 
       // A single filtered measure has its filter lifted into WHERE; next to another measure it stays inside
+      const queryPlan = ply()
+        .apply('All', $('wiki').count())
+        .apply(
+          'Tagged',
+          $('wiki')
+            .filter($('tags').is(r('a')))
+            .sum('$price'),
+        )
+        .simulateQueryPlan({ wiki: external });
+
+      expect(queryPlan.flat().map(q => q.query)).to.deep.equal([
+        "SELECT\nCOUNT(*) AS `All`,\nSUM(CASE WHEN (`__mvm_0` = TRUE) THEN `price` ELSE 0 END) AS `Tagged`\nFROM (SELECT t.*, EXISTS(SELECT 1 FROM UNNEST(IF(ARRAY_LENGTH(`tags`)>0,`tags`,[STRUCT(CAST(NULL AS STRING) AS v)])) WHERE (`v`='a')) AS `__mvm_0` FROM `histories` AS t) AS t\nGROUP BY ()",
+      ]);
+    });
+
+    it('keeps a measure filter on a multi-value column per row when splitting on that column', () => {
+      const external = External.fromJS(
+        { engine: 'bigquery', source: 'histories', attributes },
+        rowsRequester([]),
+      );
+
+      const queryPlan = $('wiki')
+        .split('$tags', 'Tag')
+        .apply('All', $('wiki').count())
+        .apply(
+          'Tagged',
+          $('wiki')
+            .filter($('tags').is(r('a')))
+            .count(),
+        )
+        .sort('$All', 'descending')
+        .limit(5)
+        .simulateQueryPlan({ wiki: external });
+
+      expect(queryPlan.flat().map(q => q.query)).to.deep.equal([
+        "SELECT\n`__mv__tags` AS `Tag`,\nCOUNT(*) AS `All`,\nSUM(CASE WHEN (`__mvm_0` = TRUE) THEN 1 ELSE 0 END) AS `Tagged`\nFROM (SELECT t.*, EXISTS(SELECT 1 FROM UNNEST(IF(ARRAY_LENGTH(`tags`)>0,`tags`,[STRUCT(CAST(NULL AS STRING) AS v)])) WHERE (`v`='a')) AS `__mvm_0`, __mvs_0.v AS `__mv__tags` FROM `histories` AS t LEFT JOIN UNNEST(t.`tags`) AS __mvs_0) AS t\nGROUP BY 1\nORDER BY IS_NAN(`All`) IS TRUE DESC, `All` DESC\nLIMIT 5",
+      ]);
+    });
+
+    it('reads a text column the cube types as NUMBER as Druid does inside SUM and AVG', () => {
+      const parse =
+        "SAFE_CAST(REGEXP_EXTRACT(`size`, r'^([+-]?(?:[0-9]+[.]?[0-9]*|[.][0-9]+)(?:[eE][+-]?[0-9]+)?)[dDfF]?$') AS FLOAT64)";
+      return External.fromJS(
+        {
+          engine: 'bigquery',
+          source: 'histories',
+          attributeOverrides: [{ name: 'size', type: 'NUMBER' }],
+        },
+        rowsRequester([
+          { name: '__time', type: 'TIMESTAMP' },
+          { name: 'competitor', type: 'STRING' },
+          { name: 'size', type: 'STRING' },
+          { name: 'price', type: 'FLOAT' },
+        ]),
+      )
+        .introspect()
+        .then(external => {
+          expect(AttributeInfo.toJSs(external.attributes)[2]).to.deep.equal({
+            name: 'size',
+            type: 'NUMBER',
+            nativeType: 'STRING',
+          });
+
+          const queries = ex =>
+            ex
+              .simulateQueryPlan({ wiki: external })
+              .flat()
+              .map(q => q.query);
+
+          expect(
+            queries(
+              ply()
+                .apply('Size', $('wiki').average('$size'))
+                .apply('Total', $('wiki').sum('$size'))
+                .apply('Price', $('wiki').sum('$price')),
+            ),
+          ).to.deep.equal([
+            `SELECT\nAVG(${parse}) AS \`Size\`,\nSUM(${parse}) AS \`Total\`,\nSUM(\`price\`) AS \`Price\`\nFROM \`histories\` AS t\nGROUP BY ()`,
+          ]);
+
+          // A single measure is computed in value mode
+          expect(queries($('wiki').average('$size'))).to.deep.equal([
+            `SELECT\nAVG(${parse}) AS \`__VALUE__\`\nFROM \`histories\` AS t\nGROUP BY ()`,
+          ]);
+        });
+    });
+
+    it('refuses a multi-value column inside a measure other than in a filter', () => {
+      const external = External.fromJS(
+        { engine: 'bigquery', source: 'histories', attributes },
+        rowsRequester([]),
+      );
+
       expect(() =>
         ply()
           .apply('All', $('wiki').count())
-          .apply(
-            'Tagged',
-            $('wiki')
-              .filter($('tags').is(r('a')))
-              .count(),
-          )
+          .apply('Tags', $('wiki').countDistinct('$tags'))
           .simulateQueryPlan({ wiki: external }),
-      ).to.throw("multi-value column 'tags' in measure 'Tagged'");
+      ).to.throw("multi-value column in measure 'Tags' is only supported in a filter");
     });
   });
 
@@ -195,6 +283,15 @@ describe('BigQueryExternal', () => {
       expect(dialect.escapeLiteral("it's a \\ path\n")).to.equal("'it\\'s a \\\\ path\\n'");
     });
 
+    it('casts text to a number as Druid does: no spaces, no hex, an optional d or f suffix', () => {
+      expect(dialect.castExpression('STRING', '`x`', 'NUMBER')).to.equal(
+        "SAFE_CAST(REGEXP_EXTRACT(`x`, r'^([+-]?(?:[0-9]+[.]?[0-9]*|[.][0-9]+)(?:[eE][+-]?[0-9]+)?)[dDfF]?$') AS FLOAT64)",
+      );
+      expect(dialect.castExpression('BOOLEAN', '`x`', 'NUMBER')).to.equal(
+        'SAFE_CAST(`x` AS FLOAT64)',
+      );
+    });
+
     it('orders NaN highest and NULL lowest, as Druid groupBy does', () => {
       expect(dialect.orderByExpression('`x`', 'ASC', 'NUMBER')).to.equal(
         'IS_NAN(`x`) IS TRUE ASC, `x` ASC',
@@ -203,6 +300,41 @@ describe('BigQueryExternal', () => {
         'IS_NAN(`x`) IS TRUE DESC, `x` DESC',
       );
       expect(dialect.orderByExpression('`x`', 'DESC', 'STRING')).to.equal('`x` DESC');
+    });
+
+    it('translates every EXTRACT unit of Druid SQL', () => {
+      const raw = sql =>
+        dialect.translateRawSql(plywood.Expression.parse(`s\${${sql}}`).parsedSql, sql);
+      const units = {
+        EPOCH: 'DIV(UNIX_MILLIS(`__time`),1000)',
+        MILLISECOND: 'EXTRACT(MILLISECOND FROM `__time`)',
+        SECOND: 'EXTRACT(SECOND FROM `__time`)',
+        MINUTE: 'EXTRACT(MINUTE FROM `__time`)',
+        HOUR: 'EXTRACT(HOUR FROM `__time`)',
+        DAY: 'EXTRACT(DAY FROM `__time`)',
+        DOW: 'MOD(EXTRACT(DAYOFWEEK FROM `__time`)+5,7)+1',
+        ISODOW: 'MOD(EXTRACT(DAYOFWEEK FROM `__time`)+5,7)+1',
+        DOY: 'EXTRACT(DAYOFYEAR FROM `__time`)',
+        WEEK: 'EXTRACT(ISOWEEK FROM `__time`)',
+        MONTH: 'EXTRACT(MONTH FROM `__time`)',
+        QUARTER: 'EXTRACT(QUARTER FROM `__time`)',
+        YEAR: 'EXTRACT(YEAR FROM `__time`)',
+        ISOYEAR: 'EXTRACT(YEAR FROM `__time`)',
+        DECADE: 'DIV(EXTRACT(YEAR FROM `__time`),10)',
+        CENTURY: 'DIV(EXTRACT(YEAR FROM `__time`)+99,100)',
+        MILLENNIUM: 'DIV(EXTRACT(YEAR FROM `__time`)+999,1000)',
+      };
+      expect(Object.keys(BigQueryDialect.RAW_EXTRACT)).to.deep.equal(Object.keys(units));
+      for (const unit of Object.keys(units)) {
+        expect(raw(`EXTRACT(${unit} FROM __time)`)).to.equal(units[unit]);
+      }
+      expect(raw('EXTRACT(YEAR FROM CURRENT_TIMESTAMP) - 1')).to.equal(
+        'EXTRACT(YEAR FROM CURRENT_TIMESTAMP()) - 1',
+      );
+      // Druid fails to plan it too
+      expect(() => raw('EXTRACT(MICROSECOND FROM __time)')).to.throw(
+        "unsupported EXTRACT unit 'MICROSECOND'",
+      );
     });
 
     it('rewrites JSON paths Druid reads into BigQuery syntax', () => {

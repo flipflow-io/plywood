@@ -3029,7 +3029,9 @@ describe('BigQuery Functional', function () {
   // - ipMatch, ipSearch, ipStringify: Druid IP types, no BigQuery column holds one
   // - customAggregate, customTransform: Druid native JSON, not SQL
   // - timeRange, join, select: no SQL form in SQLExternal on any engine
-  // - a multi-value column inside a measure: refused with an error (see BigQueryExternal tests)
+  // - a multi-value column inside a measure other than in a filter: refused with an error
+  // - a sum filtered on a multi-value column: on client 507 Druid returns NULL for it (its
+  //   SUM(CASE … ELSE 0 END) over a multi-value column), so no Druid answer is frozen; BigQuery returns the sum
   // - a filter on a collect measure: dropped by SQLExternal on master, on Druid SQL as well
   // - a filtered sum of a column over a group with no matching row: Druid gives NULL on `wikipedia`
   //   and 0 on the client datasources (same filtered longSum plan); BigQuery gives 0
@@ -3165,6 +3167,45 @@ describe('BigQuery Functional', function () {
       MvOverlap: countWhere($('userChars').mvOverlap(['A', 'Z'])),
       MvFilterOnly: byKey($('userChars').mvFilterOnly(['A', 'B'])),
       MvSplit: byKey('$userChars', $('wiki').count(), 8),
+      // A filter on a multi-value column inside a measure, next to a plain count (else it moves to WHERE)
+      MvMeasureTotal: ply()
+        .apply('N', $('wiki').count())
+        .apply(
+          'V',
+          $('wiki')
+            .filter($('userChars').is(r('A')))
+            .count(),
+        ),
+      MvMeasureNot: ply()
+        .apply('N', $('wiki').count())
+        .apply(
+          'V',
+          $('wiki')
+            .filter($('userChars').is(r('A')).not())
+            .count(),
+        ),
+      MvMeasureSplit: $('wiki')
+        .split('$channel', 'K')
+        .apply('N', $('wiki').count())
+        .apply(
+          'V',
+          $('wiki')
+            .filter($('userChars').is(r('A')))
+            .average('$added'),
+        )
+        .sort('$K', 'ascending')
+        .limit(5),
+      MvMeasureSplitOnIt: $('wiki')
+        .split('$userChars', 'K')
+        .apply('N', $('wiki').count())
+        .apply(
+          'V',
+          $('wiki')
+            .filter($('userChars').in(['A', 'B']))
+            .count(),
+        )
+        .sort('$K', 'ascending')
+        .limit(8),
       NumberBucket: byKey($('commentLength').numberBucket(10)),
       Overlap: countWhere(
         $('__time').overlap(
@@ -3329,6 +3370,25 @@ describe('BigQuery Functional', function () {
         { K: "'", V: 316 },
         { K: '(', V: 251 },
         { K: ')', V: 252 },
+      ],
+      MvMeasureTotal: [{ N: 390134, V: 221790 }],
+      MvMeasureNot: [{ N: 390134, V: 168344 }],
+      MvMeasureSplit: [
+        { K: 'ar', N: 4467, V: 640.4052741151978 },
+        { K: 'be', N: 269, V: 956.5793103448276 },
+        { K: 'bg', N: 778, V: 1556.1198156682028 },
+        { K: 'ca', N: 4448, V: 212.1478715459298 },
+        { K: 'ce', N: 665, V: 1301.9830508474577 },
+      ],
+      MvMeasureSplitOnIt: [
+        { K: ' ', N: 39371, V: 30798 },
+        { K: '!', N: 26628, V: 25951 },
+        { K: '"', N: 5, V: 3 },
+        { K: '$', N: 2, V: 1 },
+        { K: '&', N: 402, V: 349 },
+        { K: "'", N: 316, V: 250 },
+        { K: '(', N: 251, V: 186 },
+        { K: ')', N: 252, V: 187 },
       ],
       NumberBucket: [
         { K: { start: 0, end: 10 }, V: 21525 },
