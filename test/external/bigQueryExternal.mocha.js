@@ -166,24 +166,64 @@ describe('BigQueryExternal', () => {
       ).to.equal('other.brands');
     });
 
-    it('refuses a multi-value column inside a measure instead of counting it wrong', () => {
+    it('filters a measure on a multi-value column per row, as Druid does', () => {
       const external = External.fromJS(
         { engine: 'bigquery', source: 'histories', attributes },
         rowsRequester([]),
       );
 
       // A single filtered measure has its filter lifted into WHERE; next to another measure it stays inside
+      const queryPlan = ply()
+        .apply('All', $('wiki').count())
+        .apply(
+          'Tagged',
+          $('wiki')
+            .filter($('tags').is(r('a')))
+            .sum('$price'),
+        )
+        .simulateQueryPlan({ wiki: external });
+
+      expect(queryPlan.flat().map(q => q.query)).to.deep.equal([
+        "SELECT\nCOUNT(*) AS `All`,\nSUM(CASE WHEN (`__mvm_0` = TRUE) THEN `price` ELSE 0 END) AS `Tagged`\nFROM (SELECT t.*, EXISTS(SELECT 1 FROM UNNEST(IF(ARRAY_LENGTH(`tags`)>0,`tags`,[STRUCT(CAST(NULL AS STRING) AS v)])) WHERE (`v`='a')) AS `__mvm_0` FROM `histories` AS t) AS t\nGROUP BY ()",
+      ]);
+    });
+
+    it('keeps a measure filter on a multi-value column per row when splitting on that column', () => {
+      const external = External.fromJS(
+        { engine: 'bigquery', source: 'histories', attributes },
+        rowsRequester([]),
+      );
+
+      const queryPlan = $('wiki')
+        .split('$tags', 'Tag')
+        .apply('All', $('wiki').count())
+        .apply(
+          'Tagged',
+          $('wiki')
+            .filter($('tags').is(r('a')))
+            .count(),
+        )
+        .sort('$All', 'descending')
+        .limit(5)
+        .simulateQueryPlan({ wiki: external });
+
+      expect(queryPlan.flat().map(q => q.query)).to.deep.equal([
+        "SELECT\n`__mv__tags` AS `Tag`,\nCOUNT(*) AS `All`,\nSUM(CASE WHEN (`__mvm_0` = TRUE) THEN 1 ELSE 0 END) AS `Tagged`\nFROM (SELECT t.*, EXISTS(SELECT 1 FROM UNNEST(IF(ARRAY_LENGTH(`tags`)>0,`tags`,[STRUCT(CAST(NULL AS STRING) AS v)])) WHERE (`v`='a')) AS `__mvm_0`, __mvs_0.v AS `__mv__tags` FROM `histories` AS t LEFT JOIN UNNEST(t.`tags`) AS __mvs_0) AS t\nGROUP BY 1\nORDER BY IS_NAN(`All`) IS TRUE DESC, `All` DESC\nLIMIT 5",
+      ]);
+    });
+
+    it('refuses a multi-value column inside a measure other than in a filter', () => {
+      const external = External.fromJS(
+        { engine: 'bigquery', source: 'histories', attributes },
+        rowsRequester([]),
+      );
+
       expect(() =>
         ply()
           .apply('All', $('wiki').count())
-          .apply(
-            'Tagged',
-            $('wiki')
-              .filter($('tags').is(r('a')))
-              .count(),
-          )
+          .apply('Tags', $('wiki').countDistinct('$tags'))
           .simulateQueryPlan({ wiki: external }),
-      ).to.throw("multi-value column 'tags' in measure 'Tagged'");
+      ).to.throw("multi-value column in measure 'Tags' is only supported in a filter");
     });
   });
 

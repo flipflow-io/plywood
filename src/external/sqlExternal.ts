@@ -166,6 +166,11 @@ export abstract class SQLExternal extends External {
     return null;
   }
 
+  // The measures as rendered in the query; an external may rewrite them
+  protected getQueryApplies(applies: ApplyExpression[]): ApplyExpression[] {
+    return applies;
+  }
+
   protected getFrom(): string {
     const { source, dialect, withQuery } = this;
     if (withQuery) {
@@ -778,12 +783,13 @@ export abstract class SQLExternal extends External {
     // so references like $isOwnProducta resolve to $isOwnProduct before SQL generation.
     // Without this, the generated SQL references the alias as if it were a real column.
     const hasDerivedAttributes = Object.keys(derivedAttributes).length > 0;
-    const applies: ApplyExpression[] =
+    const applies: ApplyExpression[] = this.getQueryApplies(
       hasDerivedAttributes && this.applies
         ? this.applies.map(apply =>
             apply.changeExpression(this.inlineDerivedAttributes(apply.expression)),
           )
-        : this.applies;
+        : this.applies,
+    );
 
     const queryParts = [];
     const cteDefinitions: string[] = [];

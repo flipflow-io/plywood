@@ -23,6 +23,7 @@ import { BigQueryDialect } from '../dialect';
 import {
   $,
   AndExpression,
+  ApplyExpression,
   Expression,
   IsExpression,
   LiteralExpression,
@@ -50,8 +51,9 @@ export interface BigQueryField {
 
 /**
  * How the multi-value columns used by a query are read. Druid evaluates a filter on a multi-value
- * column per row (true when any element matches) and a split on one per element, except that a
- * top level `= 'x'` or `IS NULL` filter turns a split on the same column into that single value.
+ * column per row (true when any element matches), also inside a measure, and a split on one per
+ * element, except that a top level `= 'x'` or `IS NULL` filter turns a split on the same column into
+ * that single value.
  */
 interface MultiValuePlan {
   filter: Expression;
@@ -60,6 +62,8 @@ interface MultiValuePlan {
   elementColumns: { name: string; array: string }[];
   predicates: string[];
   constants: Record<string, string>;
+  measurePredicates: string[];
+  measures: Record<string, Expression>;
 }
 
 export class BigQueryExternal extends SQLExternal {
@@ -280,23 +284,8 @@ export class BigQueryExternal extends SQLExternal {
     const filter = super.getQueryFilter();
     const split = this.split ? super.getQuerySplit() : undefined;
 
-    for (const apply of this.applies || []) {
-      // Measure filters sit in a nested scope that getFreeReferences does not report
-      const refs: string[] = [];
-      this.inlineDerivedAttributes(apply.expression).substitute(ex => {
-        if (isMultiValueRef(ex)) refs.push((ex as RefExpression).name);
-        return null;
-      });
-      if (refs.length) {
-        throw new Error(
-          `multi-value column '${refs[0]}' in measure '${apply.name}' is not supported by the BigQuery external`,
-        );
-      }
-    }
-
-    // Each predicate on one multi-value column is computed per row next to the table
-    const predicates: string[] = [];
-    const newFilter = filter.substitute(ex => {
+    // A boolean leaf on one multi-value column, as a per row SQL predicate (any element matches)
+    const predicateSQLOf = (ex: Expression): string | null => {
       if (
         ex instanceof AndExpression ||
         ex instanceof OrExpression ||
@@ -310,22 +299,55 @@ export class BigQueryExternal extends SQLExternal {
       if (refs.length > 1) {
         throw new Error(`can not filter on two multi-value columns at once: ${ex}`);
       }
-      const column = refs[0];
-      let predicateSQL: string;
       if (
         (ex instanceof MvContainsExpression || ex instanceof MvOverlapExpression) &&
         isMultiValueRef(ex.operand)
       ) {
-        predicateSQL = ex.getSQL(dialect);
-      } else {
-        const elementPredicate = ex.substitute(sub => (isMultiValueRef(sub) ? $('v') : null));
-        predicateSQL = `EXISTS(SELECT 1 FROM ${this.multiValueElements(
-          column,
-        )} WHERE ${elementPredicate.getSQL(dialect)})`;
+        return ex.getSQL(dialect);
       }
-      predicates.push(predicateSQL);
+      const elementPredicate = ex.substitute(sub => (isMultiValueRef(sub) ? $('v') : null));
+      return `EXISTS(SELECT 1 FROM ${this.multiValueElements(
+        refs[0],
+      )} WHERE ${elementPredicate.getSQL(dialect)})`;
+    };
+
+    // Each predicate on one multi-value column is computed per row next to the table
+    const predicates: string[] = [];
+    const newFilter = filter.substitute(ex => {
+      const sql = predicateSQLOf(ex);
+      if (sql === null) return null;
+      predicates.push(sql);
       return $(`__mvp_${predicates.length - 1}`, 'BOOLEAN');
     });
+
+    // So is each one inside a measure (measure filters sit in a nested scope that
+    // getFreeReferences does not report)
+    const hasMultiValueRef = (ex: Expression) => {
+      let found = false;
+      ex.substitute(sub => {
+        if (isMultiValueRef(sub)) found = true;
+        return null;
+      });
+      return found;
+    };
+    const measurePredicates: string[] = [];
+    const measures: Record<string, Expression> = {};
+    for (const apply of this.applies || []) {
+      const expression = this.inlineDerivedAttributes(apply.expression);
+      if (!hasMultiValueRef(expression)) continue;
+      const measure = expression.substitute(ex => {
+        const sql = predicateSQLOf(ex);
+        if (sql === null) return null;
+        measurePredicates.push(sql);
+        return $(`__mvm_${measurePredicates.length - 1}`, 'BOOLEAN');
+      });
+      if (hasMultiValueRef(measure)) {
+        throw new Error(
+          `multi-value column in measure '${apply.name}' is only supported in a filter`,
+        );
+      }
+      measures[apply.name] = measure;
+    }
 
     // A split on a multi-value column reads an element column added next to the table
     const constants: Record<string, string> = {};
@@ -364,7 +386,14 @@ export class BigQueryExternal extends SQLExternal {
       });
     }
 
-    if (!predicates.length && !elementColumns.length && !Object.keys(constants).length) return null;
+    if (
+      !predicates.length &&
+      !elementColumns.length &&
+      !Object.keys(constants).length &&
+      !measurePredicates.length
+    ) {
+      return null;
+    }
     return {
       filter: newFilter,
       split: newSplit,
@@ -372,6 +401,8 @@ export class BigQueryExternal extends SQLExternal {
       elementColumns,
       predicates,
       constants,
+      measurePredicates,
+      measures,
     };
   }
 
@@ -404,6 +435,14 @@ export class BigQueryExternal extends SQLExternal {
     return plan ? plan.filter : super.getQueryFilter();
   }
 
+  protected getQueryApplies(applies: ApplyExpression[]): ApplyExpression[] {
+    const plan = this.getMultiValuePlan();
+    if (!plan || !applies) return applies;
+    return applies.map(apply =>
+      plan.measures[apply.name] ? apply.changeExpression(plan.measures[apply.name]) : apply,
+    );
+  }
+
   public getQuerySplit(): SplitExpression {
     const plan = this.getMultiValuePlan();
     return plan && plan.split ? plan.split : super.getQuerySplit();
@@ -430,6 +469,7 @@ export class BigQueryExternal extends SQLExternal {
 
     const extraColumns = [
       ...plan.predicates.map((sql, i) => `${sql} AS ${dialect.escapeName(`__mvp_${i}`)}`),
+      ...plan.measurePredicates.map((sql, i) => `${sql} AS ${dialect.escapeName(`__mvm_${i}`)}`),
       ...Object.keys(plan.constants).map(
         column => `${plan.constants[column]} AS ${dialect.escapeName(`__mv__${column}`)}`,
       ),
