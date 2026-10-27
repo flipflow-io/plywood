@@ -107,6 +107,11 @@ export abstract class SQLDialect {
     return sql;
   }
 
+  // Whether a window function may partition by the grouped expressions of its own query
+  public windowOverGroupedExpressions(): boolean {
+    return true;
+  }
+
   public orderByExpression(expression: string, direction: string, _type?: PlyType): string {
     return `${expression} ${direction}`;
   }

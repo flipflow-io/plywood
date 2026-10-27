@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+import { SqlExpression } from 'druid-query-toolkit';
 import { PlywoodRequester } from 'plywood-base-api';
 import { ReadableStream, Transform } from 'readable-stream';
 
@@ -132,6 +133,37 @@ export abstract class SQLExternal extends External {
 
   protected sqlToQuery(sql: string): any {
     return sql;
+  }
+
+  // PIVOT_NESTED_AGG parts are raw Druid SQL; engines with another syntax translate them
+  static translatePivotNestedAggComponents<
+    T extends {
+      subSplitExpression: string;
+      innerAggregateExpr: string;
+      outerAggregateExpr: string;
+    },
+  >(components: T | null, dialect: SQLDialect): T | null {
+    if (!components) return components;
+    const translate = (sql: string) => {
+      let parsed: SqlExpression;
+      try {
+        parsed = SqlExpression.parse(sql);
+      } catch {
+        return sql;
+      }
+      return dialect.translateRawSql(parsed, sql);
+    };
+    return {
+      ...components,
+      subSplitExpression: translate(components.subSplitExpression),
+      innerAggregateExpr: translate(components.innerAggregateExpr),
+      outerAggregateExpr: translate(components.outerAggregateExpr),
+    };
+  }
+
+  // The ORDER BY of a split with no sort; engines that return groups in a defined order leave it out
+  protected getUnsortedSplitOrderSQL(_split: SplitExpression): string | null {
+    return null;
   }
 
   protected getFrom(): string {
@@ -292,22 +324,38 @@ export abstract class SQLExternal extends External {
         whereParts.push(modeFilter);
       }
 
-      // Inner subquery: alias split dims with key names, GROUP BY raw expressions
-      const innerSelect = [
-        ...splitDimAliasedSQLs,
-        `${modeFieldSQL} AS ${dialect.escapeName('__val')}`,
-        `ROW_NUMBER() OVER (PARTITION BY ${splitDimSQLs.join(
-          ',',
-        )} ORDER BY COUNT(*) DESC) AS ${dialect.escapeName('__rn')}`,
-      ].join(',\n');
-
       const innerGroupBy = [...splitDimSQLs, modeFieldSQL].join(',');
       const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+      let rankedFrom: string;
+      if (dialect.windowOverGroupedExpressions()) {
+        // Inner subquery: alias split dims with key names, GROUP BY raw expressions
+        const innerSelect = [
+          ...splitDimAliasedSQLs,
+          `${modeFieldSQL} AS ${dialect.escapeName('__val')}`,
+          `ROW_NUMBER() OVER (PARTITION BY ${splitDimSQLs.join(
+            ',',
+          )} ORDER BY COUNT(*) DESC) AS ${dialect.escapeName('__rn')}`,
+        ].join(',\n');
+        rankedFrom = `FROM (SELECT ${innerSelect} ${from} ${whereClause} GROUP BY ${innerGroupBy})`;
+      } else {
+        // Count per group first, then number the groups over the key columns
+        const countedSelect = [
+          ...splitDimAliasedSQLs,
+          `${modeFieldSQL} AS ${dialect.escapeName('__val')}`,
+          `COUNT(*) AS ${dialect.escapeName('__count')}`,
+        ].join(',\n');
+        rankedFrom = `FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY ${splitKeyEscaped.join(
+          ',',
+        )} ORDER BY ${dialect.escapeName('__count')} DESC) AS ${dialect.escapeName(
+          '__rn',
+        )} FROM (SELECT ${countedSelect} ${from} ${whereClause} GROUP BY ${innerGroupBy}))`;
+      }
 
       const sql = [
         'SELECT',
         outerSelect,
-        `FROM (SELECT ${innerSelect} ${from} ${whereClause} GROUP BY ${innerGroupBy})`,
+        rankedFrom,
         `WHERE ${dialect.escapeName('__rn')} = 1`,
       ].join('\n');
 
@@ -986,8 +1034,10 @@ export abstract class SQLExternal extends External {
 
           if (apply.expression instanceof SqlAggregateExpression) {
             const sqlAggregateExpression = apply.expression;
-            const pivotNestedAggComponents =
-              sqlAggregateExpression.extractPivotNestedAggComponents();
+            const pivotNestedAggComponents = SQLExternal.translatePivotNestedAggComponents(
+              sqlAggregateExpression.extractPivotNestedAggComponents(),
+              dialect,
+            );
             if (pivotNestedAggComponents) {
               const subSplitExpression = pivotNestedAggComponents.subSplitExpression.trim();
 
@@ -1175,6 +1225,9 @@ export abstract class SQLExternal extends External {
         }
         if (sort) {
           queryParts.push(sort.getSQL(dialect));
+        } else {
+          const defaultOrder = this.getUnsortedSplitOrderSQL(split);
+          if (defaultOrder) queryParts.push(defaultOrder);
         }
         if (limit) {
           queryParts.push(limit.getSQL(dialect));
