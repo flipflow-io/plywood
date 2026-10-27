@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import { SqlColumn } from 'druid-query-toolkit';
 import { PlywoodRequester } from 'plywood-base-api';
 import * as toArray from 'stream-to-array';
 
@@ -26,11 +27,13 @@ import {
   IsExpression,
   LiteralExpression,
   MvContainsExpression,
+  MvFilterOnlyExpression,
   MvOverlapExpression,
   NotExpression,
   OrExpression,
   RefExpression,
   SplitExpression,
+  SqlRefExpression,
 } from '../expressions';
 import { dictEqual } from '../helper';
 import { PlyType } from '../types';
@@ -54,7 +57,7 @@ interface MultiValuePlan {
   filter: Expression;
   split: SplitExpression | undefined;
   columns: string[];
-  elementColumns: string[];
+  elementColumns: { name: string; array: string }[];
   predicates: string[];
   constants: Record<string, string>;
 }
@@ -64,6 +67,12 @@ export class BigQueryExternal extends SQLExternal {
   static type = 'DATASET';
 
   static MULTI_VALUE_NATIVE_TYPE = 'ARRAY<STRUCT<v STRING>>';
+
+  static STANDARD_TYPE_NAME: Record<string, string> = {
+    INTEGER: 'INT64',
+    FLOAT: 'FLOAT64',
+    BOOLEAN: 'BOOL',
+  };
 
   static fromJS(parameters: ExternalJS, requester: PlywoodRequester<any>): BigQueryExternal {
     const value: ExternalValue = SQLExternal.jsToValue(parameters, requester);
@@ -130,7 +139,8 @@ export class BigQueryExternal extends SQLExternal {
           default:
             return null;
         }
-        if (nativeType === 'INTEGER') nativeType = 'INT64';
+        // Standard SQL names for the legacy ones a dry-run schema reports
+        nativeType = BigQueryExternal.STANDARD_TYPE_NAME[nativeType] || nativeType;
 
         return new AttributeInfo({
           name,
@@ -199,6 +209,28 @@ export class BigQueryExternal extends SQLExternal {
 
   public getTimeAttribute(): string | undefined {
     return this.timeAttribute || '__time';
+  }
+
+  public isTimeRef(ex: Expression): ex is RefExpression {
+    if (ex instanceof SqlRefExpression) {
+      return (
+        ex.parsedSql instanceof SqlColumn && ex.parsedSql.getName() === this.getTimeAttribute()
+      );
+    }
+    return super.isTimeRef(ex);
+  }
+
+  // Druid returns the groups of an unsorted split ordered by their keys
+  protected getUnsortedSplitOrderSQL(split: SplitExpression): string | null {
+    const { dialect } = this;
+    return (
+      'ORDER BY ' +
+      split
+        .mapSplits((name, expression) =>
+          dialect.orderByExpression(dialect.escapeName(name), 'ASC', expression.type),
+        )
+        .join(', ')
+    );
   }
 
   protected getIntrospectAttributes(): Promise<Attributes> {
@@ -297,7 +329,7 @@ export class BigQueryExternal extends SQLExternal {
 
     // A split on a multi-value column reads an element column added next to the table
     const constants: Record<string, string> = {};
-    const elementColumns: string[] = [];
+    const elementColumns: { name: string; array: string }[] = [];
     let newSplit = split;
     if (split) {
       const topLevel = filter instanceof AndExpression ? filter.getExpressionList() : [filter];
@@ -306,7 +338,18 @@ export class BigQueryExternal extends SQLExternal {
         if (!refs.length) return ex;
         if (refs.length > 1) throw new Error(`can not split on two multi-value columns: ${ex}`);
         const column = refs[0];
-        if (!(column in constants) && !elementColumns.includes(column)) {
+        const columnSQL = `t.${dialect.escapeName(column)}`;
+        if (ex instanceof MvFilterOnlyExpression && isMultiValueRef(ex.operand)) {
+          // Only the listed values split; a row left with none is one NULL group, as in Druid
+          const name = `__mv__${column}__only${elementColumns.length}`;
+          elementColumns.push({
+            name,
+            array: dialect.mvFilterOnlyExpression(columnSQL, ex.mvArray),
+          });
+          return $(name, 'STRING');
+        }
+        const elementName = `__mv__${column}`;
+        if (!(column in constants) && !elementColumns.some(e => e.name === elementName)) {
           const pinned = topLevel
             .map(part => BigQueryExternal.pinnedMultiValue(part, column))
             .find(v => v !== undefined);
@@ -314,7 +357,7 @@ export class BigQueryExternal extends SQLExternal {
             constants[column] =
               pinned === null ? 'CAST(NULL AS STRING)' : dialect.escapeLiteral(pinned);
           } else {
-            elementColumns.push(column);
+            elementColumns.push({ name: elementName, array: columnSQL });
           }
         }
         return ex.substitute(sub => (isMultiValueRef(sub) ? $(`__mv__${column}`, 'STRING') : null));
@@ -391,11 +434,11 @@ export class BigQueryExternal extends SQLExternal {
         column => `${plan.constants[column]} AS ${dialect.escapeName(`__mv__${column}`)}`,
       ),
       ...plan.elementColumns.map(
-        (column, i) => `__mvs_${i}.v AS ${dialect.escapeName(`__mv__${column}`)}`,
+        (element, i) => `__mvs_${i}.v AS ${dialect.escapeName(element.name)}`,
       ),
     ];
     const joins = plan.elementColumns.map(
-      (column, i) => `LEFT JOIN UNNEST(t.${dialect.escapeName(column)}) AS __mvs_${i}`,
+      (element, i) => `LEFT JOIN UNNEST(${element.array}) AS __mvs_${i}`,
     );
     return `FROM (SELECT t.*, ${extraColumns.join(', ')} FROM ${relation} AS t${joins
       .map(join => ' ' + join)

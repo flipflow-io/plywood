@@ -46,3 +46,14 @@ exports.postgresHost = `localhost:5432`;
 exports.postgresDatabase = 'datazoo';
 exports.postgresUser = 'root';
 exports.postgresPassword = 'datazoo';
+
+// BigQuery: the fixture is a copy of the Druid `wikipedia` test datasource (390,134 rows, 2015-09-12)
+exports.bigQueryProject = process.env.BIGQUERY_PROJECT || 'flipflow-426307';
+exports.bigQueryDataset = process.env.BIGQUERY_DATASET || 'etl_lab';
+exports.bigQueryLocation = process.env.BIGQUERY_LOCATION || 'EU';
+exports.bigQueryWikipedia =
+  process.env.BIGQUERY_WIKIPEDIA || 'flipflow-426307.etl_lab.dbq__plywood_fixture_wikipedia';
+exports.bigQueryChannelLookup =
+  process.env.BIGQUERY_CHANNEL_LOOKUP ||
+  'flipflow-426307.etl_lab.dbq__plywood_fixture_lookup_channel';
+exports.bigQueryRequester = process.env.BIGQUERY_REQUESTER || 'plywood-bigquery-requester';

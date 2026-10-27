@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import type { Duration, Timezone } from 'chronoshift';
+import { Duration, Timezone } from 'chronoshift';
 import type { SqlBase, SqlExpression } from 'druid-query-toolkit';
 import { NamedArray } from 'immutable-class';
 
@@ -40,6 +40,8 @@ export class BigQueryDialect extends SQLDialect {
     P3M: 'QUARTER',
     P1Y: 'YEAR',
   };
+
+  static QUANTILE_SUFFIX = ', 1000)[OFFSET(';
 
   // Druid's ISO day of week (Monday = 1); BigQuery DAYOFWEEK has Sunday = 1
   static ISO_DOW = 'MOD(EXTRACT(DAYOFWEEK FROM $$ AT TIME ZONE ##)+5,7)+1';
@@ -223,6 +225,11 @@ export class BigQueryDialect extends SQLDialect {
     return `[${arr.join(',')}]`;
   }
 
+  public windowOverGroupedExpressions(): boolean {
+    // BigQuery: "PARTITION BY expression references column … which is neither grouped nor aggregated"
+    return false;
+  }
+
   public orderByExpression(expression: string, direction: string, type?: PlyType): string {
     // Druid's groupBy orders NULL lowest, as BigQuery does, but NaN highest where BigQuery puts it lowest
     if (type !== 'NUMBER') return `${expression} ${direction}`;
@@ -278,8 +285,18 @@ export class BigQueryDialect extends SQLDialect {
   }
 
   public filterAggregatorExpression(aggregate: string, whereFilter: string): string {
-    if (whereFilter.indexOf('WHERE') === -1) return aggregate;
-    throw new Error('filtered aggregators are not supported in BigQuery dialect');
+    const whereIndex = whereFilter.indexOf('WHERE ');
+    if (whereIndex === -1) return aggregate;
+    // BigQuery has no FILTER (WHERE …): the only filtered aggregator is quantileExpression's, whose
+    // NULLs APPROX_QUANTILES skips, so the filter moves inside it
+    const prefix = 'APPROX_QUANTILES(';
+    const suffixStart = aggregate.lastIndexOf(BigQueryDialect.QUANTILE_SUFFIX);
+    if (!aggregate.startsWith(prefix) || suffixStart === -1) {
+      throw new Error(`unsupported filtered aggregator '${aggregate}' in BigQuery dialect`);
+    }
+    const condition = whereFilter.substr(whereIndex + 6);
+    const operand = aggregate.slice(prefix.length, suffixStart);
+    return `${prefix}IF(${condition}, ${operand}, NULL)${aggregate.slice(suffixStart)}`;
   }
 
   public castExpression(
@@ -335,10 +352,11 @@ export class BigQueryDialect extends SQLDialect {
   public timePartExpression(operand: string, part: string, timezone: Timezone): string {
     const timePartFunction = BigQueryDialect.TIME_PART_TO_FUNCTION[part];
     if (!timePartFunction) throw new Error(`unsupported part ${part} in BigQuery dialect`);
+    // Function replacers: a `$$` in a replacement string would collapse to `$`
     return timePartFunction
-      .replace(/DOW/g, `(${BigQueryDialect.ISO_DOW})`)
-      .replace(/\$\$/g, operand)
-      .replace(/##/g, this.timezoneSQL(timezone));
+      .replace(/DOW/g, () => `(${BigQueryDialect.ISO_DOW})`)
+      .replace(/\$\$/g, () => operand)
+      .replace(/##/g, () => this.timezoneSQL(timezone));
   }
 
   public timeShiftExpression(
@@ -384,13 +402,20 @@ export class BigQueryDialect extends SQLDialect {
     quantile: number,
     _parameterAttributeName: string | undefined,
   ): string {
-    return `APPROX_QUANTILES(${str}, 1000)[OFFSET(${Math.round(quantile * 1000)})]`;
+    return `APPROX_QUANTILES(${str}${BigQueryDialect.QUANTILE_SUFFIX}${Math.round(
+      quantile * 1000,
+    )})]`;
+  }
+
+  // Druid follows IEEE: log(0) is -Infinity and log(x < 0) NaN; BigQuery fails the query
+  private ieeeLog(fn: string, operand: string): string {
+    return `CASE WHEN ${operand}>0 THEN ${fn}(${operand}) WHEN ${operand}=0 THEN CAST('-inf' AS FLOAT64) WHEN ${operand}<0 THEN CAST('nan' AS FLOAT64) END`;
   }
 
   public logExpression(base: string, operand: string): string {
-    if (base === String(Math.E)) return `LN(${operand})`;
-    if (base === '10') return `LOG10(${operand})`;
-    return `LOG(${operand},${base})`;
+    if (base === String(Math.E)) return this.ieeeLog('LN', operand);
+    if (base === '10') return this.ieeeLog('LOG10', operand);
+    return this.floatDivision(this.ieeeLog('LN', operand), this.ieeeLog('LN', base));
   }
 
   public lookupExpression(base: string, lookup: string): string {
@@ -619,6 +644,34 @@ export class BigQueryDialect extends SQLDialect {
         return format
           ? `SAFE.PARSE_TIMESTAMP(${this.escapeLiteral(format)}, ${this.rawSql(args[0])}${tz})`
           : `SAFE_CAST(${this.rawSql(args[0])} AS TIMESTAMP)`;
+      }
+
+      case 'TIME_FLOOR':
+      case 'TIME_SHIFT':
+      case 'TIME_EXTRACT': {
+        const literal = (i: number) =>
+          args[i] && args[i].type === 'literal' ? (args[i] as any).value : undefined;
+        const zoneIndex = name === 'TIME_FLOOR' ? 3 : name === 'TIME_SHIFT' ? 3 : 2;
+        const timezone = Timezone.fromJS(literal(zoneIndex) || 'Etc/UTC');
+        const operand = this.rawSql(args[0]);
+        if (name === 'TIME_EXTRACT') {
+          const unit = String(literal(1) || 'MILLISECOND').toUpperCase();
+          const part = { DOW: 'ISO_DOW', DOY: 'DAYOFYEAR', WEEK: 'ISOWEEK' }[unit] || unit;
+          if (part === 'ISO_DOW') {
+            return BigQueryDialect.ISO_DOW.replace(/\$\$/g, operand).replace(
+              /##/g,
+              this.timezoneSQL(timezone),
+            );
+          }
+          return `EXTRACT(${part} FROM ${operand} AT TIME ZONE ${this.timezoneSQL(timezone)})`;
+        }
+        if (name === 'TIME_FLOOR' && args[2] && literal(2) !== null) {
+          throw new Error(`unsupported TIME_FLOOR origin in BigQuery dialect: ${node}`);
+        }
+        const duration = Duration.fromJS(literal(1));
+        return name === 'TIME_FLOOR'
+          ? this.timeFloorExpression(operand, duration, timezone)
+          : this.timeShiftExpression(operand, duration, Number(literal(2)), timezone);
       }
 
       case 'TIMESTAMPDIFF':

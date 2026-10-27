@@ -64,8 +64,8 @@ describe('BigQueryExternal', () => {
         { name: '__time', type: 'TIME', nativeType: 'TIMESTAMP' },
         { name: 'competitor', type: 'STRING', nativeType: 'STRING' },
         { name: 'count', type: 'NUMBER', nativeType: 'INT64' },
-        { name: 'price', type: 'NUMBER', nativeType: 'FLOAT' },
-        { name: 'onSale', type: 'BOOLEAN', nativeType: 'BOOLEAN' },
+        { name: 'price', type: 'NUMBER', nativeType: 'FLOAT64' },
+        { name: 'onSale', type: 'BOOLEAN', nativeType: 'BOOL' },
         { name: 'attributes', type: 'STRING', nativeType: 'JSON' },
         { name: 'tags', type: 'STRING', nativeType: 'ARRAY<STRUCT<v STRING>>' },
       ]);

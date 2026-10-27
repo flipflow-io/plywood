@@ -413,9 +413,9 @@ describe('simulate BigQuery', () => {
           SELECT
           \`Competitor\`,
           \`__val\` AS \`ModePrice\`
-          FROM (SELECT \`competitor\` AS \`Competitor\`,
+          FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY \`Competitor\` ORDER BY \`__count\` DESC) AS \`__rn\` FROM (SELECT \`competitor\` AS \`Competitor\`,
           \`price\` AS \`__val\`,
-          ROW_NUMBER() OVER (PARTITION BY \`competitor\` ORDER BY COUNT(*) DESC) AS \`__rn\` FROM \`histories\` AS t WHERE (TIMESTAMP '2026-10-25 00:00:00'<=\`__time\` AND \`__time\`<TIMESTAMP '2026-10-26 00:00:00') AND \`price\` IS NOT NULL GROUP BY \`competitor\`,\`price\`)
+          COUNT(*) AS \`__count\` FROM \`histories\` AS t WHERE (TIMESTAMP '2026-10-25 00:00:00'<=\`__time\` AND \`__time\`<TIMESTAMP '2026-10-26 00:00:00') AND \`price\` IS NOT NULL GROUP BY \`competitor\`,\`price\`))
           WHERE \`__rn\` = 1
         `,
       },
