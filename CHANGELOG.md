@@ -1,5 +1,10 @@
 # Change Log
 
+## 0.52.0
+
+- Add BigQuery as an engine (`BigQueryDialect`, `BigQueryExternal`, engine `bigquery`)
+- Add dialect hooks for ORDER BY, raw SQL, window ranking and unsorted split order
+
 ## 0.36.0
 
 - Switch to using druid-query-toolkit

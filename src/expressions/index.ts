@@ -56,6 +56,7 @@ export * from './minExpression';
 export * from './modeExpression';
 export * from './multiplyExpression';
 export * from './mvContainsExpression';
+export * from './mvFilterOnlyExpression';
 export * from './mvOverlapExpression';
 export * from './notExpression';
 export * from './numberBucketExpression';

@@ -15,6 +15,7 @@
  */
 
 export * from './baseExternal';
+export * from './bigQueryExternal';
 export * from './druidExternal';
 export * from './mySqlExternal';
 export * from './postgresExternal';

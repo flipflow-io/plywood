@@ -112,12 +112,14 @@ export class SqlAggregateExpression extends ChainableExpression {
   }
 
   protected _getSQLChainableHelper(dialect: SQLDialect, operandSQL: string): string {
+    let parsedSql = this.parsedSql;
     let sql = this.sql;
     if (operandSQL.includes(' WHERE ')) {
       const filterParse = SqlExpression.parse(operandSQL.split(' WHERE ')[1]);
-      sql = String(SqlAggregateExpression.substituteFilter(this.parsedSql, filterParse));
+      parsedSql = SqlAggregateExpression.substituteFilter(this.parsedSql, filterParse);
+      sql = String(parsedSql);
     }
-    return `(${sql})`;
+    return `(${dialect.translateRawSql(parsedSql, sql)})`;
   }
 
   public extractPivotNestedAggComponents(): {
