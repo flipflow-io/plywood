@@ -245,6 +245,41 @@ describe('BigQueryExternal', () => {
       expect(dialect.orderByExpression('`x`', 'DESC', 'STRING')).to.equal('`x` DESC');
     });
 
+    it('translates every EXTRACT unit of Druid SQL', () => {
+      const raw = sql =>
+        dialect.translateRawSql(plywood.Expression.parse(`s\${${sql}}`).parsedSql, sql);
+      const units = {
+        EPOCH: 'DIV(UNIX_MILLIS(`__time`),1000)',
+        MILLISECOND: 'EXTRACT(MILLISECOND FROM `__time`)',
+        SECOND: 'EXTRACT(SECOND FROM `__time`)',
+        MINUTE: 'EXTRACT(MINUTE FROM `__time`)',
+        HOUR: 'EXTRACT(HOUR FROM `__time`)',
+        DAY: 'EXTRACT(DAY FROM `__time`)',
+        DOW: 'MOD(EXTRACT(DAYOFWEEK FROM `__time`)+5,7)+1',
+        ISODOW: 'MOD(EXTRACT(DAYOFWEEK FROM `__time`)+5,7)+1',
+        DOY: 'EXTRACT(DAYOFYEAR FROM `__time`)',
+        WEEK: 'EXTRACT(ISOWEEK FROM `__time`)',
+        MONTH: 'EXTRACT(MONTH FROM `__time`)',
+        QUARTER: 'EXTRACT(QUARTER FROM `__time`)',
+        YEAR: 'EXTRACT(YEAR FROM `__time`)',
+        ISOYEAR: 'EXTRACT(YEAR FROM `__time`)',
+        DECADE: 'DIV(EXTRACT(YEAR FROM `__time`),10)',
+        CENTURY: 'DIV(EXTRACT(YEAR FROM `__time`)+99,100)',
+        MILLENNIUM: 'DIV(EXTRACT(YEAR FROM `__time`)+999,1000)',
+      };
+      expect(Object.keys(BigQueryDialect.RAW_EXTRACT)).to.deep.equal(Object.keys(units));
+      for (const unit of Object.keys(units)) {
+        expect(raw(`EXTRACT(${unit} FROM __time)`)).to.equal(units[unit]);
+      }
+      expect(raw('EXTRACT(YEAR FROM CURRENT_TIMESTAMP) - 1')).to.equal(
+        'EXTRACT(YEAR FROM CURRENT_TIMESTAMP()) - 1',
+      );
+      // Druid fails to plan it too
+      expect(() => raw('EXTRACT(MICROSECOND FROM __time)')).to.throw(
+        "unsupported EXTRACT unit 'MICROSECOND'",
+      );
+    });
+
     it('rewrites JSON paths Druid reads into BigQuery syntax', () => {
       const raw = sql =>
         dialect.translateRawSql(plywood.Expression.parse(`s\${${sql}}`).parsedSql, sql);

@@ -44,6 +44,28 @@ export class BigQueryDialect extends SQLDialect {
   static QUANTILE_SUFFIX = ', 1000)[OFFSET(';
 
   // Druid's ISO day of week (Monday = 1); BigQuery DAYOFWEEK has Sunday = 1
+  // Druid SQL's EXTRACT units, as measured on Druid: ISOYEAR is the calendar year, CENTURY and
+  // MILLENNIUM round up (2000 is in the 20th), EPOCH truncates toward zero, MICROSECOND fails to plan
+  static RAW_EXTRACT: Record<string, string> = {
+    EPOCH: 'DIV(UNIX_MILLIS($$),1000)',
+    MILLISECOND: 'EXTRACT(MILLISECOND FROM $$)',
+    SECOND: 'EXTRACT(SECOND FROM $$)',
+    MINUTE: 'EXTRACT(MINUTE FROM $$)',
+    HOUR: 'EXTRACT(HOUR FROM $$)',
+    DAY: 'EXTRACT(DAY FROM $$)',
+    DOW: 'MOD(EXTRACT(DAYOFWEEK FROM $$)+5,7)+1',
+    ISODOW: 'MOD(EXTRACT(DAYOFWEEK FROM $$)+5,7)+1',
+    DOY: 'EXTRACT(DAYOFYEAR FROM $$)',
+    WEEK: 'EXTRACT(ISOWEEK FROM $$)',
+    MONTH: 'EXTRACT(MONTH FROM $$)',
+    QUARTER: 'EXTRACT(QUARTER FROM $$)',
+    YEAR: 'EXTRACT(YEAR FROM $$)',
+    ISOYEAR: 'EXTRACT(YEAR FROM $$)',
+    DECADE: 'DIV(EXTRACT(YEAR FROM $$),10)',
+    CENTURY: 'DIV(EXTRACT(YEAR FROM $$)+99,100)',
+    MILLENNIUM: 'DIV(EXTRACT(YEAR FROM $$)+999,1000)',
+  };
+
   static ISO_DOW = 'MOD(EXTRACT(DAYOFWEEK FROM $$ AT TIME ZONE ##)+5,7)+1';
 
   static TIME_PART_TO_FUNCTION: Record<string, string> = {
@@ -644,6 +666,14 @@ export class BigQueryDialect extends SQLDialect {
         return format
           ? `SAFE.PARSE_TIMESTAMP(${this.escapeLiteral(format)}, ${this.rawSql(args[0])}${tz})`
           : `SAFE_CAST(${this.rawSql(args[0])} AS TIMESTAMP)`;
+      }
+
+      case 'EXTRACT': {
+        // EXTRACT(unit FROM x): the unit parses as a literal
+        const unit = String((args[0] as any).value).toUpperCase();
+        const part = BigQueryDialect.RAW_EXTRACT[unit];
+        if (!part) throw new Error(`unsupported EXTRACT unit '${unit}' in BigQuery dialect`);
+        return part.replace(/\$\$/g, () => this.rawSql(args[1]));
       }
 
       case 'TIME_FLOOR':
