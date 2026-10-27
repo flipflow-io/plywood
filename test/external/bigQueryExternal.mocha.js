@@ -212,6 +212,54 @@ describe('BigQueryExternal', () => {
       ]);
     });
 
+    it('reads a text column the cube types as NUMBER as Druid does inside SUM and AVG', () => {
+      const parse =
+        "SAFE_CAST(REGEXP_EXTRACT(`size`, r'^([+-]?(?:[0-9]+[.]?[0-9]*|[.][0-9]+)(?:[eE][+-]?[0-9]+)?)[dDfF]?$') AS FLOAT64)";
+      return External.fromJS(
+        {
+          engine: 'bigquery',
+          source: 'histories',
+          attributeOverrides: [{ name: 'size', type: 'NUMBER' }],
+        },
+        rowsRequester([
+          { name: '__time', type: 'TIMESTAMP' },
+          { name: 'competitor', type: 'STRING' },
+          { name: 'size', type: 'STRING' },
+          { name: 'price', type: 'FLOAT' },
+        ]),
+      )
+        .introspect()
+        .then(external => {
+          expect(AttributeInfo.toJSs(external.attributes)[2]).to.deep.equal({
+            name: 'size',
+            type: 'NUMBER',
+            nativeType: 'STRING',
+          });
+
+          const queries = ex =>
+            ex
+              .simulateQueryPlan({ wiki: external })
+              .flat()
+              .map(q => q.query);
+
+          expect(
+            queries(
+              ply()
+                .apply('Size', $('wiki').average('$size'))
+                .apply('Total', $('wiki').sum('$size'))
+                .apply('Price', $('wiki').sum('$price')),
+            ),
+          ).to.deep.equal([
+            `SELECT\nAVG(${parse}) AS \`Size\`,\nSUM(${parse}) AS \`Total\`,\nSUM(\`price\`) AS \`Price\`\nFROM \`histories\` AS t\nGROUP BY ()`,
+          ]);
+
+          // A single measure is computed in value mode
+          expect(queries($('wiki').average('$size'))).to.deep.equal([
+            `SELECT\nAVG(${parse}) AS \`__VALUE__\`\nFROM \`histories\` AS t\nGROUP BY ()`,
+          ]);
+        });
+    });
+
     it('refuses a multi-value column inside a measure other than in a filter', () => {
       const external = External.fromJS(
         { engine: 'bigquery', source: 'histories', attributes },
@@ -233,6 +281,15 @@ describe('BigQueryExternal', () => {
     it('quotes names with backticks and literals with backslash escapes', () => {
       expect(dialect.escapeName('a`b')).to.equal('`a\\`b`');
       expect(dialect.escapeLiteral("it's a \\ path\n")).to.equal("'it\\'s a \\\\ path\\n'");
+    });
+
+    it('casts text to a number as Druid does: no spaces, no hex, an optional d or f suffix', () => {
+      expect(dialect.castExpression('STRING', '`x`', 'NUMBER')).to.equal(
+        "SAFE_CAST(REGEXP_EXTRACT(`x`, r'^([+-]?(?:[0-9]+[.]?[0-9]*|[.][0-9]+)(?:[eE][+-]?[0-9]+)?)[dDfF]?$') AS FLOAT64)",
+      );
+      expect(dialect.castExpression('BOOLEAN', '`x`', 'NUMBER')).to.equal(
+        'SAFE_CAST(`x` AS FLOAT64)',
+      );
     });
 
     it('orders NaN highest and NULL lowest, as Druid groupBy does', () => {

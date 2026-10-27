@@ -117,6 +117,10 @@ export class BigQueryDialect extends SQLDialect {
     },
     NUMBER: {
       TIME: 'UNIX_MILLIS($$)',
+      // Druid parses text as a decimal number with no spaces around it (an optional d or f suffix
+      // allowed) and gives NULL otherwise; BigQuery's SAFE_CAST also takes spaces and 0x hex
+      STRING:
+        "SAFE_CAST(REGEXP_EXTRACT($$, r'^([+-]?(?:[0-9]+[.]?[0-9]*|[.][0-9]+)(?:[eE][+-]?[0-9]+)?)[dDfF]?$') AS FLOAT64)",
       _: 'SAFE_CAST($$ AS FLOAT64)', // Druid gives NULL for text that is not a number
     },
     STRING: {
@@ -337,7 +341,7 @@ export class BigQueryDialect extends SQLDialect {
         `unsupported cast from ${inputType || 'unknown'} to ${targetType} in BigQuery dialect`,
       );
     }
-    return castFunction.replace(/\$\$/g, operand);
+    return castFunction.replace(/\$\$/g, () => operand);
   }
 
   private timezoneSQL(timezone: Timezone): string {

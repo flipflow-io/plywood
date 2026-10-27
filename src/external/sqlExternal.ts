@@ -901,6 +901,7 @@ export abstract class SQLExternal extends External {
             this.inlineDerivedAttributes(valueApply.expression),
           );
         }
+        valueApply = this.getQueryApplies([valueApply])[0];
         const valueModeEx = SQLExternal.extractModeExpression(valueApply.expression);
         if (valueModeEx) {
           const modeFieldSQL = valueModeEx.expression.getSQL(dialect);

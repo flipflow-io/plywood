@@ -3,6 +3,8 @@
 ## 0.52.1
 
 - BigQuery: a filter on a multi-value column inside a measure works, per row as in Druid
+- BigQuery: raw `EXTRACT(unit FROM x)` translated for every Druid unit
+- BigQuery: SUM and AVG read a text column the cube types as NUMBER, parsed as Druid parses it
 
 ## 0.52.0
 
