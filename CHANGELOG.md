@@ -1,5 +1,9 @@
 # Change Log
 
+## 0.52.1
+
+- BigQuery: a filter on a multi-value column inside a measure works, per row as in Druid
+
 ## 0.52.0
 
 - Add BigQuery as an engine (`BigQueryDialect`, `BigQueryExternal`, engine `bigquery`)
