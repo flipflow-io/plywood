@@ -229,9 +229,10 @@ export abstract class SQLExternal extends External {
 
     const modeQueries = modeApplyInfos.map(({ apply, modeExpression }) => {
       // Outer query: reference aliased key names from inner subquery
-      const outerSelect = [...splitKeyEscaped, `"__val" AS ${dialect.escapeName(apply.name)}`].join(
-        ',\n',
-      );
+      const outerSelect = [
+        ...splitKeyEscaped,
+        `${dialect.escapeName('__val')} AS ${dialect.escapeName(apply.name)}`,
+      ].join(',\n');
 
       // MODE over a RESPLIT measure: `split($k).apply('B', agg).mode($B)`. The mode
       // field is an inner-split aggregate that only exists inside cte_subsplit, so
@@ -254,10 +255,10 @@ export abstract class SQLExternal extends External {
 
         const cteInnerSelect = [
           ...lowered.selectExpressions,
-          `${cteFieldSQL} AS "__val"`,
+          `${cteFieldSQL} AS ${dialect.escapeName('__val')}`,
           `ROW_NUMBER() OVER (PARTITION BY ${lowered.groupByExpressions.join(
             ',',
-          )} ORDER BY COUNT(*) DESC) AS "__rn"`,
+          )} ORDER BY COUNT(*) DESC) AS ${dialect.escapeName('__rn')}`,
         ].join(',\n');
         const cteInnerGroupBy = [...lowered.groupByExpressions, cteFieldSQL].join(',');
 
@@ -268,7 +269,7 @@ export abstract class SQLExternal extends External {
           `FROM (SELECT ${cteInnerSelect} ${lowered.fromClause} WHERE ${cteWhereParts.join(
             ' AND ',
           )} GROUP BY ${cteInnerGroupBy})`,
-          'WHERE "__rn" = 1',
+          `WHERE ${dialect.escapeName('__rn')} = 1`,
         ].join('\n');
 
         return {
@@ -294,10 +295,10 @@ export abstract class SQLExternal extends External {
       // Inner subquery: alias split dims with key names, GROUP BY raw expressions
       const innerSelect = [
         ...splitDimAliasedSQLs,
-        `${modeFieldSQL} AS "__val"`,
+        `${modeFieldSQL} AS ${dialect.escapeName('__val')}`,
         `ROW_NUMBER() OVER (PARTITION BY ${splitDimSQLs.join(
           ',',
-        )} ORDER BY COUNT(*) DESC) AS "__rn"`,
+        )} ORDER BY COUNT(*) DESC) AS ${dialect.escapeName('__rn')}`,
       ].join(',\n');
 
       const innerGroupBy = [...splitDimSQLs, modeFieldSQL].join(',');
@@ -307,7 +308,7 @@ export abstract class SQLExternal extends External {
         'SELECT',
         outerSelect,
         `FROM (SELECT ${innerSelect} ${from} ${whereClause} GROUP BY ${innerGroupBy})`,
-        'WHERE "__rn" = 1',
+        `WHERE ${dialect.escapeName('__rn')} = 1`,
       ].join('\n');
 
       return {
@@ -1022,7 +1023,9 @@ export abstract class SQLExternal extends External {
           let innerGroupByExpressions = new Set({ setType: 'STRING', elements: [] });
 
           // Añadir la expresión de subdivisión interna
-          innerSelectExpressions = innerSelectExpressions.add(`${subSplitExpression} AS "sub_key"`);
+          innerSelectExpressions = innerSelectExpressions.add(
+            `${subSplitExpression} AS ${dialect.escapeName('sub_key')}`,
+          );
           innerGroupByExpressions = innerGroupByExpressions.add(subSplitExpression);
 
           // Añadir las expresiones de selección del split
@@ -1036,7 +1039,9 @@ export abstract class SQLExternal extends External {
           // Añadir las expresiones agregadas internas
           pnaApplies.forEach(({ components }) => {
             innerSelectExpressions = innerSelectExpressions.add(
-              `${components.innerAggregateExpr} AS "${components.innerAggregateValueAlias}"`,
+              `${components.innerAggregateExpr} AS ${dialect.escapeName(
+                components.innerAggregateValueAlias,
+              )}`,
             );
           });
 
@@ -1565,7 +1570,7 @@ export abstract class SQLExternal extends External {
   protected _wrapCTEReferencesWithAnyValue(
     sqlExpression: string,
     cteColumnNames: string[],
-    _dialect: SQLDialect,
+    dialect: SQLDialect,
   ): string {
     if (!cteColumnNames || cteColumnNames.length === 0) {
       return sqlExpression;
@@ -1580,20 +1585,18 @@ export abstract class SQLExternal extends External {
     const sortedColumnNames = cteColumnNames.slice().sort((a, b) => b.length - a.length);
     let processedExpression = sqlExpression;
     for (const columnName of sortedColumnNames) {
-      const quotedColumnPattern = new RegExp(`"${columnName.replace(/"/g, '""')}"`, 'g');
+      const escapedColumnName = dialect.escapeName(columnName);
+      const quotedColumnPattern = new RegExp(escapedColumnName, 'g');
       if (quotedColumnPattern.test(processedExpression)) {
         const aggregatePattern = new RegExp(
-          `\\b(SUM|COUNT|AVG|MIN|MAX|STDDEV|VARIANCE|GROUP_CONCAT|LISTAGG|ARRAY_AGG|STRING_AGG|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|EVERY|REGR_|PERCENTILE_|MEDIAN|ANY_VALUE)\\s*\\([^)]*"${columnName.replace(
-            /"/g,
-            '""',
-          )}"[^)]*\\)`,
+          `\\b(SUM|COUNT|AVG|MIN|MAX|STDDEV|VARIANCE|GROUP_CONCAT|LISTAGG|ARRAY_AGG|STRING_AGG|BIT_AND|BIT_OR|BIT_XOR|BOOL_AND|BOOL_OR|CORR|COVAR_POP|COVAR_SAMP|EVERY|REGR_|PERCENTILE_|MEDIAN|ANY_VALUE)\\s*\\([^)]*${escapedColumnName}[^)]*\\)`,
           'i',
         );
         if (!aggregatePattern.test(processedExpression)) {
           const anyValueFn = this._getAnyValueFunction();
           processedExpression = processedExpression.replace(
             quotedColumnPattern,
-            `${anyValueFn}("${columnName}")`,
+            `${anyValueFn}(${escapedColumnName})`,
           );
         }
       }

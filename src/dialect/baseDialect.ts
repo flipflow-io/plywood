@@ -16,6 +16,7 @@
  */
 
 import type { Duration, Timezone } from 'chronoshift';
+import type { SqlExpression } from 'druid-query-toolkit';
 
 import { Ip } from '../datatypes/ip';
 import { PlyType, PlyTypeSimple } from '../types';
@@ -100,6 +101,15 @@ export abstract class SQLDialect {
   public abstract timeToSQL(date: Date): string;
 
   public abstract stringArrayToSQL(value: string[]): string;
+
+  // Raw SQL written in the cube (s${…}) is Druid SQL; engines that speak it pass it through
+  public translateRawSql(_parsedSql: SqlExpression, sql: string): string {
+    return sql;
+  }
+
+  public orderByExpression(expression: string, direction: string, _type?: PlyType): string {
+    return `${expression} ${direction}`;
+  }
 
   public aggregateFilterIfNeeded(
     inputSQL: string,

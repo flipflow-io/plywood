@@ -91,7 +91,7 @@ export class SortExpression extends ChainableUnaryExpression {
     expressionSQL: string,
   ): string {
     const dir = this.direction === SortExpression.DESCENDING ? 'DESC' : 'ASC';
-    return `ORDER BY ${expressionSQL} ${dir}`;
+    return `ORDER BY ${dialect.orderByExpression(expressionSQL, dir, this.expression.type)}`;
   }
 
   public refName(): string {
