@@ -337,6 +337,22 @@ describe('BigQueryExternal', () => {
       );
     });
 
+    it('reads arithmetic left to right, as Druid does', () => {
+      const raw = sql =>
+        dialect.translateRawSql(plywood.Expression.parse(`s\${${sql}}`).parsedSql, sql);
+      expect(raw('(priceWithoutOffer - price) * 100.0 / priceWithoutOffer')).to.equal(
+        'IEEE_DIVIDE((`priceWithoutOffer` - `price`) * 100.0,`priceWithoutOffer`)',
+      );
+      expect(raw('a / b * c')).to.equal('IEEE_DIVIDE(`a`,`b`) * `c`');
+      expect(raw('a * b / c * d')).to.equal('IEEE_DIVIDE(`a` * `b`,`c`) * `d`');
+      expect(raw('a / b / c')).to.equal('IEEE_DIVIDE(IEEE_DIVIDE(`a`,`b`),`c`)');
+      expect(raw('a + b * c - d')).to.equal('`a` + (`b` * `c`) - `d`');
+      expect(raw('a - b + c')).to.equal('`a` - `b` + `c`');
+      // Written parentheses are kept
+      expect(raw('a * (b / c)')).to.equal('`a` * (IEEE_DIVIDE(`b`,`c`))');
+      expect(raw('a - (b - c)')).to.equal('`a` - (`b` - `c`)');
+    });
+
     it('rewrites JSON paths Druid reads into BigQuery syntax', () => {
       const raw = sql =>
         dialect.translateRawSql(plywood.Expression.parse(`s\${${sql}}`).parsedSql, sql);

@@ -66,6 +66,9 @@ export class BigQueryDialect extends SQLDialect {
     MILLENNIUM: 'DIV(EXTRACT(YEAR FROM $$)+999,1000)',
   };
 
+  // Operators that Druid reads left to right at one precedence level
+  static RAW_SQL_LEVEL: Record<string, string> = { '*': '*', '/': '*', '+': '+', '-': '+' };
+
   static ISO_DOW = 'MOD(EXTRACT(DAYOFWEEK FROM $$ AT TIME ZONE ##)+5,7)+1';
 
   static TIME_PART_TO_FUNCTION: Record<string, string> = {
@@ -755,6 +758,24 @@ export class BigQueryDialect extends SQLDialect {
     return `${name}(${decorator ? decorator + ' ' : ''}${argSQLs.join(', ')})`;
   }
 
+  // The parser nests `a * b / c` as `a * (b / c)` and `a + b - c` as `a + (b - c)`; Druid reads them
+  // left to right, and in floating point the grouping changes the result
+  private rawSqlTerms(node: any, op: string = null): { op: string; arg: SqlBase }[] {
+    const level = BigQueryDialect.RAW_SQL_LEVEL[node.op];
+    return [].concat(
+      ...node
+        .getArgArray()
+        .map((arg: any, i: number) =>
+          level &&
+          arg.type === 'multi' &&
+          !arg.hasParens() &&
+          BigQueryDialect.RAW_SQL_LEVEL[arg.op] === level
+            ? this.rawSqlTerms(arg, i ? node.op : op)
+            : [{ op: i ? node.op : op, arg }],
+        ),
+    );
+  }
+
   private rawSql(node: SqlBase, nested = false): string {
     const n = node as any;
     switch (node.type) {
@@ -786,15 +807,14 @@ export class BigQueryDialect extends SQLDialect {
       }
 
       case 'multi': {
-        const args: SqlBase[] = n.getArgArray();
-        let sql: string;
-        if (n.op === '/') {
-          sql = args
-            .map(a => this.rawSql(a, true))
-            .reduce((acc: string, a: string) => this.floatDivision(acc, a));
-        } else {
-          sql = args.map(a => this.rawSql(a, true)).join(` ${n.op} `);
-        }
+        const [first, ...rest] = this.rawSqlTerms(n);
+        const sql = rest.reduce(
+          (acc: string, { op, arg }) =>
+            op === '/'
+              ? this.floatDivision(acc, this.rawSql(arg, true))
+              : `${acc} ${op} ${this.rawSql(arg, true)}`,
+          this.rawSql(first.arg, true),
+        );
         return nested ? `(${sql})` : sql;
       }
 
