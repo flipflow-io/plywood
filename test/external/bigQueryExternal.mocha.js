@@ -353,6 +353,32 @@ describe('BigQueryExternal', () => {
       expect(raw('a - (b - c)')).to.equal('`a` - (`b` - `c`)');
     });
 
+    it('divides two integers as integers, as Druid does', () => {
+      const typed = new BigQueryDialect({
+        attributes: AttributeInfo.fromJSs([
+          { name: 'cnt', type: 'NUMBER', nativeType: 'INT64' },
+          { name: 'price', type: 'NUMBER', nativeType: 'FLOAT64' },
+        ]),
+      });
+      const raw = sql =>
+        typed.translateRawSql(plywood.Expression.parse(`s\${${sql}}`).parsedSql, sql);
+      expect(raw("(LENGTH(imageList) - LENGTH(REPLACE(imageList, 'http', ''))) / 4")).to.equal(
+        "DIV((CHAR_LENGTH(`imageList`) - CHAR_LENGTH(REPLACE(`imageList`, 'http', ''))),4)",
+      );
+      expect(raw('cnt / 2')).to.equal('DIV(`cnt`,2)');
+      expect(raw('COUNT(*) / 7')).to.equal('DIV(COUNT(*),7)');
+      expect(raw('SUM(cnt) * 3 / 2')).to.equal('DIV(SUM(`cnt`) * 3,2)');
+      expect(raw('CASE WHEN cnt = 1 THEN 3 ELSE 5 END / 2')).to.equal(
+        'DIV(CASE WHEN `cnt` = 1 THEN 3 ELSE 5 END,2)',
+      );
+      // Any float operand keeps the float division
+      expect(raw('cnt / 2.0')).to.equal('IEEE_DIVIDE(`cnt`,2.0)');
+      expect(raw('price / 2')).to.equal('IEEE_DIVIDE(`price`,2)');
+      expect(raw('cnt * 1.0 / 2')).to.equal('IEEE_DIVIDE(`cnt` * 1.0,2)');
+      expect(raw('CAST(cnt AS DOUBLE) / 2')).to.equal('IEEE_DIVIDE(SAFE_CAST(`cnt` AS FLOAT64),2)');
+      expect(raw('unknownColumn / 2')).to.equal('IEEE_DIVIDE(`unknownColumn`,2)');
+    });
+
     it('rewrites JSON paths Druid reads into BigQuery syntax', () => {
       const raw = sql =>
         dialect.translateRawSql(plywood.Expression.parse(`s\${${sql}}`).parsedSql, sql);
