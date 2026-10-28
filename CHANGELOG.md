@@ -1,5 +1,10 @@
 # Change Log
 
+## 0.52.2
+
+- BigQuery: raw SQL arithmetic is read left to right, as Druid reads it (`a * b / c` is `(a * b) / c`)
+- BigQuery: raw SQL divides two integers as integers, toward zero, as Druid does (`1 / 2` is `0`)
+
 ## 0.52.1
 
 - BigQuery: a filter on a multi-value column inside a measure works, per row as in Druid

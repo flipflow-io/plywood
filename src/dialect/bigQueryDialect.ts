@@ -66,6 +66,23 @@ export class BigQueryDialect extends SQLDialect {
     MILLENNIUM: 'DIV(EXTRACT(YEAR FROM $$)+999,1000)',
   };
 
+  // Operators that Druid reads left to right at one precedence level
+  static RAW_SQL_LEVEL: Record<string, string> = { '*': '*', '/': '*', '+': '+', '-': '+' };
+
+  // Druid SQL functions that return an integer, as measured on Druid
+  static RAW_SQL_INTEGER_FUNCTIONS = [
+    'COUNT',
+    'LENGTH',
+    'CHAR_LENGTH',
+    'STRPOS',
+    'POSITION',
+    'EXTRACT',
+    'TIMESTAMPDIFF',
+  ];
+
+  // Druid SQL functions that return an integer when their arguments are integers
+  static RAW_SQL_INTEGER_PRESERVING_FUNCTIONS = ['SUM', 'MIN', 'MAX', 'ABS', 'COALESCE'];
+
   static ISO_DOW = 'MOD(EXTRACT(DAYOFWEEK FROM $$ AT TIME ZONE ##)+5,7)+1';
 
   static TIME_PART_TO_FUNCTION: Record<string, string> = {
@@ -481,6 +498,53 @@ export class BigQueryDialect extends SQLDialect {
     return attribute ? attribute.type : undefined;
   }
 
+  // Whether Druid SQL types this as an integer; false when unsure, which keeps the float division
+  private rawSqlIsInteger(node: SqlBase): boolean {
+    const n = node as any;
+    switch (node.type) {
+      case 'literal':
+        return typeof n.value === 'number' && /^[+-]?\d+$/.test(n.stringValue);
+
+      case 'column': {
+        const attribute = NamedArray.findByName(this.attributes || [], n.getName());
+        return Boolean(attribute && attribute.nativeType === 'INT64');
+      }
+
+      case 'function': {
+        const name = n.getEffectiveFunctionName();
+        const args: SqlBase[] = n.getArgArray();
+        if (name === 'CAST')
+          return BigQueryDialect.RAW_SQL_TYPE[String(n.getArg(1).value).toUpperCase()] === 'INT64';
+        if (BigQueryDialect.RAW_SQL_INTEGER_FUNCTIONS.includes(name)) return true;
+        return (
+          BigQueryDialect.RAW_SQL_INTEGER_PRESERVING_FUNCTIONS.includes(name) &&
+          args.length > 0 &&
+          args.every(a => this.rawSqlIsInteger(a))
+        );
+      }
+
+      case 'case': {
+        const results: SqlBase[] = n.whenThenParts.values
+          .map((part: any) => part.thenExpression)
+          .concat(n.elseExpression ? [n.elseExpression] : [])
+          .filter((r: any) => !(r.type === 'literal' && r.value === null));
+        return results.length > 0 && results.every(r => this.rawSqlIsInteger(r));
+      }
+
+      case 'multi':
+        return (
+          Boolean(BigQueryDialect.RAW_SQL_LEVEL[n.op]) &&
+          n.getArgArray().every((a: SqlBase) => this.rawSqlIsInteger(a))
+        );
+
+      case 'unary':
+        return n.op !== 'NOT' && this.rawSqlIsInteger(n.argument);
+
+      default:
+        return false;
+    }
+  }
+
   private rawSqlIsNumberLiteral(node: SqlBase): boolean {
     return node.type === 'literal' && typeof (node as any).value === 'number';
   }
@@ -755,6 +819,24 @@ export class BigQueryDialect extends SQLDialect {
     return `${name}(${decorator ? decorator + ' ' : ''}${argSQLs.join(', ')})`;
   }
 
+  // The parser nests `a * b / c` as `a * (b / c)` and `a + b - c` as `a + (b - c)`; Druid reads them
+  // left to right, and in floating point the grouping changes the result
+  private rawSqlTerms(node: any, op: string = null): { op: string; arg: SqlBase }[] {
+    const level = BigQueryDialect.RAW_SQL_LEVEL[node.op];
+    return [].concat(
+      ...node
+        .getArgArray()
+        .map((arg: any, i: number) =>
+          level &&
+          arg.type === 'multi' &&
+          !arg.hasParens() &&
+          BigQueryDialect.RAW_SQL_LEVEL[arg.op] === level
+            ? this.rawSqlTerms(arg, i ? node.op : op)
+            : [{ op: i ? node.op : op, arg }],
+        ),
+    );
+  }
+
   private rawSql(node: SqlBase, nested = false): string {
     const n = node as any;
     switch (node.type) {
@@ -786,14 +868,21 @@ export class BigQueryDialect extends SQLDialect {
       }
 
       case 'multi': {
-        const args: SqlBase[] = n.getArgArray();
-        let sql: string;
-        if (n.op === '/') {
-          sql = args
-            .map(a => this.rawSql(a, true))
-            .reduce((acc: string, a: string) => this.floatDivision(acc, a));
-        } else {
-          sql = args.map(a => this.rawSql(a, true)).join(` ${n.op} `);
+        const [first, ...rest] = this.rawSqlTerms(n);
+        let sql = this.rawSql(first.arg, true);
+        let integer = this.rawSqlIsInteger(first.arg);
+        for (const { op, arg } of rest) {
+          const argSQL = this.rawSql(arg, true);
+          const argInteger = this.rawSqlIsInteger(arg);
+          if (op !== '/') {
+            sql = `${sql} ${op} ${argSQL}`;
+          } else if (integer && argInteger) {
+            // Druid SQL divides two integers as integers, toward zero (1 / 2 = 0), as DIV does
+            sql = `DIV(${sql},${argSQL})`;
+          } else {
+            sql = this.floatDivision(sql, argSQL);
+          }
+          integer = integer && argInteger;
         }
         return nested ? `(${sql})` : sql;
       }
